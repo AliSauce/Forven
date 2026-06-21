@@ -9,6 +9,25 @@ from __future__ import annotations
 
 
 # --------------------------------------------------------------------------- #
+# Onboarding: agents stuck on the seed-default provider retarget to a
+# configured one (the "connected MiniMax but agents still pointed at openai"
+# fresh-install failure).
+# --------------------------------------------------------------------------- #
+def test_first_configured_provider_prefers_credentialed(monkeypatch):
+    from forven.agents import runner
+
+    monkeypatch.setattr(runner, "_provider_has_credentials", lambda p: p == "minimax")
+    assert runner._first_configured_provider() == ("minimax", "MiniMax-M2.5")
+
+
+def test_first_configured_provider_none_when_nothing_configured(monkeypatch):
+    from forven.agents import runner
+
+    monkeypatch.setattr(runner, "_provider_has_credentials", lambda p: False)
+    assert runner._first_configured_provider() is None
+
+
+# --------------------------------------------------------------------------- #
 # credential_status: missing vs opaque vs ok
 # --------------------------------------------------------------------------- #
 def test_credential_status_missing(monkeypatch):

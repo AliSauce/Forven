@@ -129,6 +129,29 @@ def _provider_has_credentials(provider: str) -> bool:
         return False
 
 
+def _first_configured_provider() -> tuple[str, str] | None:
+    """First provider with usable credentials, paired with its default model.
+
+    Lets a fresh install whose agents still point at the seed-default provider
+    (e.g. ``openai``) run out of the box when only a *different* provider was
+    connected (e.g. MiniMax), instead of failing every task on missing creds.
+    """
+    try:
+        from forven.model_routing import get_default_model_for_provider, get_model_routing
+
+        routing = get_model_routing()
+        priority = list(routing.get("provider_priority") or [])
+        known = list((routing.get("default_models") or {}).keys())
+        for p in priority + [k for k in known if k not in priority]:
+            if _provider_has_credentials(p):
+                model = get_default_model_for_provider(p)
+                if model:
+                    return (p, model)
+    except Exception:
+        return None
+    return None
+
+
 def _resolve_backup_provider(primary_provider: str) -> tuple[str, str] | None:
     """Resolve the user-configured backup provider as ``(provider, model_id)``, or
     None when fallback is disabled/unusable.
@@ -1058,6 +1081,20 @@ async def _run_agent_task_inner(
         provider = agent.get("model", "openai")
         model_id = agent.get("model_id")
         provider, model_id = normalize_provider_and_model(provider, model_id)
+        # Onboarding resilience: if the agent's configured provider has no usable
+        # credentials (e.g. the seed default "openai" on an install where only a
+        # different provider like MiniMax was connected), retarget to a configured
+        # provider instead of failing the task. Logged so the switch isn't silent.
+        if not _provider_has_credentials(provider):
+            alt = _first_configured_provider()
+            if alt is not None and alt[0] != provider:
+                log.warning(
+                    "Agent %s is set to provider %r which has no credentials; "
+                    "routing to the configured provider %s/%s instead. Change it "
+                    "under Settings > Agents to silence this.",
+                    agent_id, provider, alt[0], alt[1],
+                )
+                provider, model_id = alt
         messages = [{"role": "user", "content": prompt}]
 
         response, usage = await _call_with_tools(provider, model_id, messages, context, tools=agent_tools)
