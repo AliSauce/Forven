@@ -188,9 +188,17 @@ _WALK_FORWARD_TIMEOUT = 180   # base/floor for the isolated walk-forward worker
 # even though the same strategy completes fine at 1y. But a generous flat value would let a
 # genuinely stuck strategy hang. So scale the budget with bar count — floored at the base
 # (unchanged behaviour for typical windows) and capped so a real runaway is still killed.
-_ISOLATION_TIMEOUT_PER_1K_BARS = 8   # extra seconds granted per 1,000 bars
-_BACKTEST_TIMEOUT_MAX = 300           # hard ceiling for a single backtest (5 min)
-_WALK_FORWARD_TIMEOUT_MAX = 600       # walk-forward re-runs N folds, so a larger ceiling
+# Granted per 1,000 bars. A NON-VECTORIZABLE strategy (every custom strategy-creator
+# type + built-ins not in _VECTORIZABLE_TYPES) runs the per-bar slow path at ~0.0045 s/bar
+# inline, but ~0.008-0.011 s/bar once Windows process-spawn + OHLCV pickle overhead is
+# added. The old 8 s/1k grant (cap 300s) left a 730-day/1h run (~17.5k bars) with only ~2s
+# of margin and HARD-capped larger windows below the real cost — so cost_stress,
+# confirmation_backtest and the 15m leg of timeframe_sweep timed out (or got razor-thin
+# margins) for slow strategies, silently blocking promotion. 16 s/1k @ a 600s ceiling gives
+# ~1.7-1.9x margin across windows while still killing a genuinely runaway strategy.
+_ISOLATION_TIMEOUT_PER_1K_BARS = 16  # extra seconds granted per 1,000 bars
+_BACKTEST_TIMEOUT_MAX = 600           # hard ceiling for a single backtest (10 min)
+_WALK_FORWARD_TIMEOUT_MAX = 900       # walk-forward re-runs N folds, so a larger ceiling
 
 
 def _scale_isolation_timeout(n_bars: int, base: int, ceiling: int) -> int:

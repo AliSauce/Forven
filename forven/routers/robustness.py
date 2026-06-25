@@ -100,6 +100,36 @@ _ROBUSTNESS_USER_RESERVED_SLOTS = 2  # always keep 2 slots free for user work
 # budget that bounds the global total rather than just one step's share.
 _ROBUSTNESS_RERUN_MAX_WORKERS = 4
 
+# Parameter-jitter sweep sizing. A NON-VECTORIZABLE strategy runs the slow per-bar
+# backtest path (~0.011 s/bar once process-isolation spawn + OHLCV pickle overhead is
+# added), so the old flat 240s deadline truncated the 30-rerun sweep to ~10 reruns and
+# then judged the required `param_jitter` verdict on that weak partial sample — a
+# false-negative that silently blocked promotion ("missing required verdict tests:
+# param_jitter"). We size the sweep to the per-backtest cost so the FULL sample
+# COMPLETES (a complete smaller sample beats a truncated one), keeping a statistical
+# floor. No verdict threshold is touched.
+_PARAM_JITTER_MIN_ITERATIONS = 15      # statistical floor — never run fewer than this
+_PARAM_JITTER_TARGET_SECONDS = 10 * 60  # wall-clock the full sweep should finish within
+_PARAM_JITTER_DEADLINE_CEILING = 18 * 60  # hard cap so a genuinely stuck rerun can't wedge the step
+
+
+def _estimate_rerun_seconds(strategy_type: object, n_bars: int) -> float:
+    """Estimate wall-clock for ONE isolated rerun backtest — sizing only, never affects results.
+
+    Non-vectorizable strategies use the per-bar slow path and are ~10x slower; the
+    per-bar constant already folds in process-isolation spawn/pickle overhead.
+    """
+    try:
+        from forven.strategies.backtest import _VECTORIZABLE_TYPES
+    except Exception:
+        _VECTORIZABLE_TYPES = frozenset()
+    per_bar = 0.0012 if str(strategy_type or "") in _VECTORIZABLE_TYPES else 0.011
+    try:
+        bars = max(0, int(n_bars))
+    except (TypeError, ValueError):
+        bars = 0
+    return max(2.0, bars * per_bar) + 6.0  # + a spawn-overhead floor
+
 
 def _resolve_robustness_workers(configured: object, *, n_tasks: int) -> int:
     """Thread-pool width for fanning out one robustness step's independent reruns.
@@ -1082,6 +1112,29 @@ def _run_param_jitter_analysis(body: ParamJitterBody) -> dict:
     # results. Net effect: the ~30-rerun sweep that used to truncate at its
     # wall-clock deadline (e.g. 10/30 reruns) now finishes the full sample in a
     # fraction of the time, giving the verdict its intended statistical power.
+    # Size the sweep to this strategy's per-backtest cost so the FULL sample completes
+    # (vs the old uncontrolled truncation at a flat deadline that produced a weak verdict
+    # on ~10/30 reruns). Cap iterations to what finishes within the target wall-clock,
+    # keeping a statistical floor; size the deadline to actually finish that sample.
+    jitter_workers = _resolve_robustness_workers(
+        robustness_cfg.get("param_jitter_workers"), n_tasks=n_iters
+    )
+    _est_rerun_s = _estimate_rerun_seconds(strategy_type, len(candles))
+    _feasible_iters = max(
+        _PARAM_JITTER_MIN_ITERATIONS,
+        int(_PARAM_JITTER_TARGET_SECONDS * jitter_workers / _est_rerun_s),
+    )
+    if _feasible_iters < n_iters:
+        log.info(
+            "param_jitter %s: sizing reruns %d->%d for slow backtest (~%.0fs each, %d workers) "
+            "so the full sample completes for a clean verdict",
+            body.strategy_id, n_iters, _feasible_iters, _est_rerun_s, jitter_workers,
+        )
+        n_iters = _feasible_iters
+        jitter_workers = _resolve_robustness_workers(
+            robustness_cfg.get("param_jitter_workers"), n_tasks=n_iters
+        )
+
     perturbations: list[dict] = []
     for _ in range(n_iters):
         perturbed_params = dict(base_params)
@@ -1106,19 +1159,23 @@ def _run_param_jitter_analysis(body: ParamJitterBody) -> dict:
             sync_strategy_state=False,  # perturbed params must never overwrite stored metrics or auto-promote
         )
 
-    jitter_workers = _resolve_robustness_workers(
-        robustness_cfg.get("param_jitter_workers"), n_tasks=len(perturbations)
+    # Deadline generous enough to COMPLETE the (now feasibly-sized) sample at the estimated
+    # per-rerun cost; honour a larger operator-configured deadline, and hard-cap so a
+    # genuinely stuck rerun can't wedge the gauntlet.
+    adaptive_deadline_s = min(
+        float(_PARAM_JITTER_DEADLINE_CEILING),
+        max(jitter_deadline_s, _est_rerun_s * n_iters / max(jitter_workers, 1) * 1.4 + 30.0),
     )
     runs, deadline_hit = _run_backtests_chunked_parallel(
         [(lambda p=p: _rerun(p)) for p in perturbations],
         workers=jitter_workers,
-        deadline_s=jitter_deadline_s,
+        deadline_s=adaptive_deadline_s,
     )
     if deadline_hit:
         log.warning(
             "param_jitter: deadline %.0fs hit after %d/%d reruns for %s (%d workers) — "
             "computing verdict from completed reruns",
-            jitter_deadline_s, len(runs), n_iters, body.strategy_id, jitter_workers,
+            adaptive_deadline_s, len(runs), n_iters, body.strategy_id, jitter_workers,
         )
 
     for iteration_idx, run in enumerate(runs):

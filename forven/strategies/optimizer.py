@@ -10,6 +10,7 @@ import itertools
 import json
 import logging
 import math
+import os
 import pkgutil
 import random
 import time
@@ -41,10 +42,88 @@ _NEVER_SIMULATED_RISK_AXES = frozenset(_UNSUPPORTED_BACKTEST_RISK_FIELDS)
 # Max combinations to prevent runaway searches
 MAX_GRID_COMBOS = 200
 TOP_N = 5  # Keep top N results
-GRID_SEARCH_WORKERS = 2  # Parallel backtest workers (kept low to avoid CPU saturation)
-COMBO_TIMEOUT_SECONDS = 30  # Per-combo timeout — kill stragglers
-GRID_TIMEOUT_SECONDS = 90  # Overall grid search timeout (90s — allows more strategies per cycle)
 MAX_OPTIMIZATION_TRIALS = 10_000
+
+# --- Adaptive grid execution budget ----------------------------------------
+# A non-vectorizable strategy (every custom strategy-creator type, plus built-ins
+# like atr_breakout that are NOT in backtest._VECTORIZABLE_TYPES) runs the per-bar
+# slow path at ~0.004 s/bar, so a single 365-day 1h backtest is ~35s. Vectorizable
+# built-ins are ~1000x faster. The old FIXED budget (2 workers, 90s overall, 30s
+# per combo) was tuned for the fast path and made slow-strategy optimization
+# mathematically impossible: 200 combos x 35s can never fit 90s, and a 30s combo
+# timeout < 35s killed every slow combo that DID finish. That stalled the whole
+# gauntlet (strategies could not pass `validation_optimization`, so nothing reached
+# walk-forward or paper). We now SIZE the grid to the estimated per-backtest cost so
+# both fast and slow strategies complete, comfortably inside the async polling budget
+# (the gauntlet abandons a still-'running' optimization only after
+# async_result_max_age_minutes, default 60min). No quality gate is touched: a slow
+# strategy simply gets a smaller (still real) LHS sample and must clear every
+# downstream robustness gate on its genuine metrics.
+GRID_SEARCH_WORKERS = 2  # legacy default; live worker count is adaptive (_grid_workers)
+COMBO_TIMEOUT_SECONDS = 30  # legacy default; live per-combo timeout is adaptive
+GRID_TIMEOUT_SECONDS = 90  # legacy default; live overall timeout is adaptive
+
+# Per-bar cost reflects the ISOLATED backtest (each combo runs in a spawned worker), which
+# measured ~0.009-0.011 s/bar end-to-end for the slow path — ~2x the ~0.0045 s/bar inline
+# cost — once Windows spawn + OHLCV pickle + the per-bar Python loop are all counted. Sizing
+# on the inline cost made the grid time out on its tail combos; the isolated estimate lets it
+# COMPLETE within budget.
+_SLOW_BACKTEST_SECONDS_PER_BAR = 0.0095        # measured isolated slow-path cost, padded
+_VECTORIZED_BACKTEST_SECONDS_PER_BAR = 0.0008  # vectorized path is ~10x+ faster (isolated)
+_PROCESS_SPAWN_OVERHEAD_SECONDS = 10.0         # residual per-combo spawn + candle IPC floor
+_GRID_TARGET_SECONDS = 15 * 60                 # wall-clock the grid AIMS to finish within (lets a FAST/vectorized strategy keep the full MAX_GRID_COMBOS grid; slow ones get a feasible LHS subset)
+_GRID_TIMEOUT_CEILING = 35 * 60                # never run a single grid longer than this (< 60min async budget)
+_GRID_MIN_COMBOS = 24                          # always sample at least this many — keep the search meaningful
+_GRID_MAX_WORKERS = 4                          # cap so live trading / scanners keep cores
+
+
+def _estimate_backtest_seconds(strategy_type: str | None, bars: int | None) -> float:
+    """Rough wall-clock for ONE backtest of `strategy_type` over `bars` candles.
+
+    Used only to SIZE the grid budget — never affects results. Non-vectorizable
+    strategies use the per-bar slow path and are ~10x+ slower than vectorized ones.
+    """
+    try:
+        from forven.strategies.backtest import _VECTORIZABLE_TYPES
+    except Exception:
+        _VECTORIZABLE_TYPES = frozenset()
+    n = int(bars) if bars else 8760
+    per_bar = (
+        _VECTORIZED_BACKTEST_SECONDS_PER_BAR
+        if str(strategy_type or "") in _VECTORIZABLE_TYPES
+        else _SLOW_BACKTEST_SECONDS_PER_BAR
+    )
+    return max(1.0, n * per_bar)
+
+
+def _grid_workers(n_combos: int) -> int:
+    cores = os.cpu_count() or 4
+    headroom = cores - 2 if cores > 3 else 2  # leave 2 cores for the live bot on multi-core hosts
+    return max(1, min(_GRID_MAX_WORKERS, headroom, max(1, n_combos)))
+
+
+def _grid_execution_budget(
+    strategy_type: str | None, bars: int | None, n_combos: int
+) -> tuple[int, int, float, float]:
+    """Return (workers, feasible_combos, combo_timeout_s, grid_timeout_s).
+
+    Sizes the grid so it finishes near `_GRID_TARGET_SECONDS` for the estimated
+    per-backtest cost, capped by `_GRID_TIMEOUT_CEILING` (well under the 60-min async
+    abandon budget so the optimization actually persists a result).
+    """
+    per_backtest = _estimate_backtest_seconds(strategy_type, bars)
+    per_combo = per_backtest + _PROCESS_SPAWN_OVERHEAD_SECONDS
+    workers = _grid_workers(n_combos)
+    feasible = max(_GRID_MIN_COMBOS, int(_GRID_TARGET_SECONDS * workers / per_combo))
+    feasible = min(feasible, n_combos)
+    # MUST generously exceed the full per-combo wall time (backtest + spawn + IPC), or a
+    # combo that actually finished gets reaped as a TimeoutError and counted as a loss.
+    combo_timeout = max(90.0, per_combo * 2.5)
+    grid_timeout = float(min(
+        _GRID_TIMEOUT_CEILING,
+        max(_GRID_TARGET_SECONDS, int(per_combo * feasible / max(workers, 1) * 1.5) + 60),
+    ))
+    return workers, feasible, combo_timeout, grid_timeout
 
 
 _LHS_SEED = 42  # Deterministic seed for reproducible LHS sampling
@@ -335,11 +414,24 @@ def grid_search(
         # "max_workers must be greater than 0". No viable grid → return no results.
         log.warning("Grid search %s: no parameter combinations to evaluate (empty grid)", strategy_id)
         return []
-    trial_budget = _trial_budget(max_trials)
+    # Size the grid to the estimated per-backtest cost so a slow (non-vectorizable)
+    # strategy still completes within the async budget. `feasible` caps how many
+    # combos can run in the wall-clock target; the explicit trial budget still wins
+    # when the operator asked for fewer.
+    _grid_workers_n, _grid_feasible, _grid_combo_timeout, _grid_overall_timeout = _grid_execution_budget(
+        strategy_type, bars, len(combos)
+    )
+    trial_budget = min(_trial_budget(max_trials), _grid_feasible)
     if len(combos) > trial_budget:
         # P2-4: Latin Hypercube Sampling instead of deterministic first-N truncation.
+        _total_combos = len(combos)
         combos = _lhs_sample(combos, param_ranges, trial_budget)
-        log.info("Grid search: %d total combos sampled to %d via LHS", len(list(itertools.product(*param_ranges))), len(combos))
+        log.info(
+            "Grid search %s: %d total combos sampled to %d via LHS (feasible=%d, workers=%d, "
+            "combo_timeout=%.0fs, grid_timeout=%.0fs, est_per_backtest=%.1fs)",
+            strategy_id, _total_combos, len(combos), _grid_feasible, _grid_workers_n,
+            _grid_combo_timeout, _grid_overall_timeout, _estimate_backtest_seconds(strategy_type, bars),
+        )
 
     # P2-5: Parameter coverage telemetry
     coverage = {}
@@ -440,7 +532,11 @@ def grid_search(
     results = []
     timed_out = 0
     failed = 0
-    workers = max(1, min(GRID_SEARCH_WORKERS, len(combos)))
+    # Adaptive budget (sized above for this strategy's per-backtest cost), re-clamped
+    # to the FINAL combo count so a tiny grid doesn't spin up idle workers.
+    workers = max(1, min(_grid_workers_n, len(combos)))
+    combo_timeout_s = _grid_combo_timeout
+    grid_timeout_s = _grid_overall_timeout
     grid_start = time.monotonic()
     overall_timeout_message: str | None = None
 
@@ -450,26 +546,26 @@ def grid_search(
             for i, combo in enumerate(combos)
         }
         try:
-            for future in as_completed(futures, timeout=GRID_TIMEOUT_SECONDS):
+            for future in as_completed(futures, timeout=grid_timeout_s):
                 try:
-                    result = future.result(timeout=COMBO_TIMEOUT_SECONDS)
+                    result = future.result(timeout=combo_timeout_s)
                     if result is not None:
                         results.append(result)
                     else:
                         failed += 1
                 except TimeoutError:
                     timed_out += 1
-                    log.debug("Grid search combo timed out after %ds", COMBO_TIMEOUT_SECONDS)
+                    log.debug("Grid search combo timed out after %.0fs", combo_timeout_s)
                 except Exception as exc:
                     failed += 1
                     log.debug("Grid search combo error: %s", exc)
         except TimeoutError:
             pending = sum(1 for future in futures if not future.done())
             overall_timeout_message = (
-                f"Grid search timed out after {GRID_TIMEOUT_SECONDS}s "
+                f"Grid search timed out after {grid_timeout_s:.0f}s "
                 f"({len(results)} valid, {failed} failed, {pending} still running)"
             )
-            log.warning("Grid search %s: overall timeout after %ds, cancelling remaining futures", strategy_id, GRID_TIMEOUT_SECONDS)
+            log.warning("Grid search %s: overall timeout after %.0fs, cancelling remaining futures", strategy_id, grid_timeout_s)
             for f in futures:
                 f.cancel()
 
@@ -613,7 +709,7 @@ def optimize_strategy(
             leverage=leverage,
         )
     except TimeoutError as exc:
-        detail = str(exc).strip() or f"Grid search timed out after {GRID_TIMEOUT_SECONDS}s"
+        detail = str(exc).strip() or "Grid search timed out"
         return {"error": detail}
 
     if not grid_results:
