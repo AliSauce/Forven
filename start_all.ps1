@@ -1184,6 +1184,18 @@ try {
     $rapidFailureWindow = [TimeSpan]::FromMinutes(2)
     $rapidFailureThreshold = 5
     $rapidFailureBackoffSeconds = 300
+    # How many consecutive failed /api/health probes are tolerated before restarting a
+    # backend that is STILL ALIVE and STILL LISTENING. The single-worker backend blocks
+    # /api/health while a heavy synchronous job runs (optimization, param-jitter, the
+    # gauntlet robustness suite), so the old 2-probe (~20s) trigger killed long-running
+    # jobs mid-flight — "Server restarted while job was running" — and that was worse
+    # during development when our own CPU-heavy scripts slowed the probe further. A dead
+    # backend is still caught immediately (it exits or frees the port). 120 probes @ 10s =
+    # ~20 min, which comfortably outlasts the longest legit job (a slow-strategy
+    # optimization or param-jitter sweep). Override with BACKEND_HEALTH_RESTART_CYCLES.
+    $backendHealthRestartCycles = if ($env:BACKEND_HEALTH_RESTART_CYCLES) {
+        [Math]::Max(2, [int]$env:BACKEND_HEALTH_RESTART_CYCLES)
+    } else { 120 }
 
     # Per-service failure tracking. Protects against crash-loops (e.g. invalid
     # Discord token → LoginFailure → exit → restart → repeat).
@@ -1284,7 +1296,11 @@ try {
             $script:ServiceState["backend"].unhealthyChecks += 1
             $backendListenerPids = @(Get-ListeningProcessIds -Port $backendPort)
             $backendProbeCount = [int]$script:ServiceState["backend"].unhealthyChecks
-            $shouldRestartBackend = $backendExited -or $backendListenerPids.Count -eq 0 -or $backendProbeCount -ge 2
+            # Restart ONLY on genuine death (process exited / no port listener) or after a
+            # long run of failed probes on a still-listening backend (a true hang, not a
+            # busy worker). A live+listening backend that fails a few probes is almost
+            # always mid-job — restarting it kills the job, so wait it out.
+            $shouldRestartBackend = $backendExited -or $backendListenerPids.Count -eq 0 -or $backendProbeCount -ge $backendHealthRestartCycles
             if ($shouldRestartBackend) {
                 $exitCode = if ($backendExited) { Get-SafeExitCode -Process $backendProc } else { 1 }
                 Update-ServiceFailure -Name "backend" -ExitCode $exitCode
@@ -1311,7 +1327,7 @@ try {
                     }
                 }
             } else {
-                Write-WarnMessage "Backend health check failed ($backendProbeCount/2); waiting one more watchdog cycle before restart."
+                Write-WarnMessage "Backend health check failed ($backendProbeCount/$backendHealthRestartCycles) but process is alive and listening (likely a heavy job blocking /api/health); not restarting."
             }
         }
 
