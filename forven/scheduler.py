@@ -3156,15 +3156,20 @@ def seed_forven_jobs():
         payload={"kind": "data_manager_collect_funding", "timeout_seconds": 180},
     )
 
-    # 14b. Data Engine catch-up — every 10 minutes. Drains the CatchUpPlanner
+    # 14b. Data Engine catch-up — every 30 minutes. Drains the CatchUpPlanner
     # backlog (the whole catalog, not just the active keep-alive set) so dormant
     # series stay current automatically instead of needing manual "Execute plan"
     # clicks. Gated on the wired data_engine_settings.auto_catchup_enabled flag.
+    # Cadence was 10 min, but each run tail-extends ~a dozen stale series via a full
+    # whole-file parquet rewrite (~4 min of CPU for ~20 bars), and on the single API
+    # worker that repeated burst starves the live WebSocket. The backlog is a slow
+    # drift, not real-time, so 30 min keeps dormant series acceptably current at
+    # ~1/3 the rewrite duty cycle. (The active set stays hot via the keep-alive.)
     add_job(
         job_id="forven-data-engine-catchup",
         name="Data Engine Catch-Up (auto-drain backfill plan)",
         schedule_type="interval",
-        schedule_expr="600000",
+        schedule_expr="1800000",
         command="data-engine-catchup",
         timezone_str="UTC",
         payload={"kind": "data_engine_catchup", "timeout_seconds": 300},
