@@ -67,13 +67,16 @@ def test_marker_descriptor_fields():
     assert short == {"side": "bear", "action": "short", "shape": "arrowDown", "color": "#f97316", "label": "SHORT"}
     cover = paper_domain._trade_marker_fields("short", "exit")
     assert cover == {"side": "bull", "action": "cover", "shape": "arrowUp", "color": "#14b8a6", "label": "COVER"}
-    # Triggers: muted hues, entry=green up / exit=red down, long/short kept in action.
-    tlong = paper_domain._trigger_marker_fields("long", "entry")
-    assert tlong == {"side": "bull", "action": "long_signal", "shape": "arrowUp", "color": "#4ade80"}
-    tshort = paper_domain._trigger_marker_fields("short", "entry")
-    assert tshort["action"] == "short_signal" and tshort["shape"] == "arrowUp" and tshort["color"] == "#4ade80"
-    texit = paper_domain._trigger_marker_fields("long", "exit")
-    assert texit == {"side": "bear", "action": "exit_signal", "shape": "arrowDown", "color": "#f87171"}
+    # Triggers use the BUY/SELL/SHORT/COVER convention: buy-side (long entry, short
+    # exit) = green ▲ below bar; sell-side (long exit, short entry) = red ▼ above bar.
+    assert paper_domain._trigger_marker_fields("long", "entry") == {
+        "side": "bull", "action": "buy", "shape": "arrowUp", "color": "#4ade80"}
+    assert paper_domain._trigger_marker_fields("short", "exit") == {
+        "side": "bull", "action": "cover", "shape": "arrowUp", "color": "#4ade80"}
+    assert paper_domain._trigger_marker_fields("long", "exit") == {
+        "side": "bear", "action": "sell", "shape": "arrowDown", "color": "#f87171"}
+    assert paper_domain._trigger_marker_fields("short", "entry") == {
+        "side": "bear", "action": "short", "shape": "arrowDown", "color": "#f87171"}
 
 
 def test_compute_chart_indicators_uses_registry():
@@ -153,12 +156,14 @@ def test_chart_bundle_assembles_everything(monkeypatch):
     # 1. Real indicators (registry), not guessed.
     assert {m["name"] for m in bundle["main_indicators"]} == {"ema_fast", "ema_slow"}
     assert any(s["name"] == "rsi" for s in bundle["sub_indicators"])
-    # 2. Full-history triggers — self-describing (muted arrows distinct from fills).
+    # 2. Full-history triggers — self-describing buy/sell/short/cover green/red triangles.
     assert bundle["trigger_entries"] and bundle["trigger_exits"]
     te = bundle["trigger_entries"][0]
-    assert te["shape"] == "arrowUp" and te["color"] == "#4ade80" and te["action"] in ("long_signal", "short_signal")
+    assert te["action"] in ("buy", "short")  # long-biased rsi → BUY (green ▲)
+    assert te["shape"] == "arrowUp" and te["color"] == "#4ade80"
     tx = bundle["trigger_exits"][0]
-    assert tx["shape"] == "arrowDown" and tx["color"] == "#f87171" and tx["action"] == "exit_signal"
+    assert tx["action"] in ("sell", "cover")
+    assert tx["shape"] == "arrowDown" and tx["color"] == "#f87171"
     # 3. Actual trade markers — the long entry/exit carry BUY/SELL descriptors.
     e1_entry = next(m for m in bundle["entry_markers"] if m["trade_id"] == "E1")
     assert e1_entry["action"] == "buy" and e1_entry["label"] == "BUY" and e1_entry["shape"] == "arrowUp"

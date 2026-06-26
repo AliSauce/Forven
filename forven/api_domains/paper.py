@@ -1540,16 +1540,26 @@ def _trade_marker_fields(direction: str, leg: str) -> dict:
 
 
 def _trigger_marker_fields(direction: str, leg: str) -> dict:
-    """Self-describing visual fields for a would-be TRIGGER. ``leg`` is 'entry'/'exit'.
+    """Self-describing visual fields for a would-be open/close TRIGGER, using the
+    BUY / SELL / SHORT / COVER convention so the full-history overlay reads like an
+    order log. ``leg`` is 'entry'/'exit'.
 
-    Entries are green up-arrows (below bar), exits red down-arrows (above bar); the
-    long/short nuance is preserved in ``action`` while the color/shape follow the
-    entry/exit convention the product owner asked for."""
+    Buy-side actions are GREEN up-triangles below the bar; sell-side actions are RED
+    down-triangles above the bar:
+      * long entry  → BUY   (buy-side, green ▲)
+      * short exit  → COVER (buy-side, green ▲)
+      * long exit   → SELL  (sell-side, red ▼)
+      * short entry → SHORT (sell-side, red ▼)
+    """
     is_short = str(direction or "long").strip().lower() == "short"
     if leg == "entry":
-        return {"side": "bull", "action": "short_signal" if is_short else "long_signal",
-                "shape": "arrowUp", "color": _MARK_TRIG_ENTRY}
-    return {"side": "bear", "action": "exit_signal", "shape": "arrowDown", "color": _MARK_TRIG_EXIT}
+        if is_short:  # SHORT — sell-side
+            return {"side": "bear", "action": "short", "shape": "arrowDown", "color": _MARK_TRIG_EXIT}
+        return {"side": "bull", "action": "buy", "shape": "arrowUp", "color": _MARK_TRIG_ENTRY}
+    # exit
+    if is_short:  # COVER — buy-side
+        return {"side": "bull", "action": "cover", "shape": "arrowUp", "color": _MARK_TRIG_ENTRY}
+    return {"side": "bear", "action": "sell", "shape": "arrowDown", "color": _MARK_TRIG_EXIT}
 
 
 def get_paper_session_markers(
@@ -1806,13 +1816,12 @@ def _kernel_trigger_markers(strat, frame, *, params, leverage, strategy_type, cu
     """Discrete historical trigger points = the entries/exits the KERNEL would make
     over the whole frame (ungated). These are EVENTS (one per would-be position
     open/close), not raw per-bar signal states — so a strategy whose exit condition
-    holds for long stretches doesn't light up every candle.
+    holds for long stretches doesn't light up every candle. Each is tagged
+    buy/sell/short/cover (green/red triangle) via ``_trigger_marker_fields``.
 
-    Only triggers strictly BEFORE ``cutoff`` (the first actual paper trade) are
-    emitted, so the live period is shown by real trade markers and the pre-live
-    period by would-be triggers — the 'what it would have done before it went live'
-    the operator asked for. When there are no real trades yet, the full would-be
-    history is shown."""
+    ``cutoff`` (an ISO timestamp) bounds which triggers are emitted to strictly
+    BEFORE it; ``None`` (the chart's default) emits the FULL would-be history so the
+    operator can compare the strategy's open/close logic against the actual trades."""
     import pandas as pd
     from forven.strategies import backtest as _bt
 
@@ -1878,11 +1887,6 @@ def get_paper_session_chart(
     entry_markers = [m for m in marker_bundle.get("entries", []) if m.get("marker_kind") == "trade"]
     exit_markers = [m for m in marker_bundle.get("exits", []) if m.get("marker_kind") == "trade"]
 
-    # Pre-live cutoff = the FIRST actual paper trade; would-be triggers are only shown
-    # before it (the live period is covered by the real trade markers).
-    _entry_ts = [pd.to_datetime(m.get("timestamp"), utc=True, errors="coerce") for m in entry_markers]
-    _entry_ts = [t for t in _entry_ts if t is not None and not pd.isna(t)]
-    cutoff = min(_entry_ts) if _entry_ts else None
     leverage = float(params.get("leverage", 1.0) or 1.0)
 
     if frame is not None and len(frame) >= 2:
@@ -1892,8 +1896,11 @@ def get_paper_session_chart(
         else:
             warnings.append(f"No indicator overlay available for strategy type '{strategy_type or 'unknown'}'.")
         strat = _resolve_chart_strategy(session, params)
+        # Full-history triggers: EVERY would-be open/close (buy/sell/short/cover) the
+        # strategy makes across the whole chart, as green/red triangles — so the
+        # operator can compare the strategy's signals against the actual trades.
         trigger_entries, trigger_exits = _kernel_trigger_markers(
-            strat, frame, params=params, leverage=leverage, strategy_type=strategy_type, cutoff=cutoff,
+            strat, frame, params=params, leverage=leverage, strategy_type=strategy_type, cutoff=None,
         )
 
     # Active levels from the open position. Every level is self-describing
