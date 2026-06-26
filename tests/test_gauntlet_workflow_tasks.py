@@ -54,6 +54,26 @@ def test_quick_screen_runtime_error_blocks_without_rejecting_strategy(forven_db,
     assert row["status"] == "quick_screen"
 
 
+def test_trade_mode_unsupported_is_terminal_not_retryable():
+    """A strategy type that can't run the requested trade_mode is a fixed
+    config<->code mismatch — classify it failed_gate (terminal), never a retryable
+    blocked_runtime, so the advancer drains it instead of re-queuing every cycle."""
+    from forven.gauntlet.tasks import _classify_exception
+
+    for msg in (
+        "Strategy 'donchian_regime_short' does not support trade_mode='short_only'",
+        "Strategy 'rsi_momentum' does not support trade_mode='both'",
+    ):
+        verdict = _classify_exception(ValueError(msg))
+        assert verdict["status"] == "failed_gate", msg
+        assert verdict["retryable"] is False, msg
+
+    # Control: a genuine transient runtime error stays retryable.
+    transient = _classify_exception(RuntimeError("backtest engine unavailable"))
+    assert transient["status"] == "blocked_runtime"
+    assert transient["retryable"] is True
+
+
 def test_quick_screen_pass_advances_to_gate(forven_db, monkeypatch):
     kv_set("forven:pipeline:settings", {"gauntlet_auto_quick_screen_enabled": True})
     created = create_lifecycle_strategy(
@@ -225,7 +245,7 @@ def test_validation_optimization_uses_best_sweep_timeframe(forven_db, monkeypatc
     assert seen["timeframe"] == "4h"
 
 
-def test_apply_optimized_defaults_updates_strategy_params_and_records_artifact(forven_db):
+def test_apply_optimized_defaults_updates_strategy_params_and_records_artifact(forven_db, monkeypatch):
     strategy_id = _created_strategy_for_workflow()
     workflow = create_or_get_workflow(strategy_id=strategy_id, created_by="pytest", settings_snapshot=build_settings_snapshot())
     detail = get_workflow_detail(workflow["id"])
@@ -235,6 +255,21 @@ def test_apply_optimized_defaults_updates_strategy_params_and_records_artifact(f
         opt_step["id"],
         "passed",
         output={"result_id": "OPT-1", "timeframe": "4h", "best_params": {"rsi_period": 21, "rsi_entry": 35}},
+    )
+
+    # Apply is now gated by the optimization-acceptance chokepoint (the gate's
+    # accept/reject logic is covered by test_optimization_acceptance.py). Force a
+    # positive decision here so this test stays focused on the gauntlet's WRITE
+    # mechanics (params/timeframe/metrics/artifact) on the accept path.
+    from forven.strategies.optimization_acceptance import AcceptanceDecision
+
+    def _force_accept(*, write_fn, **_kwargs):
+        decision = AcceptanceDecision(accepted=True, code="accepted", reason="forced for apply-mechanics test")
+        write_fn(decision)
+        return {"applied": True, "code": "accepted", "reason": "forced", "decision": decision.as_record()}
+
+    monkeypatch.setattr(
+        "forven.strategies.optimization_acceptance.apply_optimized_params_if_accepted", _force_accept
     )
 
     from forven.gauntlet.tasks import run_apply_optimized_defaults

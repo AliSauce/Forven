@@ -186,8 +186,22 @@ export async function submitOptimization(request: {
 	end?: string;
 	definition_json?: Record<string, unknown>;
 	parameter_ranges?: Record<string, { min: number; max: number; step: number }>;
+	execution_parameter_ranges?: Record<string, { min: number; max: number; step: number }>;
+	execution_profile?: Record<string, unknown>;
+	initial_capital?: number;
 	fee_bps?: number;
 	slippage_bps?: number;
+	leverage?: number;
+	sizing_mode?: string;
+	fixed_size?: number;
+	risk_per_trade?: number;
+	atr_stop_multiplier?: number;
+	kelly_multiplier?: number;
+	kelly_lookback?: number;
+	stop_loss_pct?: number;
+	take_profit_pct?: number;
+	trailing_stop_pct?: number;
+	time_stop_bars?: number;
 	lifecycle_id?: string;
 }): Promise<{ job_id: string; status: string }> {
 	return fetchApi('/optimizations', {

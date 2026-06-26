@@ -412,15 +412,16 @@ function Install-BackendDeps {
     try {
         Invoke-Checked -FilePath $Python -CommandArgs @("-m","pip","install","-e",".")
     } catch {
-        Write-WarnMessage "pip install -e . failed; installing runtime deps directly."
+        Write-WarnMessage "pip install -e . failed; installing declared runtime deps from pyproject."
         & $Python -m pip uninstall -y forven | Out-Null
-        Invoke-Checked -FilePath $Python -CommandArgs @(
-            "-m","pip","install",
-            "click>=8.0","rich>=13.0","httpx>=0.25","PyJWT>=2.8","cryptography>=41.0","croniter>=2.0",
-            "filelock>=3.13","discord.py>=2.3","chromadb>=0.5","numpy>=1.26","pandas>=2.2",
-            "python-multipart>=0.0.9","fastapi>=0.111.0","uvicorn>=0.30.0","websockets>=13.0,<17","slowapi>=0.1.9","alembic>=1.13.0","pyarrow>=16.0.0","ccxt>=4.5.0",
-            "eth-account>=0.13.0","hyperliquid-python-sdk>=0.22.0"
-        )
+        # Derive the dependency set from pyproject (via the preflight helper) so this
+        # fallback can never drift from the declared deps the way a hand-list did
+        # (it had a stale pandas pin and a spurious 'alembic' forven never imports).
+        $declared = @(& $Python -m forven.preflight --print-deps 2>$null | Where-Object { $_ -and $_.Trim() })
+        if ($declared.Count -lt 1) {
+            Throw-StartAllError "Could not read declared dependencies from pyproject for the fallback install."
+        }
+        Invoke-Checked -FilePath $Python -CommandArgs (@("-m","pip","install") + $declared)
     }
 }
 
@@ -1091,11 +1092,19 @@ $env:PYTHONPATH = if ([string]::IsNullOrWhiteSpace($env:PYTHONPATH)) { $script:R
 
 $npm = Get-NpmCommand
 $python = [string](Ensure-Venv | Select-Object -Last 1)
-if (-not (Test-ModuleAvailable -PythonCommand $python -ModuleName "forven.api") -or
-    -not (Test-ModuleAvailable -PythonCommand $python -ModuleName "uvicorn") -or
-    -not (Test-ModuleAvailable -PythonCommand $python -ModuleName "websockets") -or
-    -not (Test-ModuleAvailable -PythonCommand $python -ModuleName "multipart")) {
+# Dependency completeness is driven by pyproject (the single source of truth) via
+# the preflight module, NOT a hand-maintained import probe that silently drifts:
+# the old 4-module check missed every lazily-imported dep (feedparser, trafilatura,
+# yt-dlp, ...), so a fresh/partial venv booted "healthy" and broke mid-operation.
+# Install on any gap, then re-verify and fail loudly if still unsatisfied.
+& $python -m forven.preflight
+if ($LASTEXITCODE -ne 0) {
+    Write-Info "Dependency preflight reported gaps; installing backend deps..."
     Install-BackendDeps -Python $python
+    & $python -m forven.preflight
+    if ($LASTEXITCODE -ne 0) {
+        Throw-StartAllError "Backend dependencies still unsatisfied after install (see preflight output above)."
+    }
 }
 Ensure-FrontendDeps -Npm $npm
 
@@ -1184,6 +1193,18 @@ try {
     $rapidFailureWindow = [TimeSpan]::FromMinutes(2)
     $rapidFailureThreshold = 5
     $rapidFailureBackoffSeconds = 300
+    # How many consecutive failed /api/health probes are tolerated before restarting a
+    # backend that is STILL ALIVE and STILL LISTENING. The single-worker backend blocks
+    # /api/health while a heavy synchronous job runs (optimization, param-jitter, the
+    # gauntlet robustness suite), so the old 2-probe (~20s) trigger killed long-running
+    # jobs mid-flight — "Server restarted while job was running" — and that was worse
+    # during development when our own CPU-heavy scripts slowed the probe further. A dead
+    # backend is still caught immediately (it exits or frees the port). 120 probes @ 10s =
+    # ~20 min, which comfortably outlasts the longest legit job (a slow-strategy
+    # optimization or param-jitter sweep). Override with BACKEND_HEALTH_RESTART_CYCLES.
+    $backendHealthRestartCycles = if ($env:BACKEND_HEALTH_RESTART_CYCLES) {
+        [Math]::Max(2, [int]$env:BACKEND_HEALTH_RESTART_CYCLES)
+    } else { 120 }
 
     # Per-service failure tracking. Protects against crash-loops (e.g. invalid
     # Discord token → LoginFailure → exit → restart → repeat).
@@ -1284,7 +1305,11 @@ try {
             $script:ServiceState["backend"].unhealthyChecks += 1
             $backendListenerPids = @(Get-ListeningProcessIds -Port $backendPort)
             $backendProbeCount = [int]$script:ServiceState["backend"].unhealthyChecks
-            $shouldRestartBackend = $backendExited -or $backendListenerPids.Count -eq 0 -or $backendProbeCount -ge 2
+            # Restart ONLY on genuine death (process exited / no port listener) or after a
+            # long run of failed probes on a still-listening backend (a true hang, not a
+            # busy worker). A live+listening backend that fails a few probes is almost
+            # always mid-job — restarting it kills the job, so wait it out.
+            $shouldRestartBackend = $backendExited -or $backendListenerPids.Count -eq 0 -or $backendProbeCount -ge $backendHealthRestartCycles
             if ($shouldRestartBackend) {
                 $exitCode = if ($backendExited) { Get-SafeExitCode -Process $backendProc } else { 1 }
                 Update-ServiceFailure -Name "backend" -ExitCode $exitCode
@@ -1311,7 +1336,7 @@ try {
                     }
                 }
             } else {
-                Write-WarnMessage "Backend health check failed ($backendProbeCount/2); waiting one more watchdog cycle before restart."
+                Write-WarnMessage "Backend health check failed ($backendProbeCount/$backendHealthRestartCycles) but process is alive and listening (likely a heavy job blocking /api/health); not restarting."
             }
         }
 

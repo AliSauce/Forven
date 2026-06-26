@@ -94,3 +94,31 @@ def test_param_jitter_effective_iterations_are_capped():
     requested = 500
     n_iters = min(max(int(requested), 1), cap)
     assert n_iters == cap
+
+
+def test_param_jitter_deadline_cap_finishes_before_the_outer_hard_kill():
+    """The graceful param-jitter deadline must leave room for the final in-flight
+    rerun + verdict computation before the OUTER hard kill (submit 600s / gauntlet
+    300s). Otherwise the worker is hard-killed with NO verdict — the exact
+    false-negative ('missing required verdict tests: param_jitter') the adaptive
+    sizing set out to remove. Regression guard for that off-by-budget bug."""
+    from forven.routers.robustness import (
+        _PARAM_JITTER_DEADLINE_MARGIN_S,
+        _param_jitter_deadline_cap_s,
+    )
+
+    est_rerun_s = 54.0  # ~a non-vectorizable strategy at the default 4380-bar cap
+
+    # Gauntlet step tick (~300s): the deadline + one final in-flight rerun (the
+    # chunk runner only stops AFTER a rerun crosses the deadline) must finish < 300s.
+    gauntlet_cap = _param_jitter_deadline_cap_s(300.0, est_rerun_s)
+    assert gauntlet_cap + est_rerun_s < 300.0
+    assert gauntlet_cap == max(60.0, 300.0 - est_rerun_s - _PARAM_JITTER_DEADLINE_MARGIN_S)
+
+    # Submit path (600s): same safety invariant, and it gets to use more of its budget.
+    submit_cap = _param_jitter_deadline_cap_s(600.0, est_rerun_s)
+    assert submit_cap + est_rerun_s < 600.0
+    assert submit_cap > gauntlet_cap
+
+    # Never drops below the 60s floor, even with an implausibly small budget.
+    assert _param_jitter_deadline_cap_s(30.0, est_rerun_s) == 60.0

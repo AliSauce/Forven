@@ -77,7 +77,7 @@ function buildStrategy(metrics: LifecycleStrategy['metrics'] = null): LifecycleS
 }
 
 describe('buildQuickScreenEvidenceRows', () => {
-	it('builds evidence rows from backtest metrics and validation artifacts', () => {
+	it('builds the three quick-screen entry-gate rows from backtest metrics', () => {
 		const rows = buildQuickScreenEvidenceRows({
 			strategy: buildStrategy(),
 			backtests: [
@@ -87,77 +87,10 @@ describe('buildQuickScreenEvidenceRows', () => {
 					max_drawdown_pct: 18.7,
 				}),
 			],
-			validationHistory: [
-				{
-					result_id: 'V1001',
-					strategy_id: 'S0001',
-					result_type: 'walk_forward',
-					symbol: 'BTC/USDT',
-					timeframe: '1h',
-					start_date: '2025-01-01T00:00:00Z',
-					end_date: '2025-12-31T00:00:00Z',
-					metrics: {},
-					config: {},
-					created_at: '2026-04-01T00:00:00Z',
-					deleted_at: null,
-				},
-				{
-					result_id: 'V1002',
-					strategy_id: 'S0001',
-					result_type: 'monte_carlo',
-					symbol: 'BTC/USDT',
-					timeframe: '1h',
-					start_date: '2025-01-01T00:00:00Z',
-					end_date: '2025-12-31T00:00:00Z',
-					metrics: {},
-					config: {},
-					created_at: '2026-04-01T00:00:00Z',
-					deleted_at: null,
-				},
-				{
-					result_id: 'V1003',
-					strategy_id: 'S0001',
-					result_type: 'param_jitter',
-					symbol: 'BTC/USDT',
-					timeframe: '1h',
-					start_date: '2025-01-01T00:00:00Z',
-					end_date: '2025-12-31T00:00:00Z',
-					metrics: {},
-					config: {},
-					created_at: '2026-04-01T00:00:00Z',
-					deleted_at: null,
-				},
-				{
-					result_id: 'V1004',
-					strategy_id: 'S0001',
-					result_type: 'cost_stress',
-					symbol: 'BTC/USDT',
-					timeframe: '1h',
-					start_date: '2025-01-01T00:00:00Z',
-					end_date: '2025-12-31T00:00:00Z',
-					metrics: {},
-					config: {},
-					created_at: '2026-04-01T00:00:00Z',
-					deleted_at: null,
-				},
-				{
-					result_id: 'V1005',
-					strategy_id: 'S0001',
-					result_type: 'regime_split',
-					symbol: 'BTC/USDT',
-					timeframe: '1h',
-					start_date: '2025-01-01T00:00:00Z',
-					end_date: '2025-12-31T00:00:00Z',
-					metrics: {},
-					config: {},
-					created_at: '2026-04-01T00:00:00Z',
-					deleted_at: null,
-				},
-			],
 			pipelineSettings,
 		});
 
-		expect(rows).toHaveLength(4);
+		expect(rows).toHaveLength(3);
 		expect(rows).toEqual([
 			{
 				key: 'is_sharpe_ratio',
@@ -166,14 +99,6 @@ describe('buildQuickScreenEvidenceRows', () => {
 				actual: '0.82',
 				required: '> 0.50',
 				detail: 'Actual 0.82 | Required > 0.50',
-			},
-			{
-				key: 'validation_coverage',
-				label: 'Validation Coverage',
-				status: 'passed',
-				actual: '5/5',
-				required: 'All required artifacts present',
-				detail: 'Validation artifacts present: 5/5',
 			},
 			{
 				key: 'minimum_return',
@@ -194,11 +119,23 @@ describe('buildQuickScreenEvidenceRows', () => {
 		]);
 	});
 
-	it('marks missing evidence as warning or failed rows', () => {
+	it('does NOT gate on the gauntlet validation suite at quick-screen', () => {
+		// Regression: a 'Validation Coverage' row requiring 5 robustness artifacts used to be
+		// emitted here, false-blocking every candidate at 0/5 since that suite only runs INSIDE
+		// the gauntlet. The requirement belongs to gauntlet -> paper readiness, not quick-screen.
+		const rows = buildQuickScreenEvidenceRows({
+			strategy: buildStrategy(),
+			backtests: [buildBacktest({ in_sample_sharpe: 0.82, total_return_pct: 12.4, max_drawdown_pct: 18.7 })],
+			pipelineSettings,
+		});
+		expect(rows.map((r) => r.key)).toEqual(['is_sharpe_ratio', 'minimum_return', 'max_drawdown']);
+		expect(rows.some((r) => r.key === 'validation_coverage')).toBe(false);
+	});
+
+	it('marks missing evidence as warning rows', () => {
 		const rows = buildQuickScreenEvidenceRows({
 			strategy: null,
 			backtests: [],
-			validationHistory: [],
 			pipelineSettings,
 		});
 
@@ -210,14 +147,6 @@ describe('buildQuickScreenEvidenceRows', () => {
 				actual: 'Unavailable',
 				required: '> 0.50',
 				detail: 'Unavailable | Required > 0.50',
-			},
-			{
-				key: 'validation_coverage',
-				label: 'Validation Coverage',
-				status: 'failed',
-				actual: '0/5',
-				required: 'All required artifacts present',
-				detail: 'Validation artifacts present: 0/5; missing all required artifacts',
 			},
 			{
 				key: 'minimum_return',
@@ -236,93 +165,5 @@ describe('buildQuickScreenEvidenceRows', () => {
 				detail: 'Unavailable | Required < 40%',
 			},
 		]);
-	});
-
-	it('ignores explicit failed or pending validation artifacts when counting coverage', () => {
-		const rows = buildQuickScreenEvidenceRows({
-			strategy: buildStrategy(),
-			backtests: [
-				buildBacktest({
-					in_sample_sharpe: 0.82,
-					total_return_pct: 12.4,
-					max_drawdown_pct: 18.7,
-				}),
-			],
-			validationHistory: [
-				{
-					result_id: 'V2001',
-					strategy_id: 'S0001',
-					result_type: 'walk_forward',
-					symbol: 'BTC/USDT',
-					timeframe: '1h',
-					start_date: '2025-01-01T00:00:00Z',
-					end_date: '2025-12-31T00:00:00Z',
-					metrics: {},
-					config: { status: 'failed' },
-					created_at: '2026-04-01T00:00:00Z',
-					deleted_at: null,
-				},
-				{
-					result_id: 'V2002',
-					strategy_id: 'S0001',
-					result_type: 'monte_carlo',
-					symbol: 'BTC/USDT',
-					timeframe: '1h',
-					start_date: '2025-01-01T00:00:00Z',
-					end_date: '2025-12-31T00:00:00Z',
-					metrics: {},
-					config: { status: 'pending' },
-					created_at: '2026-04-01T00:00:00Z',
-					deleted_at: null,
-				},
-				{
-					result_id: 'V2003',
-					strategy_id: 'S0001',
-					result_type: 'param_jitter',
-					symbol: 'BTC/USDT',
-					timeframe: '1h',
-					start_date: '2025-01-01T00:00:00Z',
-					end_date: '2025-12-31T00:00:00Z',
-					metrics: {},
-					config: {},
-					created_at: '2026-04-01T00:00:00Z',
-					deleted_at: null,
-				},
-				{
-					result_id: 'V2004',
-					strategy_id: 'S0001',
-					result_type: 'cost_stress',
-					symbol: 'BTC/USDT',
-					timeframe: '1h',
-					start_date: '2025-01-01T00:00:00Z',
-					end_date: '2025-12-31T00:00:00Z',
-					metrics: {},
-					config: { status: '' },
-					created_at: '2026-04-01T00:00:00Z',
-					deleted_at: null,
-				},
-				{
-					result_id: 'V2005',
-					strategy_id: 'S0001',
-					result_type: 'regime_split',
-					symbol: 'BTC/USDT',
-					timeframe: '1h',
-					start_date: '2025-01-01T00:00:00Z',
-					end_date: '2025-12-31T00:00:00Z',
-					metrics: {},
-					config: { status: 'completed' },
-					created_at: '2026-04-01T00:00:00Z',
-					deleted_at: null,
-				},
-			],
-			pipelineSettings,
-		});
-
-		expect(rows[1]).toMatchObject({
-			key: 'validation_coverage',
-			actual: '3/5',
-			required: 'All required artifacts present',
-		});
-		expect(rows[1].detail).toContain('Validation artifacts present: 3/5');
 	});
 });

@@ -50,6 +50,7 @@ from forven.db import (
 from forven.scheduler import (
     get_jobs,
     ensure_monitoring_jobs,
+    migrate_data_engine_catchup_cadence,
     migrate_data_manager_jobs,
     migrate_legacy_scanner_cadence,
     reconcile_forven_jobs,
@@ -129,40 +130,63 @@ class ForvenV1CompatMiddleware(BaseHTTPMiddleware):
 		return response
 
 
-def _bootstrap_scheduler_jobs():
-    """Ensure scheduler table has expected defaults even when bot isn't running."""
-    try:
-        from forven.db import init_db
+_SCHEDULER_BOOTSTRAP_DONE = False
+_SCHEDULER_BOOTSTRAP_LOCK = threading.Lock()
 
-        init_db()
-        # One-time gauntlet migration: demote strategies without canonical backtest
-        try:
-            from forven.brain import run_gauntlet_backtest_migration
-            run_gauntlet_backtest_migration()
-        except Exception as exc:
-            log.warning("Gauntlet backtest migration failed: %s", exc)
-        existing_jobs = get_jobs()
-        if not existing_jobs:
-            seed_forven_jobs()
-            log.info("Seeded default scheduler jobs from API bootstrap")
+
+def _bootstrap_scheduler_jobs(force: bool = False):
+    """Ensure scheduler table has expected defaults even when bot isn't running.
+
+    Runs ONCE per process. get_scheduler() — an ops endpoint the dashboard polls
+    — calls this on every request; without this guard each poll re-ran the full
+    init_db() (all schema scripts + every migration) + the gauntlet backtest
+    migration + job reconciliation, which a py-spy profile showed as steady-state
+    CPU on the single API worker. The work is idempotent, so once per process is
+    enough. Pass force=True to re-run intentionally (e.g. after a factory reset).
+    """
+    global _SCHEDULER_BOOTSTRAP_DONE
+    if _SCHEDULER_BOOTSTRAP_DONE and not force:
+        return
+    with _SCHEDULER_BOOTSTRAP_LOCK:
+        if _SCHEDULER_BOOTSTRAP_DONE and not force:
             return
+        try:
+            from forven.db import init_db
 
-        reconciliation = reconcile_forven_jobs()
-        added_monitoring = ensure_monitoring_jobs()
-        migrated_scanner = migrate_legacy_scanner_cadence()
-        migrated_data_jobs = migrate_data_manager_jobs()
-        if reconciliation["removed"] or reconciliation["added"] or added_monitoring or migrated_data_jobs:
-            log.info(
-                "Scheduler reconciliation from API bootstrap: removed=%d added=%d monitoring_added=%d data_jobs_migrated=%d",
-                reconciliation["removed"],
-                reconciliation["added"],
-                added_monitoring,
-                migrated_data_jobs,
-            )
-        elif migrated_scanner:
-            log.info("Applied scheduler legacy migration: scanner cadence updated")
-    except Exception as e:
-        log.error("API scheduler bootstrap failed: %s", e)
+            init_db()
+            # One-time gauntlet migration: demote strategies without canonical backtest
+            try:
+                from forven.brain import run_gauntlet_backtest_migration
+                run_gauntlet_backtest_migration()
+            except Exception as exc:
+                log.warning("Gauntlet backtest migration failed: %s", exc)
+            existing_jobs = get_jobs()
+            if not existing_jobs:
+                seed_forven_jobs()
+                log.info("Seeded default scheduler jobs from API bootstrap")
+            else:
+                reconciliation = reconcile_forven_jobs()
+                added_monitoring = ensure_monitoring_jobs()
+                migrated_scanner = migrate_legacy_scanner_cadence()
+                migrated_data_jobs = migrate_data_manager_jobs()
+                migrated_catchup = migrate_data_engine_catchup_cadence()
+                if reconciliation["removed"] or reconciliation["added"] or added_monitoring or migrated_data_jobs:
+                    log.info(
+                        "Scheduler reconciliation from API bootstrap: removed=%d added=%d monitoring_added=%d data_jobs_migrated=%d",
+                        reconciliation["removed"],
+                        reconciliation["added"],
+                        added_monitoring,
+                        migrated_data_jobs,
+                    )
+                elif migrated_scanner or migrated_catchup:
+                    log.info(
+                        "Applied scheduler legacy migration: scanner=%s catchup_cadence=%s",
+                        migrated_scanner, migrated_catchup,
+                    )
+        except Exception as e:
+            log.error("API scheduler bootstrap failed: %s", e)
+            return
+        _SCHEDULER_BOOTSTRAP_DONE = True
 
 
 async def _on_startup():
@@ -3235,8 +3259,22 @@ class OptimizationSubmitBody(BaseModel):
     # Per-stage window override (calendar days); see BacktestSubmitBody.duration_days.
     duration_days: int | None = Field(default=None, ge=0, le=36500)
     definition_json: dict | None = None
+    initial_capital: float | None = Field(default=None, gt=0, le=1e12)
     fee_bps: float | None = Field(default=None, ge=0, le=1000)
     slippage_bps: float | None = Field(default=None, ge=0, le=1000)
+    leverage: float | None = Field(default=None, gt=0, le=125)
+    sizing_mode: str | None = None
+    fixed_size: float | None = Field(default=None, gt=0, le=1e12)
+    risk_per_trade: float | None = Field(default=None, gt=0, le=1)
+    atr_stop_multiplier: float | None = Field(default=None, gt=0, le=50)
+    kelly_multiplier: float | None = Field(default=None, gt=0, le=5)
+    kelly_lookback: int | None = Field(default=None, ge=1, le=100_000)
+    stop_loss_pct: float | None = Field(default=None, gt=0, le=100)
+    take_profit_pct: float | None = Field(default=None, gt=0, le=1000)
+    trailing_stop_pct: float | None = Field(default=None, gt=0, le=100)
+    time_stop_bars: int | None = Field(default=None, ge=1, le=1_000_000)
+    execution_profile: dict | None = None
+    execution_parameter_ranges: dict | None = None
     lifecycle_id: str | None = None
 
 
@@ -10175,6 +10213,88 @@ def _collect_backtest_execution_controls(payload: object) -> dict[str, object]:
     return controls
 
 
+def _collect_honored_backtest_execution_controls(payload: object) -> dict[str, object]:
+    fields = (
+        "sizing_mode",
+        "fixed_size",
+        "risk_per_trade",
+        "atr_stop_multiplier",
+        "kelly_multiplier",
+        "kelly_lookback",
+        "stop_loss_pct",
+        "take_profit_pct",
+        "trailing_stop_pct",
+        "time_stop_bars",
+    )
+    controls: dict[str, object] = {}
+    for field_name in fields:
+        if isinstance(payload, dict):
+            value = payload.get(field_name)
+        else:
+            value = getattr(payload, field_name, None)
+        if value is not None:
+            controls[field_name] = value
+    return controls
+
+
+def _execution_profile_parity_warnings(controls: dict | None, leverage: float | None = None) -> list[str]:
+    """Warn when a backtest's execution profile cannot be reproduced by the live
+    (paper/live) risk path, so its returns won't translate to deployment.
+
+    Near-zero false positives: it evaluates parity ONLY when an execution profile
+    is explicitly set, and stays silent when the profile genuinely matches live —
+    risk-budget sizing (fraction/atr) within the live per-trade cap, no
+    live-unsupported exits, sane leverage. Live limits are resolved live so an
+    operator who raised their per-trade cap isn't warned with a stale threshold.
+    """
+    controls = controls if isinstance(controls, dict) else {}
+    # A default backtest carries NO execution profile (empty controls) — that is
+    # the known legacy full-notional default, not an operator choice, so warning on
+    # it every time (and persisting it to every history row) is pure noise. Only an
+    # explicitly-set profile is worth a parity check.
+    if not controls:
+        return []
+    warnings: list[str] = []
+    try:
+        from forven.exchange.risk import _get_risk_limits
+
+        limits = _get_risk_limits()
+        # The live HARD cap is max_risk_per_trade (can_open rejects above it and
+        # otherwise honors the requested risk in full); per_strategy_max is only a
+        # default, so comparing against it false-positives at the common 1-2% risk.
+        per_trade_cap = float(limits.get("max_risk_per_trade", 0.02) or 0.02)
+    except Exception:
+        per_trade_cap = 0.02
+
+    sizing_mode = str(controls.get("sizing_mode") or "full").strip().lower() or "full"
+    if sizing_mode not in ("fraction", "atr"):
+        warnings.append(
+            f"Backtest sizing '{sizing_mode}' is not used live — the live path sizes by risk budget "
+            f"over the stop distance, so these returns may not be achievable live."
+        )
+    else:
+        try:
+            effective_risk = float(controls.get("risk_per_trade") or 0.02)
+        except (TypeError, ValueError):
+            effective_risk = 0.02
+        if effective_risk > per_trade_cap + 1e-9:
+            warnings.append(
+                f"Backtest risk/trade (~{effective_risk:.1%}) exceeds the live per-trade cap ({per_trade_cap:.1%}) — "
+                f"live will reject or shrink it, understating drawdown and overstating returns."
+            )
+    if controls.get("trailing_stop_pct") is not None:
+        warnings.append("Trailing stop has no live equivalent (the scanner takes its stop from the signal); the live edge may differ.")
+    if controls.get("time_stop_bars") is not None:
+        warnings.append("Time-stop (N-bar exit) has no live equivalent in the scanner; the live edge may differ.")
+    try:
+        lev = float(leverage) if leverage is not None else None
+    except (TypeError, ValueError):
+        lev = None
+    if lev is not None and lev > 10:
+        warnings.append(f"Backtest leverage {lev:g}x is far above what the live risk budget can deploy; high-leverage sim returns won't translate.")
+    return warnings
+
+
 def _validate_local_backtest_risk_controls(
     params: dict | None,
     *,
@@ -10558,6 +10678,12 @@ def post_backtest_submit(body: BacktestSubmitBody, *, skip_auto_trash: bool = Fa
         "preserve_result": bool(body.preserve_result),
     }
     compact_config = {k: v for k, v in config_payload.items() if v is not None}
+    # Flag when this backtest's execution profile can't be reproduced live, so the
+    # operator sees it on submit AND on every history row (persisted in config).
+    execution_profile_warnings = _execution_profile_parity_warnings(manual_execution_controls, leverage=body.leverage)
+    if execution_profile_warnings:
+        _existing = compact_config.get("warnings")
+        compact_config["warnings"] = (list(_existing) if isinstance(_existing, list) else []) + execution_profile_warnings
 
     lifecycle_tag = str(body.lifecycle_id).strip() if body.lifecycle_id else strategy_id
 
@@ -10676,6 +10802,8 @@ def post_backtest_submit(body: BacktestSubmitBody, *, skip_auto_trash: bool = Fa
     response: dict = {"job_id": job_id, "status": "succeeded", "result_id": result_id}
     if risk_parity_warning:
         response["warning"] = risk_parity_warning
+    if execution_profile_warnings:
+        response["execution_profile_warning"] = execution_profile_warnings
     return response
 
 
@@ -10760,6 +10888,11 @@ def post_optimization_submit(body: OptimizationSubmitBody):
             end_dt = end_dt.replace(tzinfo=timezone.utc)
         opt_start_placeholder = (end_dt - timedelta(days=max(duration_days, 1))).isoformat()
 
+    body_execution_profile = dict(body.execution_profile) if isinstance(body.execution_profile, dict) else {}
+    body_execution_profile.update(_collect_honored_backtest_execution_controls(body))
+    body_execution_profile = {k: v for k, v in body_execution_profile.items() if v is not None}
+    execution_parameter_ranges = body.execution_parameter_ranges if isinstance(body.execution_parameter_ranges, dict) else None
+
     # Persist a placeholder row so the UI can see a "running" optimization.
     placeholder_config: dict[str, object] = {
         "strategy_id": strategy_id,
@@ -10772,8 +10905,13 @@ def post_optimization_submit(body: OptimizationSubmitBody):
         "base_params": base_params,
         "objective": body.objective,
         "n_trials": body.n_trials,
+        "initial_capital": body.initial_capital,
         "fee_bps": body.fee_bps,
         "slippage_bps": body.slippage_bps,
+        "leverage": body.leverage,
+        "execution_profile": body_execution_profile or None,
+        "execution_parameter_ranges": execution_parameter_ranges,
+        "parameter_ranges": body.parameter_ranges if isinstance(body.parameter_ranges, dict) else None,
         "job_id": job_id,
         "status": "running",
     }
@@ -10848,7 +10986,18 @@ def post_optimization_submit(body: OptimizationSubmitBody):
                 strategy_type=strategy_type,
                 bars=bars,
                 param_space=param_space,
+                base_params=base_params,
                 timeframe=timeframe,
+                objective=body_objective,
+                n_trials=body.n_trials,
+                start_date=body_start,
+                end_date=body_end,
+                execution_profile=body_execution_profile or None,
+                execution_param_space=execution_parameter_ranges,
+                fee_bps=body.fee_bps,
+                slippage_bps=body.slippage_bps,
+                initial_capital=body.initial_capital,
+                leverage=body.leverage,
             )
 
             if not isinstance(opt_result, dict) or opt_result.get("error"):
@@ -10866,8 +11015,12 @@ def post_optimization_submit(body: OptimizationSubmitBody):
                 return
 
             best_params = opt_result.get("best_params", {})
+            best_full_params = opt_result.get("best_full_params", {})
+            best_execution_controls = opt_result.get("best_execution_controls", {})
+            best_execution_profile = opt_result.get("best_execution_profile", {})
             best_metrics = opt_result.get("best_metrics", {})
             best_fitness = _coerce_float(opt_result.get("best_fitness"), 0.0)
+            best_objective_value = _coerce_float(opt_result.get("best_objective_value"), best_fitness)
 
             optimization_start = str(body_start or best_metrics.get("start_date") or best_metrics.get("start") or opt_start_placeholder).strip()
             optimization_end = str(body_end or best_metrics.get("end_date") or best_metrics.get("end") or opt_end_placeholder).strip()
@@ -10881,12 +11034,22 @@ def post_optimization_submit(body: OptimizationSubmitBody):
                 "start": optimization_start,
                 "end": optimization_end,
                 "params": best_params,
+                "best_params": best_params,
+                "best_full_params": best_full_params if isinstance(best_full_params, dict) else None,
                 "base_params": base_params,
                 "objective": body_objective,
                 "n_trials": body.n_trials,
+                "initial_capital": body.initial_capital,
                 "fee_bps": placeholder_config.get("fee_bps"),
                 "slippage_bps": placeholder_config.get("slippage_bps"),
+                "leverage": body.leverage,
+                "base_execution_profile": body_execution_profile or None,
+                "best_execution_controls": best_execution_controls if isinstance(best_execution_controls, dict) else None,
+                "execution_profile": best_execution_profile if isinstance(best_execution_profile, dict) else None,
+                "execution_parameter_ranges": execution_parameter_ranges,
+                "parameter_ranges": param_space,
                 "best_fitness": best_fitness,
+                "best_objective_value": best_objective_value,
                 "wfa_verdict": opt_result.get("wfa_verdict"),
                 "validated": opt_result.get("validated"),
                 "top_results": opt_result.get("top_results"),
@@ -10897,7 +11060,10 @@ def post_optimization_submit(body: OptimizationSubmitBody):
 
             metrics_for_storage = dict(best_metrics) if isinstance(best_metrics, dict) else {}
             metrics_for_storage["best_fitness"] = float(best_fitness)
+            metrics_for_storage["best_objective_value"] = float(best_objective_value)
             metrics_for_storage["status"] = "succeeded"
+            if isinstance(best_params, dict):
+                metrics_for_storage["best_params"] = best_params
             if body.n_trials is not None:
                 metrics_for_storage.setdefault("n_trials", int(body.n_trials))
             if body_objective is not None:
@@ -11314,13 +11480,13 @@ def post_backtesting_run(body: dict):
                 # Use certified params (canonicalized) instead of raw merged_params
                 merged_params = certified_params
                 
-                # Risk-control parity is informational — don't block.
-                risk_control_error = _validate_local_backtest_risk_controls(
-                    merged_params,
-                    extra_controls=_collect_backtest_execution_controls(body),
-                )
+                # Strategy-param risk controls are still inert and must be
+                # guarded, but body-level execution controls are now honoured
+                # below through execution_controls just like POST /api/backtests.
+                risk_control_error = _validate_local_backtest_risk_controls(merged_params)
                 if risk_control_error:
                     return {"ok": False, "error": risk_control_error}
+                manual_execution_controls = _collect_honored_backtest_execution_controls(body)
 
                 # Bracket the synchronous backtest in an agent_tasks row so the
                 # Now Working panel surfaces API/tool backtests with provenance.
@@ -11353,6 +11519,10 @@ def post_backtesting_run(body: dict):
                         persist_legacy_run=False,
                         trade_mode=body.get("trade_mode"),
                         allow_shorting=body.get("allow_shorting"),
+                        fee_bps=body.get("fee_bps"),
+                        slippage_bps=body.get("slippage_bps"),
+                        initial_capital=body.get("initial_capital"),
+                        execution_controls=manual_execution_controls or None,
                     )
                     if isinstance(result, dict) and not result.get("error"):
                         persisted = _persist_completed_backtest_run(
@@ -11416,7 +11586,11 @@ def post_backtesting_run(body: dict):
                 dataset_id=body["dataset_id"],
                 timeframe=body.get("timeframe"),
                 parameters=body.get("parameters"),
+                fee_bps=body.get("fee_bps", settings_obj.get("backtest_fee_bps", 4.5)),
                 slippage_bps=body.get("slippage_bps", settings_obj.get("backtest_slippage_bps", 2.0)),
+                initial_capital=body.get("initial_capital"),
+                leverage=body.get("leverage"),
+                execution_controls=_collect_honored_backtest_execution_controls(body),
                 objective=body.get("objective", "sharpe_ratio"),
                 trade_mode=body.get("trade_mode"),
             ))

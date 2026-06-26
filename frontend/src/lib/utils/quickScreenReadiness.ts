@@ -17,27 +17,7 @@ export interface QuickScreenEvidenceRow {
 	detail: string;
 }
 
-const REQUIRED_VALIDATION_TYPES = ['walk_forward', 'monte_carlo', 'param_jitter', 'cost_stress', 'regime_split'] as const;
-
 type QuickScreenEvidenceSource = Record<string, unknown>;
-const SUCCESS_LIKE_VALIDATION_STATUSES = new Set([
-	'succeeded',
-	'success',
-	'pass',
-	'passed',
-	'done',
-	'completed',
-	'complete',
-]);
-
-function toFiniteNumber(value: unknown): number | null {
-	if (typeof value === 'number' && Number.isFinite(value)) return value;
-	if (typeof value === 'string' && value.trim()) {
-		const parsed = Number(value);
-		return Number.isFinite(parsed) ? parsed : null;
-	}
-	return null;
-}
 
 function formatDecimal(value: number | null, digits = 2): string {
 	if (value === null || !Number.isFinite(value)) return 'Unavailable';
@@ -58,29 +38,6 @@ function formatPercent(value: number | null, digits = 2): string {
 function formatPercentThreshold(value: number | null): string {
 	if (value === null || !Number.isFinite(value)) return 'Unavailable';
 	return `${formatCompactPercentValue(value)}%`;
-}
-
-function normalizeValidationType(value: unknown): string | null {
-	const normalized = String(value ?? '').trim().toLowerCase().replace(/[-\s]/g, '_');
-	if (!normalized) return null;
-	const aliases: Record<string, string> = {
-		wfa: 'walk_forward',
-		walkforward: 'walk_forward',
-		walk_forward: 'walk_forward',
-		montecarlo: 'monte_carlo',
-		mc: 'monte_carlo',
-		monte_carlo: 'monte_carlo',
-		paramjitter: 'param_jitter',
-		jitter: 'param_jitter',
-		param_jitter: 'param_jitter',
-		coststress: 'cost_stress',
-		stress: 'cost_stress',
-		cost_stress: 'cost_stress',
-		regimesplit: 'regime_split',
-		regime: 'regime_split',
-		regime_split: 'regime_split',
-	};
-	return aliases[normalized] || normalized;
 }
 
 function buildMetricSources(
@@ -126,32 +83,19 @@ function compareThreshold(actual: number | null, required: number, passIfAbove: 
 	return actual < required ? 'passed' : 'failed';
 }
 
-function getValidationStatusCandidate(item: StrategyContainerHistoryItem): string {
-	const itemRecord = item as unknown as Record<string, unknown>;
-	const values = [
-		item.config?.status,
-		item.metrics?.status,
-		itemRecord.status,
-	];
-	for (const value of values) {
-		const text = String(value ?? '').trim().toLowerCase();
-		if (text) return text;
-	}
-	return '';
-}
-
-function isValidationEvidenceAccepted(item: StrategyContainerHistoryItem): boolean {
-	const status = getValidationStatusCandidate(item);
-	return !status || SUCCESS_LIKE_VALIDATION_STATUSES.has(status);
-}
-
+// Quick-screen is the ENTRY gate (quick_screen -> gauntlet) and judges the strategy's
+// own backtest evidence only: in-sample Sharpe, return, and drawdown. The robustness
+// validation suite (walk-forward / monte-carlo / param-jitter / cost-stress / regime-split)
+// is PRODUCED INSIDE the gauntlet, so it can never be present at quick-screen — gating on
+// it here false-blocks every candidate at 0/5. That requirement is correctly surfaced and
+// enforced one stage later (gauntlet -> paper) via the backend promotion readiness
+// (`validation_artifacts` step), so it must NOT appear in the quick-screen rows.
 export function buildQuickScreenEvidenceRows(args: {
 	strategy: LifecycleStrategy | null;
 	backtests: StrategyContainerHistoryItem[];
-	validationHistory: StrategyContainerHistoryItem[];
 	pipelineSettings: Partial<PipelineSettings> | null;
 }): QuickScreenEvidenceRow[] {
-	const { strategy, backtests, validationHistory, pipelineSettings } = args;
+	const { strategy, backtests, pipelineSettings } = args;
 	const strategyRecord = strategy ? asMetricRecord(strategy) : {};
 	const sources = buildMetricSources(strategy, backtests);
 
@@ -166,23 +110,9 @@ export function buildQuickScreenEvidenceRows(args: {
 	const sharpeThreshold = pipelineSettings?.min_sharpe_ratio ?? 0.5;
 	const drawdownLimit = pipelineSettings?.max_drawdown_pct ?? 40;
 
-	const normalizedValidationTypes = new Set<string>();
-	for (const item of validationHistory) {
-		if (item.deleted_at) continue;
-		if (!isValidationEvidenceAccepted(item)) continue;
-		const normalized = normalizeValidationType(item.result_type);
-		if (normalized && REQUIRED_VALIDATION_TYPES.includes(normalized as typeof REQUIRED_VALIDATION_TYPES[number])) {
-			normalizedValidationTypes.add(normalized);
-		}
-	}
-
-	const validationCount = normalizedValidationTypes.size;
-	const missingValidationTypes = REQUIRED_VALIDATION_TYPES.filter((type) => !normalizedValidationTypes.has(type));
-
 	const sharpeStatus = compareThreshold(inSampleSharpe, sharpeThreshold, true);
 	const returnStatus = totalReturn === null ? 'warning' : totalReturn > 0 ? 'passed' : 'failed';
 	const drawdownStatus = compareThreshold(maxDrawdown, drawdownLimit, false);
-	const validationStatus = validationCount === REQUIRED_VALIDATION_TYPES.length ? 'passed' : (validationCount === 0 ? 'failed' : 'warning');
 
 	return [
 		buildThresholdRow({
@@ -194,18 +124,6 @@ export function buildQuickScreenEvidenceRows(args: {
 			detail: inSampleSharpe === null
 				? `Unavailable | Required > ${formatDecimal(sharpeThreshold)}`
 				: `Actual ${formatDecimal(inSampleSharpe)} | Required > ${formatDecimal(sharpeThreshold)}`,
-		}),
-		buildThresholdRow({
-			key: 'validation_coverage',
-			label: 'Validation Coverage',
-			status: validationStatus,
-			actual: `${validationCount}/${REQUIRED_VALIDATION_TYPES.length}`,
-			required: 'All required artifacts present',
-			detail: validationCount === REQUIRED_VALIDATION_TYPES.length
-				? `Validation artifacts present: ${validationCount}/${REQUIRED_VALIDATION_TYPES.length}`
-				: missingValidationTypes.length === REQUIRED_VALIDATION_TYPES.length
-					? `Validation artifacts present: ${validationCount}/${REQUIRED_VALIDATION_TYPES.length}; missing all required artifacts`
-					: `Validation artifacts present: ${validationCount}/${REQUIRED_VALIDATION_TYPES.length}; missing ${missingValidationTypes.join(', ')}`,
 		}),
 		buildThresholdRow({
 			key: 'minimum_return',

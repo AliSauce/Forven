@@ -176,6 +176,11 @@ _DETERMINISTIC_ERROR_TOKENS = (
     "invalid transition",
     "cannot convert float nan",
     "truth value of an array",
+    # A strategy type that can't run the requested trade_mode (e.g. a long-only
+    # archetype asked for short_only/both) is a fixed config<->code mismatch — no
+    # number of retries makes it run. Fail fast so the workflow drains instead of
+    # the advancer re-queuing it every cycle (it's flagged retryable otherwise).
+    "does not support trade_mode",
 )
 
 
@@ -640,40 +645,91 @@ def run_apply_optimized_defaults(workflow: dict[str, Any], step: dict[str, Any])
     if not isinstance(current_metrics, dict):
         current_metrics = {}
     new_params = {**current_params, **best_params}
-    current_metrics["gauntlet_optimized_params_source"] = result_id
-    current_metrics["gauntlet_optimized_params_applied"] = True
-    if optimized_timeframe:
-        current_metrics["gauntlet_optimized_timeframe"] = optimized_timeframe
+
+    # Acceptance gate (the single chokepoint): load the persisted optimizer
+    # outcome (status/validated/wfa_verdict) for the precheck; the gate then runs
+    # a fresh held-out baseline-vs-candidate bake-off and only writes on a win.
+    optimization_metrics: dict = {}
+    if result_id:
+        _payload = _load_result_payload(result_id)
+        if isinstance(_payload, dict):
+            _m = _payload.get("metrics") if isinstance(_payload.get("metrics"), dict) else {}
+            _c = _payload.get("config") if isinstance(_payload.get("config"), dict) else {}
+            optimization_metrics = {**_m, **_c}
 
     from forven.db import get_db
     from forven.gauntlet.store import add_artifact
+    from forven.strategies.optimization_acceptance import apply_optimized_params_if_accepted
 
-    with get_db() as conn:
-        conn.execute(
-            """
-            UPDATE strategies
-            SET params = ?,
-                timeframe = COALESCE(?, timeframe),
-                metrics = ?,
-                updated_at = datetime('now')
-            WHERE id = ?
-            """,
-            (
-                json.dumps(new_params, sort_keys=True),
-                optimized_timeframe,
-                json.dumps(current_metrics, sort_keys=True),
-                strategy_id,
-            ),
+    def _write_optimized(decision):
+        applied_metrics = dict(current_metrics)
+        applied_metrics["gauntlet_optimized_params_source"] = result_id
+        applied_metrics["gauntlet_optimized_params_applied"] = True
+        applied_metrics["gauntlet_optimized_acceptance"] = decision.as_record()
+        if optimized_timeframe:
+            applied_metrics["gauntlet_optimized_timeframe"] = optimized_timeframe
+        with get_db() as conn:
+            conn.execute(
+                """
+                UPDATE strategies
+                SET params = ?,
+                    timeframe = COALESCE(?, timeframe),
+                    metrics = ?,
+                    updated_at = datetime('now')
+                WHERE id = ?
+                """,
+                (
+                    json.dumps(new_params, sort_keys=True),
+                    optimized_timeframe,
+                    json.dumps(applied_metrics, sort_keys=True),
+                    strategy_id,
+                ),
+            )
+        add_artifact(
+            workflow_id=str(workflow.get("id") or ""),
+            step_id=str(step.get("id") or "") or None,
+            artifact_type="optimized_defaults",
+            artifact_key="strategy.params",
+            result_id=result_id,
+            payload={"old_params": current_params, "new_params": new_params, "timeframe": optimized_timeframe, "acceptance": decision.as_record()},
         )
-    add_artifact(
-        workflow_id=str(workflow.get("id") or ""),
-        step_id=str(step.get("id") or "") or None,
-        artifact_type="optimized_defaults",
-        artifact_key="strategy.params",
-        result_id=result_id,
-        payload={"old_params": current_params, "new_params": new_params, "timeframe": optimized_timeframe},
+
+    outcome = apply_optimized_params_if_accepted(
+        strategy_id=strategy_id,
+        asset=str(row.get("symbol") or "BTC"),
+        strategy_type=str(row.get("type") or ""),
+        current_params=current_params,
+        candidate_params=new_params,
+        write_fn=_write_optimized,
+        optimization_metrics=optimization_metrics,
+        from_state=row.get("stage"),
+        eval_timeframe=optimized_timeframe or row.get("timeframe"),
     )
-    return {"status": "passed", "result_id": result_id, "new_params": new_params, "timeframe": optimized_timeframe}
+    if outcome.get("applied"):
+        return {"status": "passed", "result_id": result_id, "new_params": new_params, "timeframe": optimized_timeframe, "acceptance": outcome.get("decision")}
+
+    # "Baseline retained" is a successful outcome — keep the existing (more
+    # robust) params, don't fail the workflow, and record why. The audit artifact
+    # is best-effort: a recording failure must never turn the safe no-op into a
+    # workflow error.
+    try:
+        add_artifact(
+            workflow_id=str(workflow.get("id") or ""),
+            step_id=str(step.get("id") or "") or None,
+            artifact_type="optimized_defaults_rejected",
+            artifact_key="strategy.params",
+            result_id=result_id,
+            payload={"old_params": current_params, "candidate_params": new_params, "reason": outcome.get("reason"), "acceptance": outcome.get("decision")},
+        )
+    except Exception as exc:
+        log.warning("could not record optimized_defaults_rejected artifact for %s: %s", strategy_id, exc)
+    return {
+        "status": "passed",
+        "baseline_retained": True,
+        "result_id": result_id,
+        "message": f"Baseline retained: {outcome.get('reason')}",
+        "acceptance": outcome.get("decision"),
+    }
 
 
 def run_confirmation_backtest(workflow: dict[str, Any], step: dict[str, Any]) -> dict[str, Any]:

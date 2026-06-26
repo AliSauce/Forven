@@ -222,9 +222,12 @@ class ForvenAgentClient:
         return self.compact_result(res) if compact else res
 
     def run_optimization(self, strategy_id: str, dataset_id: str, *, parameter_ranges: dict | None = None,
-                         objective: str | None = None, n_trials: int | None = None) -> Any:
+                         objective: str | None = None, n_trials: int | None = None, **kwargs: Any) -> Any:
         body: dict[str, Any] = {"strategy_id": strategy_id, "dataset_id": dataset_id}
         for k, v in (("parameter_ranges", parameter_ranges), ("objective", objective), ("n_trials", n_trials)):
+            if v is not None:
+                body[k] = v
+        for k, v in kwargs.items():
             if v is not None:
                 body[k] = v
         return self.post("/api/backtesting/optimize", body)

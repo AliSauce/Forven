@@ -428,10 +428,17 @@ def _normalize_pipeline_config(config: dict | None) -> dict:
     if not isinstance(quick_screen, dict):
         quick_screen = {}
         merged["quick_screen"] = quick_screen
+    # An EXPLICIT quick_screen edit must win over the legacy paper_gate alias.
+    # _normalize republishes paper_gate on every save (see below), and the Settings
+    # save round-trips the whole config, so paper_gate is ALWAYS present in raw --
+    # mapping it back unconditionally clobbered a user's freshly-saved quick_screen
+    # value (e.g. max_drawdown_pct 0.50 reverting to the stale alias's 0.30). Only
+    # apply the back-mapping for keys the user did NOT explicitly set this save.
+    explicit_qs_cfg = raw.get("quick_screen") if isinstance(raw.get("quick_screen"), dict) else {}
     if legacy_paper_gate:
-        if "min_sharpe" in legacy_paper_gate:
+        if "min_sharpe" in legacy_paper_gate and "min_sharpe" not in explicit_qs_cfg:
             quick_screen["min_sharpe"] = legacy_paper_gate.get("min_sharpe")
-        if "max_drawdown_pct" in legacy_paper_gate:
+        if "max_drawdown_pct" in legacy_paper_gate and "max_drawdown_pct" not in explicit_qs_cfg:
             quick_screen["max_drawdown_pct"] = legacy_paper_gate.get("max_drawdown_pct")
 
     paper_trading = merged.get("paper_trading", {})

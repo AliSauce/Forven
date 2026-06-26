@@ -635,6 +635,40 @@ def migrate_legacy_scanner_cadence() -> bool:
     return True
 
 
+def migrate_data_engine_catchup_cadence() -> bool:
+    """Upgrade the Data Engine catch-up cadence from 10m to 30m on EXISTING installs.
+
+    The fresh-seed default is now 1800000 (30m) in seed_forven_jobs, but that path
+    only runs on an empty DB — an already-seeded deployment (the live single-worker
+    box this cadence change exists to protect from WS starvation) keeps the old
+    600000 (10m) row forever. This in-place migration brings it in line, gated on
+    the row STILL matching the old seeded default so operator-customized schedules
+    are left untouched. Mirrors migrate_legacy_scanner_cadence.
+    """
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT schedule_type, schedule_expr, timezone FROM scheduler_jobs WHERE id = ?",
+            ("forven-data-engine-catchup",),
+        ).fetchone()
+        if not row:
+            return False
+
+        schedule_type = str(row["schedule_type"] or "").strip().lower()
+        schedule_expr = str(row["schedule_expr"] or "").strip()
+        timezone_str = str(row["timezone"] or "UTC").strip() or "UTC"
+
+        if schedule_type != "interval" or schedule_expr != "600000":
+            return False
+
+        next_run = _compute_next_run("interval", "1800000", timezone_str)
+        conn.execute(
+            "UPDATE scheduler_jobs SET schedule_expr = ?, next_run_at = ? WHERE id = ?",
+            ("1800000", next_run, "forven-data-engine-catchup"),
+        )
+    log.info("Migrated Data Engine catch-up cadence from 10m to 30m (forven-data-engine-catchup)")
+    return True
+
+
 def get_jobs() -> list[dict]:
     """Get all scheduler jobs."""
     with get_db() as conn:
@@ -3156,15 +3190,20 @@ def seed_forven_jobs():
         payload={"kind": "data_manager_collect_funding", "timeout_seconds": 180},
     )
 
-    # 14b. Data Engine catch-up — every 10 minutes. Drains the CatchUpPlanner
+    # 14b. Data Engine catch-up — every 30 minutes. Drains the CatchUpPlanner
     # backlog (the whole catalog, not just the active keep-alive set) so dormant
     # series stay current automatically instead of needing manual "Execute plan"
     # clicks. Gated on the wired data_engine_settings.auto_catchup_enabled flag.
+    # Cadence was 10 min, but each run tail-extends ~a dozen stale series via a full
+    # whole-file parquet rewrite (~4 min of CPU for ~20 bars), and on the single API
+    # worker that repeated burst starves the live WebSocket. The backlog is a slow
+    # drift, not real-time, so 30 min keeps dormant series acceptably current at
+    # ~1/3 the rewrite duty cycle. (The active set stays hot via the keep-alive.)
     add_job(
         job_id="forven-data-engine-catchup",
         name="Data Engine Catch-Up (auto-drain backfill plan)",
         schedule_type="interval",
-        schedule_expr="600000",
+        schedule_expr="1800000",
         command="data-engine-catchup",
         timezone_str="UTC",
         payload={"kind": "data_engine_catchup", "timeout_seconds": 300},

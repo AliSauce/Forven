@@ -68,6 +68,29 @@ def test_walk_forward_returns_valid_structure(monkeypatch, forven_db):
     assert isinstance(result["splits"], list)
 
 
+def test_walk_forward_accepts_explicit_timeframe(monkeypatch, forven_db):
+    captured: dict[str, object] = {}
+
+    def _candles(*_args, **kwargs):
+        captured["timeframe"] = kwargs.get("timeframe")
+        return _fake_ohlcv(1000)
+
+    monkeypatch.setattr("forven.strategies.backtest.load_backtest_candles", _candles)
+
+    result = walk_forward(
+        strategy_id="wf-timeframe",
+        asset="BTC",
+        strategy_type="rsi_momentum",
+        params={"timeframe": "1h"},
+        timeframe="4h",
+        total_bars=1000,
+        n_splits=2,
+    )
+
+    assert captured["timeframe"] == "4h"
+    assert result["timeframe"] == "4h"
+
+
 def test_walk_forward_gap_reduces_effective_oos(monkeypatch, forven_db):
     def _candles(*_args, **_kwargs):
         return _fake_ohlcv(1000)

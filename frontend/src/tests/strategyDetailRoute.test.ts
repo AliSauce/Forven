@@ -110,6 +110,8 @@ const pipelineSettings = {
 	failed_retention_hours: 24,
 	ranking_top_n: 10,
 	ranking_metric: 'sharpe_ratio',
+	backtest_fee_bps: 4.5,
+	backtest_slippage_bps: 2,
 	created_at: '2026-04-01T00:00:00Z',
 	created_by: 'brain',
 };
@@ -582,6 +584,82 @@ describe('/lab/strategy/[id] backtest history', () => {
 		expect(target.textContent).toContain('BTC-MACD-S0001');
 	});
 
+	// Two runs with DISTINCT symbol/timeframe/window: B1001 (BTC/1h, drives the form on
+	// load) and B2002 (ETH/4h, a different span). Shared by the sync + reset tests.
+	function buildTwoRunContainer(): Record<string, unknown> {
+		const container = buildContainer(['B1001']);
+		(container.history as Record<string, unknown>).backtests = [
+			buildHistoryItem('B1001', {
+				symbol: 'BTC/USDT',
+				timeframe: '1h',
+				start_date: '2025-03-11T00:00:00Z',
+				end_date: '2026-03-11T00:00:00Z',
+				config: { start: '2025-03-11T00:00:00Z', end: '2026-03-11T00:00:00Z', params: { fast: 12, slow: 26, signal: 9 } },
+			}),
+			buildHistoryItem('B2002', {
+				symbol: 'ETH/USDT',
+				timeframe: '4h',
+				start_date: '2024-01-15T00:00:00Z',
+				end_date: '2024-07-15T00:00:00Z',
+				config: { start: '2024-01-15T00:00:00Z', end: '2024-07-15T00:00:00Z', params: { fast: 8, slow: 21, signal: 5 } },
+			}),
+		];
+		return container;
+	}
+
+	it('syncs the backtest symbol, timeframe and window to the run when a gauntlet history row is clicked', async () => {
+		apiMocks.getStrategyContainer.mockResolvedValue(buildTwoRunContainer());
+		apiMocks.getResult.mockImplementation(async (resultId: string) => buildResult(resultId));
+		apiMocks.getResultChartContext.mockImplementation(async (resultId: string) => buildChartContext(resultId));
+
+		app = mount(StrategyDetailPage, { target });
+		await openBacktestHistory(target);
+
+		const symbolInput = () => target.querySelector('#container-backtest-symbol') as HTMLInputElement | null;
+		const timeframeInput = () => target.querySelector('#container-backtest-timeframe') as HTMLSelectElement | null;
+		const startInput = () => target.querySelector('#container-backtest-start') as HTMLInputElement | null;
+		const endInput = () => target.querySelector('#container-backtest-end') as HTMLInputElement | null;
+		// On load the form takes the container default (FIRST run's) context.
+		expect(symbolInput()?.value).toBe('BTC/USDT');
+		expect(timeframeInput()?.value).toBe('1h');
+		expect(startInput()?.value).toBe('2025-03-11');
+		expect(endInput()?.value).toBe('2026-03-11');
+
+		// Clicking the second row re-points symbol/timeframe/window at THAT run.
+		clickByTestId(target, 'backtest-row-B2002');
+		await waitForCondition(() => startInput()?.value === '2024-01-15');
+		expect(symbolInput()?.value).toBe('ETH/USDT');
+		expect(timeframeInput()?.value).toBe('4h');
+		expect(startInput()?.value).toBe('2024-01-15');
+		expect(endInput()?.value).toBe('2024-07-15');
+	});
+
+	it('restores the container default symbol/timeframe/window when Reset to Defaults is clicked after selecting a run', async () => {
+		apiMocks.getStrategyContainer.mockResolvedValue(buildTwoRunContainer());
+		apiMocks.getResult.mockImplementation(async (resultId: string) => buildResult(resultId));
+		apiMocks.getResultChartContext.mockImplementation(async (resultId: string) => buildChartContext(resultId));
+
+		app = mount(StrategyDetailPage, { target });
+		await openBacktestHistory(target);
+
+		const symbolInput = () => target.querySelector('#container-backtest-symbol') as HTMLInputElement | null;
+		const timeframeInput = () => target.querySelector('#container-backtest-timeframe') as HTMLSelectElement | null;
+		const startInput = () => target.querySelector('#container-backtest-start') as HTMLInputElement | null;
+		const endInput = () => target.querySelector('#container-backtest-end') as HTMLInputElement | null;
+
+		// Move the full context to the second run, then Reset to Defaults must restore the
+		// container default (first run) symbol/timeframe/window — not leave it on the run.
+		clickByTestId(target, 'backtest-row-B2002');
+		await waitForCondition(() => startInput()?.value === '2024-01-15');
+
+		clickByTestId(target, 'backtest-params-reset');
+		await waitForCondition(() => startInput()?.value === '2025-03-11');
+		expect(symbolInput()?.value).toBe('BTC/USDT');
+		expect(timeframeInput()?.value).toBe('1h');
+		expect(startInput()?.value).toBe('2025-03-11');
+		expect(endInput()?.value).toBe('2026-03-11');
+	});
+
 	it('opens TradingView Pine in a copyable script panel', async () => {
 		const writeText = vi.fn().mockResolvedValue(undefined);
 		Object.defineProperty(navigator, 'clipboard', {
@@ -749,6 +827,7 @@ describe('/lab/strategy/[id] backtest history', () => {
 					mode: 'trend',
 					meta: { source: 'rule' },
 					zero: 0,
+					leverage: 0,
 				},
 			}),
 		);
@@ -763,9 +842,55 @@ describe('/lab/strategy/[id] backtest history', () => {
 		expect(target.querySelector('[data-testid="opt-param-select-enabled"]')).toBeNull();
 		expect(target.querySelector('[data-testid="opt-param-select-mode"]')).toBeNull();
 		expect(target.querySelector('[data-testid="opt-param-select-meta"]')).toBeNull();
+		expect(target.querySelector('[data-testid="opt-param-select-leverage"]')).toBeNull();
+		expect(target.querySelector('[data-testid="opt-exec-select-leverage"]')).not.toBeNull();
 		// A numeric param defaulting to exactly 0 (e.g. an off-by-default threshold) is now
 		// optimizable — its range is seeded via the step fallback rather than being hidden.
 		expect(target.querySelector('[data-testid="opt-param-select-zero"]')).not.toBeNull();
+	});
+
+	it('selects and clears every optimization parameter via the select-all checkbox', async () => {
+		apiMocks.getStrategyContainer.mockResolvedValue(
+			buildContainer([], { params: { fast: 12, slow: 26, signal: 9 } }),
+		);
+
+		app = mount(StrategyDetailPage, { target });
+		await openRobustnessTab(target);
+
+		const panel = () => target.querySelector('[data-testid="optimization-params-panel"]') as HTMLElement | null;
+		const selectAll = () => target.querySelector('[data-testid="opt-param-select-all"]') as HTMLInputElement | null;
+		const paramBox = (key: string) =>
+			target.querySelector(`[data-testid="opt-param-select-${key}"]`) as HTMLInputElement | null;
+
+		// Nothing selected on load.
+		expect(selectAll()).not.toBeNull();
+		expect(selectAll()?.checked).toBe(false);
+		expect(selectAll()?.indeterminate).toBe(false);
+		expect(panel()?.textContent).toContain('0 selected');
+
+		// Select all -> every param checkbox checked, header count reflects it.
+		clickByTestId(target, 'opt-param-select-all');
+		await waitForCondition(() => panel()?.textContent?.includes('3 selected') ?? false);
+		expect(paramBox('fast')?.checked).toBe(true);
+		expect(paramBox('slow')?.checked).toBe(true);
+		expect(paramBox('signal')?.checked).toBe(true);
+		expect(selectAll()?.checked).toBe(true);
+		expect(selectAll()?.indeterminate).toBe(false);
+
+		// Toggle select-all off -> everything cleared (clean toggle: it was fully checked).
+		clickByTestId(target, 'opt-param-select-all');
+		await waitForCondition(() => panel()?.textContent?.includes('0 selected') ?? false);
+		expect(paramBox('fast')?.checked).toBe(false);
+		expect(paramBox('slow')?.checked).toBe(false);
+		expect(paramBox('signal')?.checked).toBe(false);
+		expect(selectAll()?.checked).toBe(false);
+		expect(selectAll()?.indeterminate).toBe(false);
+
+		// Selecting a single param puts select-all into the indeterminate (some, not all) state.
+		clickByTestId(target, 'opt-param-select-signal');
+		await waitForCondition(() => selectAll()?.indeterminate === true);
+		expect(selectAll()?.checked).toBe(false);
+		expect(panel()?.textContent).toContain('1 selected');
 	});
 
 	it('submits selected optimization parameter ranges', async () => {
@@ -775,6 +900,15 @@ describe('/lab/strategy/[id] backtest history', () => {
 					fast: 12,
 					slow: 26,
 					signal: 9,
+					execution_profile: {
+						initial_capital: 10000,
+						fee_bps: 10,
+						slippage_bps: 5,
+						leverage: 2,
+						sizing_mode: 'fraction',
+						risk_per_trade: 0.01,
+						stop_loss_pct: 2,
+					},
 				},
 			}),
 		);
@@ -782,6 +916,12 @@ describe('/lab/strategy/[id] backtest history', () => {
 
 		app = mount(StrategyDetailPage, { target });
 		await openRobustnessTab(target);
+
+		setSelectValue(target.querySelector<HTMLSelectElement>('#container-opt-timeframe'), '4h');
+		setInputValue(target.querySelector<HTMLInputElement>('#container-opt-start'), '2025-01-15');
+		setInputValue(target.querySelector<HTMLInputElement>('#container-opt-end'), '2025-03-15');
+		setSelectValue(target.querySelector<HTMLSelectElement>('#container-opt-objective'), 'total_return_pct');
+		setInputValue(target.querySelector<HTMLInputElement>('#container-opt-trials'), '25');
 
 		clickByTestId(target, 'opt-param-select-fast');
 		setInputValue(target.querySelector<HTMLInputElement>('[data-testid="opt-param-min-fast"]'), '10');
@@ -791,6 +931,15 @@ describe('/lab/strategy/[id] backtest history', () => {
 		setInputValue(target.querySelector<HTMLInputElement>('[data-testid="opt-param-min-signal"]'), '5');
 		setInputValue(target.querySelector<HTMLInputElement>('[data-testid="opt-param-max-signal"]'), '11');
 		setInputValue(target.querySelector<HTMLInputElement>('[data-testid="opt-param-step-signal"]'), '1');
+		await waitForCondition(() => target.querySelector('[data-testid="opt-exec-select-leverage"]') !== null);
+		clickByTestId(target, 'opt-exec-select-leverage');
+		setInputValue(target.querySelector<HTMLInputElement>('[data-testid="opt-exec-min-leverage"]'), '1');
+		setInputValue(target.querySelector<HTMLInputElement>('[data-testid="opt-exec-max-leverage"]'), '3');
+		setInputValue(target.querySelector<HTMLInputElement>('[data-testid="opt-exec-step-leverage"]'), '1');
+		clickByTestId(target, 'opt-exec-select-stop_loss_pct');
+		setInputValue(target.querySelector<HTMLInputElement>('[data-testid="opt-exec-min-stop_loss_pct"]'), '1');
+		setInputValue(target.querySelector<HTMLInputElement>('[data-testid="opt-exec-max-stop_loss_pct"]'), '4');
+		setInputValue(target.querySelector<HTMLInputElement>('[data-testid="opt-exec-step-stop_loss_pct"]'), '1');
 		await flush();
 
 		clickButtonByText(target, 'Run Optimization');
@@ -800,12 +949,99 @@ describe('/lab/strategy/[id] backtest history', () => {
 			strategy_id: 'S0001',
 			strategy_name: 'BTC-MACD-S0001',
 			symbol: 'BTC/USDT',
-			timeframe: '1h',
+			timeframe: '4h',
+			start: '2025-01-15T00:00:00.000Z',
+			end: '2025-03-15T00:00:00.000Z',
+			objective: 'total_return_pct',
+			n_trials: 25,
 			parameter_ranges: {
 				fast: { min: 10, max: 20, step: 2 },
 				signal: { min: 5, max: 11, step: 1 },
 			},
+			execution_parameter_ranges: {
+				leverage: { min: 1, max: 3, step: 1 },
+				stop_loss_pct: { min: 1, max: 4, step: 1 },
+			},
+			execution_profile: expect.objectContaining({
+				initial_capital: 10000,
+				fee_bps: 10,
+				slippage_bps: 5,
+				leverage: 2,
+				sizing_mode: 'fraction',
+				risk_per_trade: 0.01,
+				stop_loss_pct: 2,
+			}),
+			leverage: 2,
+			stop_loss_pct: 2,
 		}));
+	});
+
+	it('normalizes legacy zero leverage params before optimization submit', async () => {
+		apiMocks.getStrategyContainer.mockResolvedValue(
+			buildContainer([], {
+				params: {
+					fast: 12,
+					slow: 26,
+					signal: 9,
+					leverage: 0,
+				},
+			}),
+		);
+		apiMocks.submitOptimization.mockResolvedValue({ job_id: 'OPT-JOB-LEGACY-LEV', status: 'succeeded' });
+
+		app = mount(StrategyDetailPage, { target });
+		await openRobustnessTab(target);
+
+		clickByTestId(target, 'opt-param-select-fast');
+		setInputValue(target.querySelector<HTMLInputElement>('[data-testid="opt-param-min-fast"]'), '10');
+		setInputValue(target.querySelector<HTMLInputElement>('[data-testid="opt-param-max-fast"]'), '20');
+		setInputValue(target.querySelector<HTMLInputElement>('[data-testid="opt-param-step-fast"]'), '2');
+		await flush();
+
+		clickButtonByText(target, 'Run Optimization');
+		await waitForCondition(() => apiMocks.submitOptimization.mock.calls.length > 0);
+
+		const payload = apiMocks.submitOptimization.mock.calls[0][0];
+		expect(payload).toEqual(expect.objectContaining({
+			strategy_id: 'S0001',
+			leverage: 1,
+			parameter_ranges: {
+				fast: { min: 10, max: 20, step: 2 },
+			},
+			execution_profile: expect.objectContaining({
+				leverage: 1,
+			}),
+		}));
+		expect(payload.parameter_ranges).not.toHaveProperty('leverage');
+		expect(target.textContent).not.toContain('Leverage must be greater than 0 and no more than 125.');
+	});
+
+	it('blocks invalid execution leverage ranges before optimization submit', async () => {
+		apiMocks.getStrategyContainer.mockResolvedValue(
+			buildContainer([], {
+				params: {
+					fast: 12,
+					slow: 26,
+					signal: 9,
+				},
+			}),
+		);
+
+		app = mount(StrategyDetailPage, { target });
+		await openRobustnessTab(target);
+
+		await waitForCondition(() => target.querySelector('[data-testid="opt-exec-select-leverage"]') !== null);
+		clickByTestId(target, 'opt-exec-select-leverage');
+		setInputValue(target.querySelector<HTMLInputElement>('[data-testid="opt-exec-min-leverage"]'), '0');
+		setInputValue(target.querySelector<HTMLInputElement>('[data-testid="opt-exec-max-leverage"]'), '2');
+		setInputValue(target.querySelector<HTMLInputElement>('[data-testid="opt-exec-step-leverage"]'), '1');
+		await flush();
+
+		clickButtonByText(target, 'Run Optimization');
+		await flush();
+
+		expect(apiMocks.submitOptimization).not.toHaveBeenCalled();
+		expect(target.querySelector('[data-testid="opt-exec-error-leverage"]')?.textContent).toContain('leverage minimum must be greater than zero.');
 	});
 
 	it('blocks optimization submit when a selected range is invalid', async () => {
@@ -920,7 +1156,8 @@ describe('/lab/strategy/[id] backtest history', () => {
 		expect(target.querySelector('[data-testid="backtest-parameter-panel"]')).not.toBeNull();
 		expect(target.textContent).toContain('Gauntlet Parameters');
 
-		const fastInput = target.querySelector<HTMLInputElement>('[data-testid="backtest-parameter-editor"] input[type="number"]');
+		const fastInput = Array.from(target.querySelectorAll<HTMLInputElement>('[data-testid="backtest-parameter-editor"] input[type="number"]'))
+			.find((input) => input.value === '12') ?? null;
 		setInputValue(fastInput, '15');
 		await flush();
 
@@ -934,6 +1171,131 @@ describe('/lab/strategy/[id] backtest history', () => {
 				slow: 26,
 				signal: 9,
 			},
+		}));
+	});
+
+	it('expands compact backtest parameter summaries from the overflow chip', async () => {
+		const params = {
+			alpha: 1,
+			beta: 2,
+			delta: 4,
+			epsilon: 5,
+			gamma: 3,
+			leverage: 2,
+			theta: 7,
+			zeta: 6,
+		};
+		const container = buildContainer([], { params });
+		(container.history as Record<string, unknown>).backtests = [
+			buildHistoryItem('B1001', {
+				config: { params },
+			}),
+		];
+		apiMocks.getStrategyContainer.mockResolvedValue(container);
+
+		app = mount(StrategyDetailPage, { target });
+		await openBacktestHistory(target);
+
+		const summary = target.querySelector('[data-testid="backtest-param-summary-B1001"]');
+		expect(summary?.textContent).toContain('alpha=1');
+		expect(summary?.textContent).toContain('+4 more');
+		expect(summary?.textContent).not.toContain('gamma=3');
+
+		clickByTestId(target, 'backtest-param-overflow-B1001');
+		await waitForCondition(() => target.querySelector('[data-testid="backtest-param-summary-B1001"]')?.textContent?.includes('gamma=3') ?? false);
+		expect(target.querySelector('[data-testid="backtest-param-overflow-B1001"]')?.textContent).toContain('Show less');
+
+		clickByTestId(target, 'backtest-param-overflow-B1001');
+		await waitForCondition(() => target.querySelector('[data-testid="backtest-param-summary-B1001"]')?.textContent?.includes('+4 more') ?? false);
+		expect(target.querySelector('[data-testid="backtest-param-summary-B1001"]')?.textContent).not.toContain('gamma=3');
+	});
+
+	it('does not show the params draft as permanently dirty when the strategy has a saved execution_profile', async () => {
+		// Regression: execution_profile is persisted INSIDE params but must be
+		// stripped from the alpha-param draft on BOTH sides (strategyParams and
+		// paramsDraft). Otherwise a freshly-loaded strategy reads as permanently
+		// "Unsaved"/"Draft has changes" (the Save button never disables).
+		const container = buildContainer([], {
+			params: { fast: 12, slow: 26, signal: 9, execution_profile: { sizing_mode: 'fraction', risk_per_trade: 0.02, stop_loss_pct: 2 } },
+		});
+		apiMocks.getStrategyContainer.mockResolvedValue(container);
+
+		app = mount(StrategyDetailPage, { target });
+		// Open the Gauntlet section (no history rows needed) and reach the params pane
+		// on its DEFAULT view — the exact state the user reported as stuck "Unsaved".
+		await waitForCondition(() =>
+			Array.from(target.querySelectorAll('button')).some((b) => (b.textContent ?? '').includes('Gauntlet History')),
+		);
+		clickButtonByText(target, 'Gauntlet History');
+		await waitForCondition(() => target.querySelector('[data-testid="backtest-params-save"]') !== null);
+
+		const save = target.querySelector('[data-testid="backtest-params-save"]') as HTMLButtonElement | null;
+		expect(save).not.toBeNull();
+		expect(save?.disabled).toBe(true); // a freshly-loaded saved profile is NOT dirty -> Save disabled
+		expect(target.textContent).not.toContain('Draft has changes');
+	});
+
+	it('loads gauntlet execution settings from a selected history row and resets to defaults', async () => {
+		const container = buildContainer([], {
+			params: { fast: 12, slow: 26, signal: 9, leverage: 1 },
+		});
+		(container.history as Record<string, unknown>).backtests = [
+			buildHistoryItem('B1001', {
+				config: {
+					params: { fast: 15, slow: 30, signal: 8, leverage: 2 },
+					initial_capital: 25000,
+					fee_bps: 8,
+					slippage_bps: 4,
+					leverage: 2,
+					sizing_mode: 'fraction',
+					risk_per_trade: 0.03,
+					stop_loss_pct: 5,
+					take_profit_pct: 11,
+				},
+			}),
+		];
+		apiMocks.getStrategyContainer
+			.mockResolvedValueOnce(container)
+			.mockResolvedValueOnce(container);
+		apiMocks.submitBacktest.mockResolvedValue({ job_id: 'JOB-EXEC-1', status: 'succeeded' });
+		apiMocks.getResult.mockImplementation(async (resultId: string) => buildResult(resultId));
+		apiMocks.getResultChartContext.mockImplementation(async (resultId: string) => buildChartContext(resultId));
+
+		app = mount(StrategyDetailPage, { target });
+		await openBacktestHistory(target);
+
+		clickByTestId(target, 'backtest-row-B1001');
+		await waitForCondition(() => target.textContent?.includes('Run B1001') ?? false);
+		clickButtonByText(target, 'Run the Gauntlet');
+		await waitForCondition(() => apiMocks.submitBacktest.mock.calls.length > 0);
+
+		expect(apiMocks.submitBacktest).toHaveBeenCalledWith(expect.objectContaining({
+			params: expect.objectContaining({ fast: 15, slow: 30, signal: 8 }),
+			initial_capital: 25000,
+			fee_bps: 8,
+			slippage_bps: 4,
+			leverage: 2,
+			sizing_mode: 'fraction',
+			risk_per_trade: 0.03,
+			stop_loss_pct: 5,
+			take_profit_pct: 11,
+		}));
+
+		await waitForCondition(() => apiMocks.getStrategyContainer.mock.calls.length >= 2);
+		await waitForCondition(() => target.textContent?.includes('Run B1001') ?? false);
+		apiMocks.submitBacktest.mockClear();
+		clickByTestId(target, 'backtest-params-reset');
+		await waitForCondition(() => target.textContent?.includes('Container defaults') ?? false);
+		clickButtonByText(target, 'Run the Gauntlet');
+		await waitForCondition(() => apiMocks.submitBacktest.mock.calls.length > 0);
+
+		expect(apiMocks.submitBacktest).toHaveBeenCalledWith(expect.objectContaining({
+			params: expect.objectContaining({ fast: 12, slow: 26, signal: 9 }),
+			initial_capital: 10000,
+			fee_bps: 4.5,
+			slippage_bps: 2,
+			leverage: 1,
+			sizing_mode: 'full',
 		}));
 	});
 
@@ -1053,11 +1415,14 @@ describe('/lab/strategy/[id] backtest history', () => {
 			clickButtonByText(target, 'Save');
 			await waitForCondition(() => backtestingMocks.updateStrategyDefaultParams.mock.calls.length > 0);
 
-			expect(backtestingMocks.updateStrategyDefaultParams).toHaveBeenCalledWith('S0001', {
+			// Save now also persists the execution profile under params.execution_profile
+			// (the canonical home the optimizer/gauntlet read), alongside the alpha params.
+			expect(backtestingMocks.updateStrategyDefaultParams).toHaveBeenCalledWith('S0001', expect.objectContaining({
 				fast: 12,
 				custom_note: 'keep this draft note',
 				threshold: 0.75,
-			}, { pinnedBacktestId: null });
+				execution_profile: expect.any(Object),
+			}), { pinnedBacktestId: null });
 		});
 
 		it('disables Add Param controls when the draft already contains every supported param', async () => {

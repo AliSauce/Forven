@@ -119,6 +119,75 @@
 		step: string;
 		error: string;
 	};
+	type SizingMode = 'full' | 'fraction' | 'fixed' | 'atr' | 'kelly';
+	type ExecutionProfileDraft = {
+		initial_capital: string;
+		fee_bps: string;
+		slippage_bps: string;
+		leverage: string;
+		sizing_mode: SizingMode;
+		risk_per_trade: string;
+		fixed_size: string;
+		atr_stop_multiplier: string;
+		kelly_multiplier: string;
+		kelly_lookback: string;
+		stop_loss_pct: string;
+		take_profit_pct: string;
+		trailing_stop_pct: string;
+		time_stop_bars: string;
+	};
+	const DEFAULT_EXECUTION_LEVERAGE = '1';
+	const EXECUTION_PARAM_KEYS = new Set([
+		'initial_capital',
+		'fee_bps',
+		'slippage_bps',
+		'leverage',
+		'sizing_mode',
+		'risk_per_trade',
+		'fixed_size',
+		'atr_stop_multiplier',
+		'kelly_multiplier',
+		'kelly_lookback',
+		'stop_loss_pct',
+		'take_profit_pct',
+		'trailing_stop_pct',
+		'time_stop_bars',
+	]);
+	const STRICTLY_POSITIVE_EXECUTION_RANGE_KEYS = new Set([
+		'initial_capital',
+		'leverage',
+		'risk_per_trade',
+		'fixed_size',
+		'atr_stop_multiplier',
+		'kelly_multiplier',
+		'kelly_lookback',
+		'stop_loss_pct',
+		'take_profit_pct',
+		'trailing_stop_pct',
+		'time_stop_bars',
+	]);
+	// The sizing parameter(s) each mode needs, with their default seed values. When an
+	// operator switches Sizing Mode, applySizingModeDefaults() fills any of these that are
+	// still blank so a freshly-selected mode is immediately valid/runnable instead of
+	// surfacing a "must be greater than 0" error on an empty required field. Values mirror
+	// the engine defaults in forven/strategies/backtest.py _resolve_execution_controls
+	// (risk_per_trade 0.02, atr_stop_multiplier 2.0, kelly_multiplier 0.5, kelly_lookback
+	// 100). Fixed notional has no engine default — an empty value sizes at full equity — so
+	// it seeds from the configured Initial Capital (a 1x notional reference) at apply time,
+	// falling back to this constant.
+	type SizingNumericField = 'risk_per_trade' | 'fixed_size' | 'atr_stop_multiplier' | 'kelly_multiplier' | 'kelly_lookback';
+	const SIZING_MODE_FIELD_DEFAULTS: Record<SizingMode, Partial<Record<SizingNumericField, string>>> = {
+		full: {},
+		fraction: { risk_per_trade: '0.02' },
+		fixed: { fixed_size: '10000' },
+		atr: { risk_per_trade: '0.02', atr_stop_multiplier: '2' },
+		kelly: { kelly_multiplier: '0.5', kelly_lookback: '100' },
+	};
+	// Fraction risk sizing needs a stop distance (the engine sizes by risk_per_trade / stop),
+	// and validateExecutionDraft rejects the mode without a stop loss or trailing stop. Seed
+	// this default stop loss when Fraction is selected and neither is set, so it's runnable
+	// in one click. ATR risk derives its stop from atr_stop_multiplier, so it needs no seed.
+	const FRACTION_DEFAULT_STOP_LOSS_PCT = '2';
 
 	let strategyId = '';
 	let returnTo = '/lab';
@@ -151,6 +220,7 @@
 	let chartLoading = false;
 	let chartFitContentToken = 0;
 	let expandedBacktestParamsId: string | null = null;
+	let expandedBacktestParamSummaryIds: Record<string, boolean> = {};
 	let backtestParamDrafts: Record<string, Record<string, unknown>> = {};
 	let backtestParamRunnerId: string | null = null;
 	let resultLoading = false;
@@ -158,6 +228,11 @@
 	let settingDefaultParams = false;
 	let backtestingOptParams = false;
 	let paramsDraft: Record<string, unknown> = {};
+	let executionDraft: ExecutionProfileDraft = buildFallbackExecutionDraft();
+	let containerExecutionDefaults: ExecutionProfileDraft = buildFallbackExecutionDraft();
+	let gauntletDraftSource: 'defaults' | 'run' = 'defaults';
+	let gauntletDraftSourceId = '';
+	let executionDraftError = '';
 	// Validity surfaced from the ParameterEditor(s). Gating Save/Run on these prevents
 	// silently persisting/running the last-valid value while a field shows an error.
 	let paramsHasErrors = false;
@@ -172,6 +247,8 @@
 	let prebuiltLoadSequence = 0;
 	let optimizationParamDrafts: Record<string, OptimizationParamDraft> = {};
 	let optimizationParamDraftSource = '';
+	let optimizationExecutionDrafts: Record<string, OptimizationParamDraft> = {};
+	let optimizationExecutionDraftSource = '';
 	let parameterSaveMessage = '';
 	let parameterSaveError = '';
 	let availableDatasets: Dataset[] = [];
@@ -180,6 +257,17 @@
 	let quickScreenRows: QuickScreenEvidenceRow[] = [];
 
 	let backtestForm = {
+		symbol: '',
+		timeframe: '1h',
+		start_date: defaultOneYearRange.startDate,
+		end_date: defaultOneYearRange.endDate,
+	};
+
+	// The container's default backtest context (symbol/timeframe from the configuration +
+	// the first/pinned run's window, captured at load). Clicking a history row overrides
+	// backtestForm; "Reset to Defaults" must restore THIS, not whatever the last-clicked
+	// run happened to use.
+	let containerBacktestDefaults = {
 		symbol: '',
 		timeframe: '1h',
 		start_date: defaultOneYearRange.startDate,
@@ -243,14 +331,25 @@
 	$: quickScreenRows = buildQuickScreenEvidenceRows({
 		strategy: container?.strategy ?? null,
 		backtests: backtestHistory,
-		validationHistory,
 		pipelineSettings,
 	});
 	$: executionTrades = container?.execution.trades ?? [];
 	$: executionPositions = container?.execution.positions ?? [];
-	$: strategyParams = (container?.configuration.params && typeof container.configuration.params === 'object' && !Array.isArray(container.configuration.params))
-		? container.configuration.params as Record<string, unknown>
-		: {};
+	// execution_profile is persisted INSIDE params (the canonical home the
+	// optimizer/gauntlet read) but is NOT an alpha param. Strip it everywhere the
+	// alpha-param draft is built so (a) it never shows in the ParameterEditor and
+	// (b) the strategyParams<->paramsDraft dirty comparison stays symmetric — both
+	// sides must omit it, or the draft reads as permanently "Unsaved".
+	function stripExecutionProfile(value: unknown): Record<string, unknown> {
+		if (!(value && typeof value === 'object' && !Array.isArray(value))) return {};
+		const out: Record<string, unknown> = {};
+		for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+			if (key !== 'execution_profile' && !EXECUTION_PARAM_KEYS.has(key)) out[key] = entry;
+		}
+		return out;
+	}
+
+	$: strategyParams = stripExecutionProfile(container?.configuration.params);
 	$: recentEvents = container?.events ?? [];
 	$: submitProgressPct = parseProgressPct(submitProgress);
 	$: datasetSuggestionSymbols = buildDatasetSymbolSuggestions(availableDatasets, backtestForm.timeframe || optimizationForm.timeframe || '1h');
@@ -329,7 +428,11 @@
 	$: selectedChartWarnings = selectedChartContext?.warnings ?? [];
 	$: selectedChartStart = selectedChartBars.length > 0 ? selectedChartBars[0]?.timestamp ?? null : null;
 	$: selectedChartEnd = selectedChartBars.length > 0 ? selectedChartBars[selectedChartBars.length - 1]?.timestamp ?? null : null;
+	$: containerExecutionDefaults = buildContainerExecutionDefaults(container, pipelineSettings);
+	$: executionDirty = !areExecutionDraftsEqual(containerExecutionDefaults, executionDraft);
+	$: executionDraftError = validateExecutionDraft(executionDraft) ?? '';
 	$: paramsDirty = !areParameterRecordsEqual(strategyParams, paramsDraft);
+	$: gauntletDraftDirty = paramsDirty || executionDirty;
 	$: currentStrategyIdentity = resolveContainerStrategyIdentity(container);
 	$: matchingPrebuiltStrategy = resolvePrebuiltStrategy(currentStrategyIdentity, prebuiltStrategies);
 	$: availableParamSpecs = resolvePrebuiltParamSpecs(currentStrategyIdentity, prebuiltStrategies);
@@ -355,7 +458,7 @@
 			? 'Latest run completed'
 			: submitStatus === 'failed'
 				? 'Run needs attention'
-				: paramsDirty
+				: gauntletDraftDirty
 					? 'Draft tuned and ready'
 					: 'Ready to launch';
 	$: backtestRunStateTone = submitStatus === 'failed'
@@ -364,7 +467,7 @@
 			? 'border-emerald-900/40 bg-emerald-950/20 text-emerald-200'
 			: submitStatus === 'submitting' || submitStatus === 'running'
 				? 'border-blue-900/40 bg-blue-950/20 text-blue-200'
-				: paramsDirty
+				: gauntletDraftDirty
 					? 'border-amber-900/40 bg-amber-950/20 text-amber-200'
 					: 'border-cyan-900/40 bg-cyan-950/20 text-cyan-200';
 	$: backtestRunSummary = submitStatus === 'submitting' || submitStatus === 'running'
@@ -373,10 +476,21 @@
 			? submitMessage || 'The latest backtest finished successfully.'
 			: submitStatus === 'failed'
 				? submitMessage || 'The latest submit failed validation or execution.'
-				: paramsDirty
+				: gauntletDraftDirty
 					? 'This draft has local changes and the next backtest will use them immediately.'
 					: 'The working draft matches the saved defaults for this strategy.';
 	$: syncOptimizationParamDrafts(strategyParams);
+	$: syncOptimizationExecutionDrafts(executionDraft);
+	$: optimizationParamSelectedCount = Object.values(optimizationParamDrafts).filter((draft) => draft.selected).length;
+	$: optimizationExecutionSelectedCount = Object.values(optimizationExecutionDrafts).filter((draft) => draft.selected).length;
+	$: allOptimizationParamsSelected =
+		Object.keys(optimizationParamDrafts).length > 0 &&
+		optimizationParamSelectedCount === Object.keys(optimizationParamDrafts).length;
+	$: someOptimizationParamsSelected = optimizationParamSelectedCount > 0 && !allOptimizationParamsSelected;
+	$: allOptimizationExecutionSelected =
+		Object.keys(optimizationExecutionDrafts).length > 0 &&
+		optimizationExecutionSelectedCount === Object.keys(optimizationExecutionDrafts).length;
+	$: someOptimizationExecutionSelected = optimizationExecutionSelectedCount > 0 && !allOptimizationExecutionSelected;
 	$: syncBacktestParamDrafts(backtestHistory);
 	$: orderedRecentEvents = sortLifecycleEventsDescending(recentEvents);
 	$: latestLifecycleEvent = orderedRecentEvents[0] ?? null;
@@ -830,6 +944,186 @@
 		return cloneParameterRecord(value as Record<string, unknown>);
 	}
 
+	function asPlainRecord(value: unknown): Record<string, unknown> {
+		return (!value || typeof value !== 'object' || Array.isArray(value)) ? {} : value as Record<string, unknown>;
+	}
+
+	function numberDraftValue(value: unknown, fallback = ''): string {
+		if (value === null || value === undefined || value === '') return fallback;
+		const parsed = Number(value);
+		return Number.isFinite(parsed) ? String(parsed) : fallback;
+	}
+
+	function optionalNumber(value: string): number | undefined {
+		const text = String(value ?? '').trim();
+		if (!text) return undefined;
+		const parsed = Number(text);
+		return Number.isFinite(parsed) ? parsed : undefined;
+	}
+
+	function leverageDraftValue(value: unknown, fallback = DEFAULT_EXECUTION_LEVERAGE): string {
+		const text = String(value ?? '').trim();
+		const parsed = text ? Number(text) : Number.NaN;
+		if (Number.isFinite(parsed) && parsed > 0 && parsed <= 125) return String(parsed);
+		const fallbackParsed = Number(fallback);
+		if (Number.isFinite(fallbackParsed) && fallbackParsed > 0 && fallbackParsed <= 125) return String(fallbackParsed);
+		return DEFAULT_EXECUTION_LEVERAGE;
+	}
+
+	function validSizingMode(value: unknown): SizingMode {
+		const normalized = String(value ?? '').trim().toLowerCase();
+		if (normalized === 'fraction' || normalized === 'fixed' || normalized === 'atr' || normalized === 'kelly') return normalized;
+		return 'full';
+	}
+
+	function buildFallbackExecutionDraft(): ExecutionProfileDraft {
+		return {
+			initial_capital: '10000',
+			fee_bps: '4.5',
+			slippage_bps: '2',
+			leverage: DEFAULT_EXECUTION_LEVERAGE,
+			sizing_mode: 'full',
+			risk_per_trade: '0.02',
+			fixed_size: '10000',
+			atr_stop_multiplier: '2',
+			kelly_multiplier: '0.5',
+			kelly_lookback: '100',
+			stop_loss_pct: '',
+			take_profit_pct: '',
+			trailing_stop_pct: '',
+			time_stop_bars: '',
+		};
+	}
+
+	// Seed the newly-selected sizing mode's parameters with sensible defaults, but only
+	// where the operator hasn't already supplied (or loaded from a run) a value — so
+	// switching modes never clobbers an explicit entry. Fixed notional prefers the current
+	// Initial Capital (a 1x notional reference) over the static fallback.
+	function applySizingModeDefaults(mode: SizingMode): void {
+		const defaults = SIZING_MODE_FIELD_DEFAULTS[mode];
+		const next: ExecutionProfileDraft = { ...executionDraft };
+		let changed = false;
+		for (const [key, fallback] of Object.entries(defaults) as [SizingNumericField, string][]) {
+			if (String(next[key] ?? '').trim()) continue;
+			if (key === 'fixed_size') {
+				const capital = optionalNumber(next.initial_capital);
+				next.fixed_size = capital !== undefined && capital > 0 ? String(capital) : fallback;
+			} else {
+				next[key] = fallback;
+			}
+			changed = true;
+		}
+		// Make Fraction risk runnable in one click: seed a stop loss only when the operator
+		// has set neither a stop loss nor a trailing stop, so an existing trailing stop is
+		// never overridden.
+		if (mode === 'fraction' && !next.stop_loss_pct.trim() && !next.trailing_stop_pct.trim()) {
+			next.stop_loss_pct = FRACTION_DEFAULT_STOP_LOSS_PCT;
+			changed = true;
+		}
+		if (changed) executionDraft = next;
+	}
+
+	function buildExecutionDraftFromRecord(record: Record<string, unknown>, base: ExecutionProfileDraft): ExecutionProfileDraft {
+		const nested = asPlainRecord(record.execution_profile);
+		const source = { ...record, ...nested };
+		return {
+			initial_capital: numberDraftValue(source.initial_capital, base.initial_capital),
+			fee_bps: numberDraftValue(source.fee_bps, base.fee_bps),
+			slippage_bps: numberDraftValue(source.slippage_bps, base.slippage_bps),
+			leverage: leverageDraftValue(source.leverage, base.leverage),
+			sizing_mode: validSizingMode(source.sizing_mode ?? base.sizing_mode),
+			risk_per_trade: numberDraftValue(source.risk_per_trade, base.risk_per_trade),
+			fixed_size: numberDraftValue(source.fixed_size, base.fixed_size),
+			atr_stop_multiplier: numberDraftValue(source.atr_stop_multiplier, base.atr_stop_multiplier),
+			kelly_multiplier: numberDraftValue(source.kelly_multiplier, base.kelly_multiplier),
+			kelly_lookback: numberDraftValue(source.kelly_lookback, base.kelly_lookback),
+			stop_loss_pct: numberDraftValue(source.stop_loss_pct, base.stop_loss_pct),
+			take_profit_pct: numberDraftValue(source.take_profit_pct, base.take_profit_pct),
+			trailing_stop_pct: numberDraftValue(source.trailing_stop_pct, base.trailing_stop_pct),
+			time_stop_bars: numberDraftValue(source.time_stop_bars, base.time_stop_bars),
+		};
+	}
+
+	// `containerArg`/`settingsArg` are passed explicitly from the reactive block so
+	// Svelte tracks `container` and `pipelineSettings` as dependencies. A bare
+	// `buildContainerExecutionDefaults()` call in a `$:` statement names no reactive
+	// identifiers, so the compiler computes it ONCE at init (container still null) and
+	// never recomputes — which froze `containerExecutionDefaults` at fallback defaults
+	// and left `executionDirty` permanently true on every strategy. Imperative callers
+	// (loadContainer) rely on the defaults to read the live module-level values.
+	function buildContainerExecutionDefaults(
+		containerArg: typeof container = container,
+		settingsArg: typeof pipelineSettings = pipelineSettings,
+	): ExecutionProfileDraft {
+		const fallback = buildFallbackExecutionDraft();
+		const configuration = asPlainRecord(containerArg?.configuration);
+		const params = extractParamRecord(configuration.params);
+		const settings = asPlainRecord(settingsArg);
+		return buildExecutionDraftFromRecord(
+			{
+				initial_capital: configuration.initial_capital ?? params.initial_capital,
+				fee_bps: configuration.fee_bps ?? settings.backtest_fee_bps,
+				slippage_bps: configuration.slippage_bps ?? settings.backtest_slippage_bps,
+				leverage: configuration.leverage ?? params.leverage,
+				sizing_mode: configuration.sizing_mode ?? params.sizing_mode,
+				risk_per_trade: configuration.risk_per_trade ?? params.risk_per_trade,
+				fixed_size: configuration.fixed_size ?? params.fixed_size,
+				atr_stop_multiplier: configuration.atr_stop_multiplier ?? params.atr_stop_multiplier,
+				kelly_multiplier: configuration.kelly_multiplier ?? params.kelly_multiplier,
+				kelly_lookback: configuration.kelly_lookback ?? params.kelly_lookback,
+				stop_loss_pct: configuration.stop_loss_pct ?? params.stop_loss_pct,
+				take_profit_pct: configuration.take_profit_pct ?? params.take_profit_pct,
+				trailing_stop_pct: configuration.trailing_stop_pct ?? params.trailing_stop_pct,
+				time_stop_bars: configuration.time_stop_bars ?? params.time_stop_bars,
+				execution_profile: configuration.execution_profile ?? params.execution_profile,
+			},
+			fallback,
+		);
+	}
+
+	function getHistoryExecutionDraft(item: StrategyContainerHistoryItem): ExecutionProfileDraft {
+		return buildExecutionDraftFromRecord(asPlainRecord(item.config), containerExecutionDefaults);
+	}
+
+	function areExecutionDraftsEqual(left: ExecutionProfileDraft, right: ExecutionProfileDraft): boolean {
+		return stableStringify(left) === stableStringify(right);
+	}
+
+	function executionDraftToPayload(draft: ExecutionProfileDraft): Record<string, unknown> {
+		const payload: Record<string, unknown> = {
+			sizing_mode: draft.sizing_mode,
+		};
+		for (const key of ['initial_capital', 'fee_bps', 'slippage_bps'] as const) {
+			const value = optionalNumber(draft[key]);
+			if (value !== undefined) payload[key] = value;
+		}
+		const leverage = optionalNumber(draft.leverage);
+		if (leverage !== undefined && leverage > 0 && leverage <= 125) payload.leverage = leverage;
+		if (draft.sizing_mode === 'fraction' || draft.sizing_mode === 'atr') {
+			const risk = optionalNumber(draft.risk_per_trade);
+			if (risk !== undefined) payload.risk_per_trade = risk;
+		}
+		if (draft.sizing_mode === 'fixed') {
+			const fixed = optionalNumber(draft.fixed_size);
+			if (fixed !== undefined) payload.fixed_size = fixed;
+		}
+		if (draft.sizing_mode === 'atr') {
+			const atr = optionalNumber(draft.atr_stop_multiplier);
+			if (atr !== undefined) payload.atr_stop_multiplier = atr;
+		}
+		if (draft.sizing_mode === 'kelly') {
+			const multiplier = optionalNumber(draft.kelly_multiplier);
+			const lookback = optionalNumber(draft.kelly_lookback);
+			if (multiplier !== undefined) payload.kelly_multiplier = multiplier;
+			if (lookback !== undefined) payload.kelly_lookback = Math.trunc(lookback);
+		}
+		for (const key of ['stop_loss_pct', 'take_profit_pct', 'trailing_stop_pct', 'time_stop_bars'] as const) {
+			const value = optionalNumber(draft[key]);
+			if (value !== undefined) payload[key] = key === 'time_stop_bars' ? Math.trunc(value) : value;
+		}
+		return payload;
+	}
+
 	function isStructuredParameterValue(value: unknown): boolean {
 		return Boolean(value) && typeof value === 'object';
 	}
@@ -862,6 +1156,9 @@
 			if (Object.keys(backtestParamDrafts).length > 0) {
 				backtestParamDrafts = {};
 			}
+			if (Object.keys(expandedBacktestParamSummaryIds).length > 0) {
+				expandedBacktestParamSummaryIds = {};
+			}
 			if (expandedBacktestParamsId && !items.some((item) => String(item.result_id || '').trim() === expandedBacktestParamsId)) {
 				expandedBacktestParamsId = null;
 			}
@@ -876,6 +1173,13 @@
 		backtestParamDrafts = next;
 		if (expandedBacktestParamsId && !(expandedBacktestParamsId in next)) {
 			expandedBacktestParamsId = null;
+		}
+		const retainedSummaryIds: Record<string, boolean> = {};
+		for (const [resultId, expanded] of Object.entries(expandedBacktestParamSummaryIds)) {
+			if (expanded && resultId in next) retainedSummaryIds[resultId] = true;
+		}
+		if (Object.keys(retainedSummaryIds).length !== Object.keys(expandedBacktestParamSummaryIds).length) {
+			expandedBacktestParamSummaryIds = retainedSummaryIds;
 		}
 	}
 
@@ -901,6 +1205,18 @@
 		const resultId = String(item.result_id || '').trim();
 		if (!resultId) return;
 		expandedBacktestParamsId = expandedBacktestParamsId === resultId ? null : resultId;
+	}
+
+	function toggleBacktestParamSummary(item: StrategyContainerHistoryItem): void {
+		const resultId = String(item.result_id || '').trim();
+		if (!resultId) return;
+		const next = { ...expandedBacktestParamSummaryIds };
+		if (next[resultId]) {
+			delete next[resultId];
+		} else {
+			next[resultId] = true;
+		}
+		expandedBacktestParamSummaryIds = next;
 	}
 
 	function formatBacktestParamChipValue(value: unknown): string {
@@ -931,8 +1247,9 @@
 			}));
 	}
 
-	function getBacktestVisibleParamSummary(item: StrategyContainerHistoryItem): Array<{ key: string; value: string; changed: boolean }> {
-		return getBacktestParamSummary(item).slice(0, 4);
+	function getBacktestVisibleParamSummary(item: StrategyContainerHistoryItem, expanded = false): Array<{ key: string; value: string; changed: boolean }> {
+		const summary = getBacktestParamSummary(item);
+		return expanded ? summary : summary.slice(0, 4);
 	}
 
 	function getBacktestParamOverflowCount(item: StrategyContainerHistoryItem): number {
@@ -1912,7 +2229,50 @@
 		if (!container.strategy.id) return 'Container has no strategy_id.';
 		if (!backtestForm.symbol.trim()) return 'Symbol is required.';
 		if (!backtestForm.timeframe.trim()) return 'Timeframe is required.';
-		return validateDateRange(backtestForm.start_date, backtestForm.end_date);
+		return validateDateRange(backtestForm.start_date, backtestForm.end_date) ?? validateExecutionDraft(executionDraft);
+	}
+
+	function validateExecutionDraft(draft: ExecutionProfileDraft): string | null {
+		const initialCapital = optionalNumber(draft.initial_capital);
+		if (draft.initial_capital.trim() && (initialCapital === undefined || initialCapital <= 0)) return 'Initial capital must be greater than 0.';
+		const fee = optionalNumber(draft.fee_bps);
+		if (draft.fee_bps.trim() && (fee === undefined || fee < 0)) return 'Fee bps cannot be negative.';
+		const slippage = optionalNumber(draft.slippage_bps);
+		if (draft.slippage_bps.trim() && (slippage === undefined || slippage < 0)) return 'Slippage bps cannot be negative.';
+		const leverage = optionalNumber(draft.leverage);
+		if (draft.leverage.trim() && (leverage === undefined || leverage <= 0 || leverage > 125)) return 'Leverage must be greater than 0 and no more than 125.';
+		if (draft.sizing_mode === 'fraction' || draft.sizing_mode === 'atr') {
+			const risk = optionalNumber(draft.risk_per_trade);
+			if (risk === undefined || risk <= 0 || risk > 1) return 'Risk per trade must be between 0 and 1.';
+		}
+		if (draft.sizing_mode === 'fraction' && !draft.stop_loss_pct.trim() && !draft.trailing_stop_pct.trim()) {
+			return 'Fraction sizing needs a stop loss or trailing stop.';
+		}
+		if (draft.sizing_mode === 'fixed') {
+			const fixed = optionalNumber(draft.fixed_size);
+			if (fixed === undefined || fixed <= 0) return 'Fixed notional must be greater than 0.';
+		}
+		if (draft.sizing_mode === 'atr') {
+			const atr = optionalNumber(draft.atr_stop_multiplier);
+			if (atr === undefined || atr <= 0) return 'ATR stop multiplier must be greater than 0.';
+		}
+		if (draft.sizing_mode === 'kelly') {
+			const multiplier = optionalNumber(draft.kelly_multiplier);
+			if (multiplier === undefined || multiplier <= 0 || multiplier > 5) return 'Kelly multiplier must be between 0 and 5.';
+			const lookback = optionalNumber(draft.kelly_lookback);
+			if (lookback === undefined || lookback < 1 || !Number.isInteger(lookback)) return 'Kelly lookback must be a positive whole number.';
+		}
+		for (const [key, label, max] of [
+			['stop_loss_pct', 'Stop loss %', 100],
+			['take_profit_pct', 'Take profit %', 1000],
+			['trailing_stop_pct', 'Trailing stop %', 100],
+		] as const) {
+			const value = optionalNumber(draft[key]);
+			if (draft[key].trim() && (value === undefined || value <= 0 || value > max)) return `${label} must be greater than 0 and no more than ${max}.`;
+		}
+		const timeStop = optionalNumber(draft.time_stop_bars);
+		if (draft.time_stop_bars.trim() && (timeStop === undefined || timeStop < 1 || !Number.isInteger(timeStop))) return 'Time stop must be a positive whole number of bars.';
+		return null;
 	}
 
 	function validateOptimizationForm(): string | null {
@@ -1986,9 +2346,17 @@
 		};
 	}
 
+	function createOptimizationExecutionParamDraft(key: string, value: number): OptimizationParamDraft {
+		const draft = createOptimizationParamDraft(key, value);
+		if (STRICTLY_POSITIVE_EXECUTION_RANGE_KEYS.has(key) && Number(draft.min) <= 0) {
+			draft.min = draft.kind === 'int' ? '1' : formatOptimizationInputValue(Math.max(Number(draft.step), 0.000001), draft.kind);
+		}
+		return draft;
+	}
+
 	function syncOptimizationParamDrafts(params: Record<string, unknown>) {
 		const optimizableEntries = Object.entries(params)
-			.filter(([, value]) => isOptimizableNumericParam(value))
+			.filter(([key, value]) => !EXECUTION_PARAM_KEYS.has(key) && isOptimizableNumericParam(value))
 			.map(([key, value]) => [key, Number(value)] as const);
 		const source = stableStringify(Object.fromEntries(optimizableEntries));
 		if (source === optimizationParamDraftSource) return;
@@ -2004,6 +2372,52 @@
 		}
 		optimizationParamDrafts = nextDrafts;
 		optimizationParamDraftSource = source;
+	}
+
+	function optimizationExecutionValues(draft: ExecutionProfileDraft): Record<string, number> {
+		const values: Record<string, number> = {};
+		const alwaysAvailable = ['leverage', 'stop_loss_pct', 'take_profit_pct', 'trailing_stop_pct', 'time_stop_bars'] as const;
+		for (const key of alwaysAvailable) {
+			const value = optionalNumber(draft[key]);
+			if (value !== undefined) values[key] = value;
+		}
+		if (draft.sizing_mode === 'fraction' || draft.sizing_mode === 'atr') {
+			const value = optionalNumber(draft.risk_per_trade);
+			if (value !== undefined) values.risk_per_trade = value;
+		}
+		if (draft.sizing_mode === 'fixed') {
+			const value = optionalNumber(draft.fixed_size);
+			if (value !== undefined) values.fixed_size = value;
+		}
+		if (draft.sizing_mode === 'atr') {
+			const value = optionalNumber(draft.atr_stop_multiplier);
+			if (value !== undefined) values.atr_stop_multiplier = value;
+		}
+		if (draft.sizing_mode === 'kelly') {
+			const multiplier = optionalNumber(draft.kelly_multiplier);
+			const lookback = optionalNumber(draft.kelly_lookback);
+			if (multiplier !== undefined) values.kelly_multiplier = multiplier;
+			if (lookback !== undefined) values.kelly_lookback = lookback;
+		}
+		return values;
+	}
+
+	function syncOptimizationExecutionDrafts(draft: ExecutionProfileDraft): void {
+		const entries = Object.entries(optimizationExecutionValues(draft));
+		const source = stableStringify(Object.fromEntries(entries));
+		if (source === optimizationExecutionDraftSource) return;
+		const nextDrafts: Record<string, OptimizationParamDraft> = {};
+		for (const [key, value] of entries) {
+			const existing = optimizationExecutionDrafts[key];
+			const kind = optimizationParamKind(value);
+			if (existing && existing.current === value && existing.kind === kind) {
+				nextDrafts[key] = existing;
+				continue;
+			}
+			nextDrafts[key] = createOptimizationExecutionParamDraft(key, value);
+		}
+		optimizationExecutionDrafts = nextDrafts;
+		optimizationExecutionDraftSource = source;
 	}
 
 	function parseOptimizationParamValue(rawValue: string): number | null {
@@ -2027,6 +2441,19 @@
 		return '';
 	}
 
+	function validateOptimizationExecutionDraft(draft: OptimizationParamDraft): string {
+		const baseError = validateOptimizationParamDraft(draft);
+		if (baseError) return baseError;
+		const min = Number(draft.min);
+		const max = Number(draft.max);
+		if (STRICTLY_POSITIVE_EXECUTION_RANGE_KEYS.has(draft.key) && min <= 0) {
+			return `${draft.key} minimum must be greater than zero.`;
+		}
+		if (draft.key === 'leverage' && max > 125) return 'Leverage maximum cannot exceed 125.';
+		if (draft.key === 'risk_per_trade' && max > 1) return 'Risk per trade maximum cannot exceed 1.';
+		return '';
+	}
+
 	function setOptimizationParamSelected(key: string, selected: boolean) {
 		const draft = optimizationParamDrafts[key];
 		if (!draft) return;
@@ -2038,6 +2465,43 @@
 				error: selected ? validateOptimizationParamDraft(draft) : '',
 			},
 		};
+	}
+
+	function setAllOptimizationParamsSelected(selected: boolean) {
+		const nextDrafts: Record<string, OptimizationParamDraft> = {};
+		for (const [key, draft] of Object.entries(optimizationParamDrafts)) {
+			nextDrafts[key] = {
+				...draft,
+				selected,
+				error: selected ? validateOptimizationParamDraft(draft) : '',
+			};
+		}
+		optimizationParamDrafts = nextDrafts;
+	}
+
+	function setOptimizationExecutionSelected(key: string, selected: boolean): void {
+		const draft = optimizationExecutionDrafts[key];
+		if (!draft) return;
+		optimizationExecutionDrafts = {
+			...optimizationExecutionDrafts,
+			[key]: {
+				...draft,
+				selected,
+				error: selected ? validateOptimizationExecutionDraft(draft) : '',
+			},
+		};
+	}
+
+	function setAllOptimizationExecutionSelected(selected: boolean): void {
+		const nextDrafts: Record<string, OptimizationParamDraft> = {};
+		for (const [key, draft] of Object.entries(optimizationExecutionDrafts)) {
+			nextDrafts[key] = {
+				...draft,
+				selected,
+				error: selected ? validateOptimizationExecutionDraft(draft) : '',
+			};
+		}
+		optimizationExecutionDrafts = nextDrafts;
 	}
 
 	function updateOptimizationParamField(key: string, field: 'min' | 'max' | 'step', value: string) {
@@ -2052,6 +2516,22 @@
 			[key]: {
 				...nextDraft,
 				error: nextDraft.selected ? validateOptimizationParamDraft(nextDraft) : '',
+			},
+		};
+	}
+
+	function updateOptimizationExecutionField(key: string, field: 'min' | 'max' | 'step', value: string): void {
+		const draft = optimizationExecutionDrafts[key];
+		if (!draft) return;
+		const nextDraft = {
+			...draft,
+			[field]: value,
+		};
+		optimizationExecutionDrafts = {
+			...optimizationExecutionDrafts,
+			[key]: {
+				...nextDraft,
+				error: nextDraft.selected ? validateOptimizationExecutionDraft(nextDraft) : '',
 			},
 		};
 	}
@@ -2085,6 +2565,38 @@
 		return {
 			error: firstError,
 			parameterRanges: Object.keys(parameterRanges).length > 0 ? parameterRanges : undefined,
+		};
+	}
+
+	function collectOptimizationExecutionRanges(): {
+		error: string | null;
+		executionRanges?: Record<string, { min: number; max: number; step: number }>;
+	} {
+		const nextDrafts: Record<string, OptimizationParamDraft> = {};
+		const executionRanges: Record<string, { min: number; max: number; step: number }> = {};
+		let firstError: string | null = null;
+		for (const [key, draft] of Object.entries(optimizationExecutionDrafts)) {
+			let error = '';
+			if (draft.selected) {
+				error = validateOptimizationExecutionDraft(draft);
+				if (!error) {
+					executionRanges[key] = {
+						min: Number(draft.min),
+						max: Number(draft.max),
+						step: Number(draft.step),
+					};
+				}
+			}
+			if (error && !firstError) firstError = error;
+			nextDrafts[key] = {
+				...draft,
+				error,
+			};
+		}
+		optimizationExecutionDrafts = nextDrafts;
+		return {
+			error: firstError,
+			executionRanges: Object.keys(executionRanges).length > 0 ? executionRanges : undefined,
 		};
 	}
 
@@ -2168,6 +2680,7 @@
 		if (!resultId) return;
 		selectedResultId = resultId;
 		selectedResultItem = item;
+		loadGauntletDraftFromHistory(item);
 		selectedResult = null;
 		selectedChartContext = null;
 		resultError = '';
@@ -2242,6 +2755,122 @@
 		return null;
 	}
 
+	function getOptimizationHistoryBestParams(item: StrategyContainerHistoryItem): Record<string, unknown> {
+		const metricsParams = asPlainRecord(item.metrics?.best_params);
+		if (Object.keys(metricsParams).length > 0) return metricsParams;
+		const configBest = asPlainRecord(item.config?.best_params);
+		if (Object.keys(configBest).length > 0) return configBest;
+		return extractParamRecord(item.config?.params);
+	}
+
+	function getOptimizationHistoryExecutionProfile(item: StrategyContainerHistoryItem): Record<string, unknown> {
+		const profile = asPlainRecord(item.config?.execution_profile);
+		if (Object.keys(profile).length > 0) return profile;
+		const bestProfile = asPlainRecord(item.config?.best_execution_profile);
+		if (Object.keys(bestProfile).length > 0) return bestProfile;
+		return asPlainRecord(item.config?.best_execution_controls);
+	}
+
+	function optimizationObjectiveLabel(value: unknown): string {
+		const normalized = String(value ?? '').trim();
+		const match = OPTIMIZATION_OBJECTIVES.find((option) => option.value === normalized);
+		return match?.label ?? (normalized || 'Fitness');
+	}
+
+	function optimizationObjectiveValue(item: StrategyContainerHistoryItem): number | null {
+		const objective = String(item.config?.objective || item.metrics?.objective || '').trim();
+		const explicit = readMetricOptional(item, 'best_objective_value', 'objective_value');
+		if (explicit !== null) return explicit;
+		if (objective === 'total_return_pct') return readPercentMetricOptional(item, 'total_return_pct', 'total_return', 'pnl_pct');
+		if (objective === 'profit_factor') return readMetricOptional(item, 'profit_factor', 'pf');
+		if (objective === 'win_rate') return readPercentMetricOptional(item, 'win_rate', 'win_rate_pct');
+		if (objective === 'sharpe_ratio' || objective === 'sharpe') return readMetricOptional(item, 'sharpe_ratio', 'sharpe');
+		return readMetricOptional(item, 'best_fitness', 'fitness');
+	}
+
+	function formatOptimizationObjectiveValue(item: StrategyContainerHistoryItem): string {
+		const value = optimizationObjectiveValue(item);
+		if (value === null || !Number.isFinite(value)) return '--';
+		const objective = String(item.config?.objective || item.metrics?.objective || '').trim();
+		if (objective === 'total_return_pct' || objective === 'win_rate') return `${value.toFixed(2)}%`;
+		return value.toFixed(2);
+	}
+
+	function formatOptimizationChipRecord(record: Record<string, unknown>, limit = 6): string[] {
+		return Object.entries(record)
+			.sort(([left], [right]) => left.localeCompare(right))
+			.slice(0, limit)
+			.map(([key, value]) => `${key}=${formatBacktestParamChipValue(value)}`);
+	}
+
+	function optimizationTopResults(item: StrategyContainerHistoryItem): Array<Record<string, unknown>> {
+		const top = item.config?.top_results;
+		return Array.isArray(top) ? top.filter((entry): entry is Record<string, unknown> => Boolean(entry) && typeof entry === 'object').slice(0, 3) : [];
+	}
+
+	function optimizationRunMarketLabel(item: StrategyContainerHistoryItem): string {
+		const config = asPlainRecord(item.config);
+		const symbol = String(config.symbol ?? item.symbol ?? '').trim() || 'Symbol';
+		const timeframe = String(config.timeframe ?? item.timeframe ?? '').trim() || 'TF';
+		return `${symbol} / ${timeframe}`;
+	}
+
+	function optimizationRunWindowLabel(item: StrategyContainerHistoryItem): string {
+		const config = asPlainRecord(item.config);
+		const start = String(config.start ?? item.start_date ?? '').trim();
+		const end = String(config.end ?? item.end_date ?? '').trim();
+		return `${fmtShortDate(start)} -> ${fmtShortDate(end)}`;
+	}
+
+	function optimizationWfaLabel(item: StrategyContainerHistoryItem): string {
+		const config = asPlainRecord(item.config);
+		const metrics = asPlainRecord(item.metrics);
+		const verdict = String(config.wfa_verdict ?? metrics.wfa_verdict ?? '').trim();
+		if (verdict) return verdict.toUpperCase();
+		const validated = config.validated ?? metrics.validated;
+		if (validated === true) return 'VALIDATED';
+		if (validated === false) return 'NOT VALIDATED';
+		return '--';
+	}
+
+	function optimizationWfaClass(item: StrategyContainerHistoryItem): string {
+		const label = optimizationWfaLabel(item).toLowerCase();
+		if (label.includes('fail') || label.includes('not')) return 'text-red-300';
+		if (label.includes('pass') || label.includes('valid')) return 'text-emerald-300';
+		return 'text-gray-300';
+	}
+
+	function formatOptimizationObjectiveByName(objective: string, value: number | null): string {
+		if (value === null || !Number.isFinite(value)) return '--';
+		if (objective === 'total_return_pct' || objective === 'win_rate') return `${value.toFixed(2)}%`;
+		return value.toFixed(2);
+	}
+
+	function optimizationTopObjectiveLabel(entry: Record<string, unknown>, item: StrategyContainerHistoryItem): string {
+		const objective = String(entry.objective ?? item.config?.objective ?? item.metrics?.objective ?? '').trim();
+		const value = asNumber(entry.objective_value, Number.NaN);
+		const fallback = asNumber(entry.fitness, Number.NaN);
+		const resolved = Number.isFinite(value) ? value : Number.isFinite(fallback) ? fallback : null;
+		return formatOptimizationObjectiveByName(objective, resolved);
+	}
+
+	function optimizationTopFitnessLabel(entry: Record<string, unknown>): string {
+		const fitness = asNumber(entry.fitness, Number.NaN);
+		return Number.isFinite(fitness) ? fitness.toFixed(2) : '--';
+	}
+
+	function optimizationTopParamChips(entry: Record<string, unknown>, limit = 4): string[] {
+		const params = asPlainRecord(entry.full_params);
+		const fallback = asPlainRecord(entry.params);
+		return formatOptimizationChipRecord(Object.keys(params).length > 0 ? params : fallback, limit);
+	}
+
+	function optimizationTopExecutionChips(entry: Record<string, unknown>, limit = 4): string[] {
+		const controls = asPlainRecord(entry.full_execution_controls);
+		const fallback = asPlainRecord(entry.execution_controls);
+		return formatOptimizationChipRecord(Object.keys(controls).length > 0 ? controls : fallback, limit);
+	}
+
 	function getEffectiveOptimizationParams(): Record<string, unknown> | null {
 		if (!selectedResult) return null;
 		const bestParams = getOptBestParams();
@@ -2253,6 +2882,21 @@
 		};
 	}
 
+	function getEffectiveOptimizationExecutionDraft(): ExecutionProfileDraft | null {
+		if (!selectedResult) return null;
+		const config = asPlainRecord(selectedResult.config);
+		const executionProfile = asPlainRecord(config.execution_profile);
+		const bestExecutionProfile = asPlainRecord(config.best_execution_profile);
+		const bestExecutionControls = asPlainRecord(config.best_execution_controls);
+		const source = Object.keys(executionProfile).length > 0
+			? executionProfile
+			: Object.keys(bestExecutionProfile).length > 0
+				? bestExecutionProfile
+				: bestExecutionControls;
+		if (Object.keys(source).length === 0) return null;
+		return buildExecutionDraftFromRecord(source, containerExecutionDefaults);
+	}
+
 	function isOptimizationResult(): boolean {
 		return selectedResult?.result_type === 'optimization' && getOptBestParams() !== null;
 	}
@@ -2261,6 +2905,7 @@
 		if (!container || !selectedResult || backtestingOptParams) return;
 		const effectiveParams = getEffectiveOptimizationParams();
 		if (!effectiveParams) return;
+		const optimizedExecutionDraft = getEffectiveOptimizationExecutionDraft();
 		backtestingOptParams = true;
 		try {
 			// Re-run over the SAME window the optimization used (stored on the result
@@ -2280,6 +2925,7 @@
 				params: effectiveParams,
 				definition_json: getResultDefinitionJson(selectedResult),
 				preserve_result: true,
+				...executionDraftToPayload(optimizedExecutionDraft ?? executionDraft),
 			});
 			if (response.status === 'succeeded') {
 				addToast('Gauntlet with optimized params completed', 'success', `/lab/strategy/${encodeURIComponent(strategyId)}`);
@@ -2300,13 +2946,17 @@
 		if (!container || settingDefaultParams) return;
 		const effectiveParams = getEffectiveOptimizationParams();
 		if (!effectiveParams) return;
+		const optimizedExecutionDraft = getEffectiveOptimizationExecutionDraft();
+		const paramsToSave = optimizedExecutionDraft
+			? { ...effectiveParams, execution_profile: executionDraftToPayload(optimizedExecutionDraft) }
+			: effectiveParams;
 		const confirmed = typeof window === 'undefined' || window.confirm(
 			'Set these optimized parameters as the strategy defaults?\n\nThis will update the parameters used for paper trading and live execution.'
 		);
 		if (!confirmed) return;
 		settingDefaultParams = true;
 		try {
-			await updateStrategyDefaultParams(container.strategy.id, effectiveParams, { pinnedBacktestId: null });
+			await updateStrategyDefaultParams(container.strategy.id, paramsToSave, { pinnedBacktestId: null });
 			addToast('Default parameters updated', 'success', `/lab/strategy/${encodeURIComponent(strategyId)}`);
 			await loadContainer();
 		} catch (err) {
@@ -2340,20 +2990,56 @@
 
 	function resetParameterDraft(): void {
 		paramsDraft = cloneParameterRecord(strategyParams);
+		executionDraft = { ...containerExecutionDefaults };
+		// A row click can move the backtest symbol/timeframe/window away from the container
+		// default; a "Reset to Defaults" that left them pointed at the last-clicked run
+		// would be a half-reset. Restore the captured default context alongside the draft.
+		backtestForm = { ...backtestForm, ...containerBacktestDefaults };
+		gauntletDraftSource = 'defaults';
+		gauntletDraftSourceId = '';
 		parameterSaveMessage = '';
 		parameterSaveError = '';
+	}
+
+	function resetGauntletDraftToDefaults(): void {
+		resetParameterDraft();
+	}
+
+	function loadGauntletDraftFromHistory(item: StrategyContainerHistoryItem, notify = false): void {
+		paramsDraft = getBacktestParamDraft(item);
+		executionDraft = getHistoryExecutionDraft(item);
+		// Mirror the selected run's full backtest context into the form — symbol,
+		// timeframe AND the date span — so the loaded draft reflects the SAME inputs it
+		// was produced over and re-running ("Run the Gauntlet") reproduces the run instead
+		// of pairing a stale symbol/timeframe with a new window. Symbol/timeframe fall back
+		// to the current form when the run omits them; the date span is applied only when
+		// BOTH endpoints parse (atomic) so we never blend a new start with a stale end.
+		const windowStart = toDateInput(item.start_date ?? item.config.start);
+		const windowEnd = toDateInput(item.end_date ?? item.config.end);
+		const runSymbol = (item.symbol ?? '').trim();
+		const runTimeframe = (item.timeframe ?? '').trim();
+		backtestForm = {
+			...backtestForm,
+			symbol: runSymbol || backtestForm.symbol,
+			timeframe: runTimeframe || backtestForm.timeframe,
+			...(windowStart && windowEnd ? { start_date: windowStart, end_date: windowEnd } : {}),
+		};
+		gauntletDraftSource = 'run';
+		gauntletDraftSourceId = String(item.result_id || '').trim();
+		parameterSaveMessage = '';
+		parameterSaveError = '';
+		if (notify && gauntletDraftSourceId) {
+			addToast(`Loaded Gauntlet settings from ${gauntletDraftSourceId}.`, 'info', `/lab/strategy/${encodeURIComponent(strategyId)}`);
+		}
 	}
 
 	function loadBacktestParamsIntoDraft(item: StrategyContainerHistoryItem): void {
-		paramsDraft = getBacktestParamDraft(item);
-		parameterSaveMessage = '';
-		parameterSaveError = '';
-		addToast(`Loaded parameters from ${item.result_id} into the working draft.`, 'info', `/lab/strategy/${encodeURIComponent(strategyId)}`);
+		loadGauntletDraftFromHistory(item, true);
 	}
 
 	async function saveParameterDraft(): Promise<void> {
-		if (!container || settingDefaultParams || !paramsDirty) return;
-		if (paramsHasErrors) {
+		if (!container || settingDefaultParams || !gauntletDraftDirty) return;
+		if (paramsHasErrors || executionDraftError) {
 			addToast('Fix the highlighted parameter errors before saving.', 'error');
 			return;
 		}
@@ -2361,7 +3047,12 @@
 		parameterSaveMessage = '';
 		parameterSaveError = '';
 		try {
-			await updateStrategyDefaultParams(container.strategy.id, paramsDraft, { pinnedBacktestId: null });
+			// Persist the execution profile under params.execution_profile — the
+			// canonical home the optimizer / gauntlet / acceptance gate read — alongside
+			// the alpha params, so a tuned profile survives reload and drives backtests
+			// instead of being ephemeral.
+			const paramsToSave = { ...paramsDraft, execution_profile: executionDraftToPayload(executionDraft) };
+			await updateStrategyDefaultParams(container.strategy.id, paramsToSave, { pinnedBacktestId: null });
 			parameterSaveMessage = 'Default parameters saved.';
 			addToast('Default parameters updated', 'success', `/lab/strategy/${encodeURIComponent(strategyId)}`);
 			await loadContainer();
@@ -2414,6 +3105,7 @@
 				start_date: resolvedStartDate,
 				end_date: resolvedEndDate,
 			};
+			containerBacktestDefaults = { ...backtestForm };
 			optimizationForm = {
 				...optimizationForm,
 				symbol: defaultSymbol,
@@ -2421,11 +3113,10 @@
 				start_date: resolvedStartDate,
 				end_date: resolvedEndDate,
 			};
-			paramsDraft = cloneParameterRecord(
-				(payload.configuration.params && typeof payload.configuration.params === 'object' && !Array.isArray(payload.configuration.params))
-					? (payload.configuration.params as Record<string, unknown>)
-					: {},
-			);
+			paramsDraft = cloneParameterRecord(stripExecutionProfile(payload.configuration.params));
+			executionDraft = buildContainerExecutionDefaults();
+			gauntletDraftSource = 'defaults';
+			gauntletDraftSourceId = '';
 			backtestParamDrafts = buildBacktestParamDraftMap(payload.history.backtests);
 			expandedBacktestParamsId = null;
 			backtestParamRunnerId = null;
@@ -2564,6 +3255,7 @@
 			end: toIsoDate(backtestForm.end_date),
 			params: paramsDraft,
 			definition_json: getContainerDefinitionJson(),
+			...executionDraftToPayload(executionDraft),
 		});
 	}
 
@@ -2582,6 +3274,7 @@
 				end: item.end_date ?? undefined,
 				params: getBacktestParamDraft(item),
 				definition_json: getHistoryDefinitionJson(item),
+				...executionDraftToPayload(gauntletDraftSourceId === resultId ? executionDraft : getHistoryExecutionDraft(item)),
 			});
 		} finally {
 			backtestParamRunnerId = null;
@@ -2606,11 +3299,28 @@
 			addToast(parameterRangeError, 'error', `/lab/strategy/${encodeURIComponent(strategyId)}`);
 			return;
 		}
+		const { error: executionRangeError, executionRanges } = collectOptimizationExecutionRanges();
+		if (executionRangeError) {
+			submitStatus = 'failed';
+			submitMessage = executionRangeError;
+			resetSubmitProgress();
+			addToast(executionRangeError, 'error', `/lab/strategy/${encodeURIComponent(strategyId)}`);
+			return;
+		}
+		const executionValidationError = validateExecutionDraft(executionDraft);
+		if (executionValidationError) {
+			submitStatus = 'failed';
+			submitMessage = executionValidationError;
+			resetSubmitProgress();
+			addToast(executionValidationError, 'error', `/lab/strategy/${encodeURIComponent(strategyId)}`);
+			return;
+		}
 		submitStatus = 'submitting';
 		submitMessage = '';
 		submitJobId = null;
 		resetSubmitProgress();
 		try {
+			const executionPayload = executionDraftToPayload(executionDraft);
 			const response = await submitOptimization({
 				strategy_id: container.strategy.id,
 				strategy_name: container.strategy.name,
@@ -2621,6 +3331,9 @@
 				objective: optimizationForm.objective,
 				n_trials: optimizationForm.n_trials,
 				parameter_ranges: parameterRanges,
+				execution_parameter_ranges: executionRanges,
+				execution_profile: executionPayload,
+				...executionPayload,
 			});
 			submitJobId = response.job_id;
 			if (response.status === 'succeeded') {
@@ -2861,13 +3574,13 @@
 									type="button"
 									class="rounded border border-[#2b2b2b] bg-black px-2 py-1 text-[10px] uppercase tracking-wide text-gray-400 transition hover:text-white disabled:opacity-40"
 									on:click={resetParameterDraft}
-									disabled={!paramsDirty || settingDefaultParams}
+									disabled={!gauntletDraftDirty || settingDefaultParams}
 								>Reset</button>
 								<button
 									type="button"
 									class="rounded border border-emerald-700 bg-emerald-950/30 px-2 py-1 text-[10px] uppercase tracking-wide text-emerald-200 transition hover:bg-emerald-900/40 disabled:opacity-40"
 									on:click={saveParameterDraft}
-									disabled={!paramsDirty || settingDefaultParams || paramsHasErrors}
+									disabled={!gauntletDraftDirty || settingDefaultParams || paramsHasErrors || Boolean(executionDraftError)}
 								>{settingDefaultParams ? 'Saving…' : 'Save'}</button>
 							</div>
 						</div>
@@ -3081,7 +3794,7 @@
 					<div class="mt-2 flex flex-wrap items-center gap-2 text-[11px] text-gray-500">
 						<span class="rounded border border-[#2b2b2b] bg-black px-1.5 py-0.5">{backtestBarEstimateLabel}</span>
 						<span class="rounded border border-[#2b2b2b] bg-black px-1.5 py-0.5">{backtestWindowSummary}</span>
-						<span class={`rounded border px-1.5 py-0.5 ${paramsDirty ? 'border-amber-900/60 text-amber-300' : 'border-[#2b2b2b] text-gray-500'}`}>{paramsDirty ? 'Draft has changes' : 'Defaults synced'}</span>
+						<span class={`rounded border px-1.5 py-0.5 ${gauntletDraftDirty ? 'border-amber-900/60 text-amber-300' : 'border-[#2b2b2b] text-gray-500'}`}>{gauntletDraftDirty ? 'Draft has changes' : 'Defaults synced'}</span>
 					</div>
 				</div>
 
@@ -3089,14 +3802,92 @@
 					<summary class="flex cursor-pointer items-center justify-between px-3 py-2">
 						<div class="flex items-center gap-2 text-[10px] uppercase tracking-wide text-gray-500">
 							Gauntlet Parameters
-							<span class={`rounded border px-1.5 py-0.5 text-[10px] normal-case tracking-normal ${paramsDirty ? 'border-amber-900/60 text-amber-300' : 'border-[#2b2b2b] text-gray-500'}`}>{paramsDirty ? 'Unsaved' : 'Synced'}</span>
+							<span class={`rounded border px-1.5 py-0.5 text-[10px] normal-case tracking-normal ${gauntletDraftSource === 'run' ? 'border-cyan-900/60 text-cyan-300' : 'border-[#2b2b2b] text-gray-500'}`}>
+								{gauntletDraftSource === 'run' && gauntletDraftSourceId ? `Run ${gauntletDraftSourceId}` : 'Container defaults'}
+							</span>
+							<span class={`rounded border px-1.5 py-0.5 text-[10px] normal-case tracking-normal ${gauntletDraftDirty ? 'border-amber-900/60 text-amber-300' : 'border-[#2b2b2b] text-gray-500'}`}>{gauntletDraftDirty ? 'Unsaved' : 'Synced'}</span>
 						</div>
 						<div class="flex items-center gap-1.5">
-							<button type="button" class="rounded border border-[#2b2b2b] bg-black px-2 py-0.5 text-[10px] uppercase text-gray-400 hover:text-white disabled:opacity-40" data-testid="backtest-params-reset" on:click|stopPropagation={resetParameterDraft} disabled={!paramsDirty || settingDefaultParams}>Reset</button>
-							<button type="button" class="rounded border border-emerald-700 bg-emerald-950/30 px-2 py-0.5 text-[10px] uppercase text-emerald-200 hover:bg-emerald-900/40 disabled:opacity-40" data-testid="backtest-params-save" on:click|stopPropagation={saveParameterDraft} disabled={!paramsDirty || settingDefaultParams || paramsHasErrors}>{settingDefaultParams ? 'Saving…' : 'Save'}</button>
+							<button type="button" class="rounded border border-[#2b2b2b] bg-black px-2 py-0.5 text-[10px] uppercase text-gray-400 hover:text-white disabled:opacity-40" data-testid="backtest-params-reset" on:click|stopPropagation={resetGauntletDraftToDefaults} disabled={(gauntletDraftSource === 'defaults' && !gauntletDraftDirty) || settingDefaultParams}>Reset to Defaults</button>
+							<button type="button" class="rounded border border-emerald-700 bg-emerald-950/30 px-2 py-0.5 text-[10px] uppercase text-emerald-200 hover:bg-emerald-900/40 disabled:opacity-40" data-testid="backtest-params-save" on:click|stopPropagation={saveParameterDraft} disabled={!gauntletDraftDirty || settingDefaultParams || paramsHasErrors || Boolean(executionDraftError)}>{settingDefaultParams ? 'Saving…' : 'Save'}</button>
 						</div>
 					</summary>
 					<div class="border-t border-[#1a1a1a] p-3" data-testid="backtest-parameter-editor">
+						<div class="mb-4 grid gap-3 lg:grid-cols-3">
+							<label class="block text-[10px] uppercase tracking-wide text-gray-500">
+								Initial Capital
+								<input type="number" bind:value={executionDraft.initial_capital} min="0" step="1000" class="mt-1 w-full rounded border border-[#2b2b2b] bg-black px-3 py-2 text-xs text-white outline-none focus:border-cyan-700" />
+							</label>
+							<label class="block text-[10px] uppercase tracking-wide text-gray-500">
+								Fee (bps)
+								<input type="number" bind:value={executionDraft.fee_bps} min="0" step="0.1" class="mt-1 w-full rounded border border-[#2b2b2b] bg-black px-3 py-2 text-xs text-white outline-none focus:border-cyan-700" />
+							</label>
+							<label class="block text-[10px] uppercase tracking-wide text-gray-500">
+								Slippage (bps)
+								<input type="number" bind:value={executionDraft.slippage_bps} min="0" step="0.1" class="mt-1 w-full rounded border border-[#2b2b2b] bg-black px-3 py-2 text-xs text-white outline-none focus:border-cyan-700" />
+							</label>
+							<label class="block text-[10px] uppercase tracking-wide text-gray-500">
+								Leverage
+								<input type="number" bind:value={executionDraft.leverage} min="0" max="125" step="0.1" placeholder="Engine default" class="mt-1 w-full rounded border border-[#2b2b2b] bg-black px-3 py-2 text-xs text-white outline-none focus:border-cyan-700" />
+							</label>
+							<label class="block text-[10px] uppercase tracking-wide text-gray-500">
+								Sizing Mode
+								<select bind:value={executionDraft.sizing_mode} on:change={() => applySizingModeDefaults(executionDraft.sizing_mode)} class="mt-1 w-full rounded border border-[#2b2b2b] bg-black px-3 py-2 text-xs text-white outline-none focus:border-cyan-700">
+									<option value="full">Full equity</option>
+									<option value="fraction">Fraction risk</option>
+									<option value="fixed">Fixed notional</option>
+									<option value="atr">ATR risk</option>
+									<option value="kelly">Kelly</option>
+								</select>
+							</label>
+							{#if executionDraft.sizing_mode === 'fraction' || executionDraft.sizing_mode === 'atr'}
+								<label class="block text-[10px] uppercase tracking-wide text-gray-500">
+									Risk Per Trade
+									<input type="number" bind:value={executionDraft.risk_per_trade} min="0" max="1" step="0.005" class="mt-1 w-full rounded border border-[#2b2b2b] bg-black px-3 py-2 text-xs text-white outline-none focus:border-cyan-700" />
+								</label>
+							{/if}
+							{#if executionDraft.sizing_mode === 'fixed'}
+								<label class="block text-[10px] uppercase tracking-wide text-gray-500">
+									Fixed Notional
+									<input type="number" bind:value={executionDraft.fixed_size} min="0" step="100" class="mt-1 w-full rounded border border-[#2b2b2b] bg-black px-3 py-2 text-xs text-white outline-none focus:border-cyan-700" />
+								</label>
+							{/if}
+							{#if executionDraft.sizing_mode === 'atr'}
+								<label class="block text-[10px] uppercase tracking-wide text-gray-500">
+									ATR Stop Multiplier
+									<input type="number" bind:value={executionDraft.atr_stop_multiplier} min="0" step="0.1" class="mt-1 w-full rounded border border-[#2b2b2b] bg-black px-3 py-2 text-xs text-white outline-none focus:border-cyan-700" />
+								</label>
+							{/if}
+							{#if executionDraft.sizing_mode === 'kelly'}
+								<label class="block text-[10px] uppercase tracking-wide text-gray-500">
+									Kelly Multiplier
+									<input type="number" bind:value={executionDraft.kelly_multiplier} min="0" max="5" step="0.05" class="mt-1 w-full rounded border border-[#2b2b2b] bg-black px-3 py-2 text-xs text-white outline-none focus:border-cyan-700" />
+								</label>
+								<label class="block text-[10px] uppercase tracking-wide text-gray-500">
+									Kelly Lookback
+									<input type="number" bind:value={executionDraft.kelly_lookback} min="1" step="1" class="mt-1 w-full rounded border border-[#2b2b2b] bg-black px-3 py-2 text-xs text-white outline-none focus:border-cyan-700" />
+								</label>
+							{/if}
+							<label class="block text-[10px] uppercase tracking-wide text-gray-500">
+								Stop Loss %
+								<input type="number" bind:value={executionDraft.stop_loss_pct} min="0" max="100" step="0.1" placeholder="None" class="mt-1 w-full rounded border border-[#2b2b2b] bg-black px-3 py-2 text-xs text-white outline-none focus:border-cyan-700" />
+							</label>
+							<label class="block text-[10px] uppercase tracking-wide text-gray-500">
+								Take Profit %
+								<input type="number" bind:value={executionDraft.take_profit_pct} min="0" step="0.1" placeholder="None" class="mt-1 w-full rounded border border-[#2b2b2b] bg-black px-3 py-2 text-xs text-white outline-none focus:border-cyan-700" />
+							</label>
+							<label class="block text-[10px] uppercase tracking-wide text-gray-500">
+								Trailing Stop %
+								<input type="number" bind:value={executionDraft.trailing_stop_pct} min="0" max="100" step="0.1" placeholder="None" class="mt-1 w-full rounded border border-[#2b2b2b] bg-black px-3 py-2 text-xs text-white outline-none focus:border-cyan-700" />
+							</label>
+							<label class="block text-[10px] uppercase tracking-wide text-gray-500">
+								Time Stop (bars)
+								<input type="number" bind:value={executionDraft.time_stop_bars} min="1" step="1" placeholder="None" class="mt-1 w-full rounded border border-[#2b2b2b] bg-black px-3 py-2 text-xs text-white outline-none focus:border-cyan-700" />
+							</label>
+						</div>
+						{#if executionDraftError}
+							<div class="mb-3 rounded border border-red-900/50 bg-red-950/20 px-3 py-2 text-[11px] text-red-200">{executionDraftError}</div>
+						{/if}
 						<ParameterEditor bind:params={paramsDraft} bind:hasErrors={paramsHasErrors} saving={settingDefaultParams} />
 					</div>
 				</details>
@@ -3184,16 +3975,23 @@
 																Current strategy params
 															</span>
 														{/if}
-														{#if getBacktestVisibleParamSummary(item).length > 0}
-															{#each getBacktestVisibleParamSummary(item) as entry}
+														{#if getBacktestVisibleParamSummary(item, Boolean(expandedBacktestParamSummaryIds[String(item.result_id || '').trim()])).length > 0}
+															{#each getBacktestVisibleParamSummary(item, Boolean(expandedBacktestParamSummaryIds[String(item.result_id || '').trim()])) as entry}
 																<span class={`rounded-full border px-2 py-0.5 text-[10px] ${entry.changed ? 'border-amber-900/60 bg-amber-950/15 text-amber-200' : 'border-[#2b2b2b] bg-black text-gray-300'}`}>
 																	{entry.key}={entry.value}
 																</span>
 															{/each}
 															{#if getBacktestParamOverflowCount(item) > 0}
-																<span class="rounded-full border border-[#2b2b2b] bg-black px-2 py-0.5 text-[10px] text-gray-500">
-																	+{getBacktestParamOverflowCount(item)} more
-																</span>
+																<button
+																	type="button"
+																	data-testid={`backtest-param-overflow-${item.result_id}`}
+																	class="rounded-full border border-[#2b2b2b] bg-black px-2 py-0.5 text-[10px] text-gray-500 transition hover:border-cyan-800/70 hover:text-cyan-200"
+																	aria-expanded={Boolean(expandedBacktestParamSummaryIds[String(item.result_id || '').trim()])}
+																	aria-label={`${Boolean(expandedBacktestParamSummaryIds[String(item.result_id || '').trim()]) ? 'Hide extra parameters for' : 'Show all parameters for'} ${item.result_id}`}
+																	on:click|stopPropagation={() => toggleBacktestParamSummary(item)}
+																>
+																	{Boolean(expandedBacktestParamSummaryIds[String(item.result_id || '').trim()]) ? 'Show less' : `+${getBacktestParamOverflowCount(item)} more`}
+																</button>
 															{/if}
 														{:else}
 															<span class="text-[11px] text-gray-600">No stored params</span>
@@ -3394,7 +4192,7 @@
 									<div class="mt-1 text-xs text-gray-400">Select numeric params to optimize. Unchecked params stay fixed at the current strategy defaults.</div>
 								</div>
 								<div class="rounded-full border border-cyan-900/40 bg-cyan-950/20 px-2 py-1 text-[10px] uppercase tracking-[0.18em] text-cyan-200">
-									{Object.values(optimizationParamDrafts).filter((draft) => draft.selected).length} selected
+									{optimizationParamSelectedCount} selected
 								</div>
 							</div>
 							{#if Object.keys(optimizationParamDrafts).length === 0}
@@ -3402,7 +4200,18 @@
 									No numeric strategy params are available for optimization on this container.
 								</div>
 							{:else}
-								<div class="mt-3 grid gap-2">
+								<label class="mt-3 flex w-fit items-center gap-3 text-xs">
+									<input
+										data-testid="opt-param-select-all"
+										type="checkbox"
+										class="h-4 w-4 rounded border border-[#2b2b2b] bg-black text-cyan-400 focus:ring-cyan-500/30"
+										checked={allOptimizationParamsSelected}
+										indeterminate={someOptimizationParamsSelected}
+										on:change={(event) => setAllOptimizationParamsSelected((event.currentTarget as HTMLInputElement).checked)}
+									/>
+									<span class="font-medium uppercase tracking-wide text-gray-300">Select all</span>
+								</label>
+								<div class="mt-2 grid gap-2">
 									{#each Object.values(optimizationParamDrafts) as draft (draft.key)}
 										<div class="rounded-lg border border-[#1d1d1d] bg-[#050505] p-3">
 											<div class="grid gap-3 lg:grid-cols-[minmax(0,1.2fr)_repeat(4,minmax(0,1fr))]">
@@ -3465,6 +4274,93 @@
 									{/each}
 								</div>
 							{/if}
+							<div class="mt-4 border-t border-[#1a1a1a] pt-4">
+								<div class="flex items-center justify-between gap-2">
+									<div class="text-[10px] uppercase tracking-wide text-gray-500">Execution Settings</div>
+									<div class="rounded-full border border-blue-900/40 bg-blue-950/20 px-2 py-1 text-[10px] uppercase tracking-[0.18em] text-blue-200">
+										{optimizationExecutionSelectedCount} selected
+									</div>
+								</div>
+								{#if Object.keys(optimizationExecutionDrafts).length === 0}
+									<div class="mt-3 rounded border border-[#1a1a1a] bg-[#050505] px-3 py-2 text-xs text-gray-500">
+										No numeric execution settings are active for the current sizing mode.
+									</div>
+								{:else}
+									<label class="mt-3 flex w-fit items-center gap-3 text-xs">
+										<input
+											data-testid="opt-exec-select-all"
+											type="checkbox"
+											class="h-4 w-4 rounded border border-[#2b2b2b] bg-black text-blue-400 focus:ring-blue-500/30"
+											checked={allOptimizationExecutionSelected}
+											indeterminate={someOptimizationExecutionSelected}
+											on:change={(event) => setAllOptimizationExecutionSelected((event.currentTarget as HTMLInputElement).checked)}
+										/>
+										<span class="font-medium uppercase tracking-wide text-gray-300">Select all execution</span>
+									</label>
+									<div class="mt-2 grid gap-2">
+										{#each Object.values(optimizationExecutionDrafts) as draft (draft.key)}
+											<div class="rounded-lg border border-[#1d1d1d] bg-[#050505] p-3">
+												<div class="grid gap-3 lg:grid-cols-[minmax(0,1.2fr)_repeat(4,minmax(0,1fr))]">
+													<label class="flex items-center gap-3 text-sm text-white">
+														<input
+															data-testid={`opt-exec-select-${draft.key}`}
+															type="checkbox"
+															class="h-4 w-4 rounded border border-[#2b2b2b] bg-black text-blue-400 focus:ring-blue-500/30"
+															checked={draft.selected}
+															on:change={(event) => setOptimizationExecutionSelected(draft.key, (event.currentTarget as HTMLInputElement).checked)}
+														/>
+														<span class="font-medium uppercase tracking-wide text-gray-200">{draft.key}</span>
+														<span class="rounded-full border border-[#243240] bg-[#09111a] px-2 py-0.5 text-[10px] uppercase tracking-[0.18em] text-blue-200">Current {optimizationParamCurrentLabel(draft.current, draft.kind)}</span>
+													</label>
+													<label class="block">
+														<div class="text-[10px] uppercase tracking-wide text-gray-500">Min</div>
+														<input
+															data-testid={`opt-exec-min-${draft.key}`}
+															type="number"
+															step={draft.kind === 'int' ? '1' : 'any'}
+															class="mt-1 w-full rounded border border-[#2b2b2b] bg-[#090909] px-2 py-1.5 text-sm text-white outline-none focus:border-white/60"
+															value={draft.min}
+															on:input={(event) => updateOptimizationExecutionField(draft.key, 'min', (event.currentTarget as HTMLInputElement).value)}
+														/>
+													</label>
+													<label class="block">
+														<div class="text-[10px] uppercase tracking-wide text-gray-500">Max</div>
+														<input
+															data-testid={`opt-exec-max-${draft.key}`}
+															type="number"
+															step={draft.kind === 'int' ? '1' : 'any'}
+															class="mt-1 w-full rounded border border-[#2b2b2b] bg-[#090909] px-2 py-1.5 text-sm text-white outline-none focus:border-white/60"
+															value={draft.max}
+															on:input={(event) => updateOptimizationExecutionField(draft.key, 'max', (event.currentTarget as HTMLInputElement).value)}
+														/>
+													</label>
+													<label class="block">
+														<div class="text-[10px] uppercase tracking-wide text-gray-500">Step</div>
+														<input
+															data-testid={`opt-exec-step-${draft.key}`}
+															type="number"
+															step={draft.kind === 'int' ? '1' : 'any'}
+															class="mt-1 w-full rounded border border-[#2b2b2b] bg-[#090909] px-2 py-1.5 text-sm text-white outline-none focus:border-white/60"
+															value={draft.step}
+															on:input={(event) => updateOptimizationExecutionField(draft.key, 'step', (event.currentTarget as HTMLInputElement).value)}
+														/>
+													</label>
+													<div class="flex items-end">
+														<div class="rounded border border-[#1d1d1d] bg-[#090909] px-3 py-2 text-[11px] text-gray-400">
+															{draft.kind === 'int' ? 'Whole-number sweep' : 'Decimal sweep'}
+														</div>
+													</div>
+												</div>
+												{#if draft.error}
+													<div data-testid={`opt-exec-error-${draft.key}`} class="mt-2 rounded border border-red-900/40 bg-red-950/20 px-2.5 py-2 text-[11px] text-red-200">
+														{draft.error}
+													</div>
+												{/if}
+											</div>
+										{/each}
+									</div>
+								{/if}
+							</div>
 						</div>
 					</div>
 
@@ -3476,15 +4372,21 @@
 							{:else}
 								<div class="mt-3 grid gap-3">
 									{#each optimizationHistory as item}
+										{@const objectiveName = String(item.config?.objective || item.metrics?.objective || '').trim()}
+										{@const bestParamChips = formatOptimizationChipRecord(getOptimizationHistoryBestParams(item), 8)}
+										{@const executionChips = formatOptimizationChipRecord(getOptimizationHistoryExecutionProfile(item), 8)}
+										{@const topResults = optimizationTopResults(item)}
 										<button
 											data-testid={`optimization-row-${item.result_id}`}
 											class={`rounded border border-[#222] bg-[#090909] px-4 py-3 text-left transition ${historyCardBorder(item.result_type)} ${selectedResultId === item.result_id ? 'border-blue-500/70 shadow-[0_0_0_1px_rgba(96,165,250,0.08),0_18px_40px_rgba(59,130,246,0.08)]' : ''}`}
 											on:click={() => void openResult(item)}
 										>
-											<div class="flex items-center gap-2 text-xs">
-												<span class="font-mono text-cyan-300">{item.result_id}</span>
+											<div class="flex flex-wrap items-center gap-2 text-xs">
+												<span class="break-all font-mono text-cyan-300">{item.result_id}</span>
 												<span class={`rounded border px-1 py-0.5 text-[10px] ${resultTypeBadge(item.result_type)}`}>{item.result_type}</span>
 												<span class={`rounded border px-1.5 py-0.5 text-[10px] ${statusBadgeClass(historyItemStatus(item))}`}>{statusLabel(historyItemStatus(item))}</span>
+												<span class="rounded border border-[#252525] bg-black px-2 py-0.5 font-mono text-[10px] text-gray-300">{optimizationRunMarketLabel(item)}</span>
+												<span class="rounded border border-[#252525] bg-black px-2 py-0.5 font-mono text-[10px] text-gray-400">{optimizationRunWindowLabel(item)}</span>
 												<span class="ml-auto text-gray-500">{fmtDate(item.created_at)}</span>
 											</div>
 											{#if historyItemError(item)}
@@ -3492,24 +4394,87 @@
 													{historyItemError(item)}
 												</div>
 											{/if}
-											<div class="mt-3 grid grid-cols-2 gap-2 text-xs sm:grid-cols-4">
-												<div class="rounded border border-[#1f1f1f] bg-black px-3 py-2">
+											<div class="mt-3 grid grid-cols-2 gap-2 text-xs md:grid-cols-3 xl:grid-cols-6">
+												<div class="border-l border-blue-900/60 bg-black/50 px-3 py-2">
+													<div class="text-[10px] uppercase tracking-[0.18em] text-gray-500">{optimizationObjectiveLabel(objectiveName)}</div>
+													<div class="mt-1 font-mono text-sm text-blue-200">{formatOptimizationObjectiveValue(item)}</div>
+												</div>
+												<div class="border-l border-[#252525] bg-black/40 px-3 py-2">
 													<div class="text-[10px] uppercase tracking-[0.18em] text-gray-500">Fitness</div>
 													<div class="mt-1 font-mono text-sm text-gray-300">{numOrDash(readMetricOptional(item, 'best_fitness', 'fitness'))}</div>
 												</div>
-												<div class="rounded border border-[#1f1f1f] bg-black px-3 py-2">
+												<div class="border-l border-[#252525] bg-black/40 px-3 py-2">
 													<div class="text-[10px] uppercase tracking-[0.18em] text-gray-500">Sharpe</div>
 													<div class={`mt-1 font-mono text-sm ${isSharpeReliable(item) ? 'text-gray-300' : 'text-gray-500'}`} title={isSharpeReliable(item) ? undefined : 'Low trade count (<20) — Sharpe may be noisy'}>{formatSharpe(item)}</div>
 												</div>
-												<div class="rounded border border-[#1f1f1f] bg-black px-3 py-2">
-													<div class="text-[10px] uppercase tracking-[0.18em] text-gray-500">OOS Return</div>
+												<div class="border-l border-[#252525] bg-black/40 px-3 py-2">
+													<div class="text-[10px] uppercase tracking-[0.18em] text-gray-500">Return</div>
 													<div class={`mt-1 font-mono text-sm ${signedPercentClass(readPercentMetricOptional(item, 'total_return_pct', 'total_return', 'pnl_pct'))}`}>{pctOrDash(readPercentMetricOptional(item, 'total_return_pct', 'total_return', 'pnl_pct'))}</div>
 												</div>
-												<div class="rounded border border-[#1f1f1f] bg-black px-3 py-2">
+												<div class="border-l border-[#252525] bg-black/40 px-3 py-2">
+													<div class="text-[10px] uppercase tracking-[0.18em] text-gray-500">WFA</div>
+													<div class={`mt-1 font-mono text-sm ${optimizationWfaClass(item)}`}>{optimizationWfaLabel(item)}</div>
+												</div>
+												<div class="border-l border-[#252525] bg-black/40 px-3 py-2">
 													<div class="text-[10px] uppercase tracking-[0.18em] text-gray-500">Trials</div>
 													<div class="mt-1 font-mono text-sm text-gray-300">{historyItemTrials(item) ?? '--'}</div>
 												</div>
 											</div>
+											<div class="mt-3 grid gap-3 border-t border-[#1a1a1a] pt-3 lg:grid-cols-2">
+												<div>
+													<div class="text-[10px] uppercase tracking-[0.18em] text-gray-500">Best Params</div>
+													{#if bestParamChips.length}
+														<div class="mt-2 flex flex-wrap gap-1.5">
+															{#each bestParamChips as chip}
+																<span class="rounded border border-blue-900/50 bg-blue-950/10 px-2 py-1 font-mono text-[10px] text-blue-100">{chip}</span>
+															{/each}
+														</div>
+													{:else}
+														<div class="mt-2 text-[11px] text-gray-600">No optimized signal parameters stored.</div>
+													{/if}
+												</div>
+												<div>
+													<div class="text-[10px] uppercase tracking-[0.18em] text-gray-500">Execution Profile</div>
+													{#if executionChips.length}
+														<div class="mt-2 flex flex-wrap gap-1.5">
+															{#each executionChips as chip}
+																<span class="rounded border border-emerald-900/50 bg-emerald-950/10 px-2 py-1 font-mono text-[10px] text-emerald-100">{chip}</span>
+															{/each}
+														</div>
+													{:else}
+														<div class="mt-2 text-[11px] text-gray-600">No execution overrides stored.</div>
+													{/if}
+												</div>
+											</div>
+											{#if topResults.length}
+												<div class="mt-3 border-t border-[#1a1a1a] pt-3">
+													<div class="mb-2 flex items-center gap-2 text-[10px] uppercase tracking-[0.18em] text-gray-500">
+														<span>Top Candidates</span>
+														<span class="font-mono text-gray-700">{topResults.length}</span>
+													</div>
+													<div class="grid gap-2 xl:grid-cols-3">
+														{#each topResults as candidate, index}
+															{@const candidateParams = optimizationTopParamChips(candidate, 4)}
+															{@const candidateExecution = optimizationTopExecutionChips(candidate, 4)}
+															<div class="border border-[#1f1f1f] bg-black/40 px-3 py-2">
+																<div class="flex items-center gap-2 text-[11px]">
+																	<span class="font-mono text-gray-500">#{index + 1}</span>
+																	<span class="font-mono text-blue-200">{optimizationTopObjectiveLabel(candidate, item)}</span>
+																	<span class="ml-auto font-mono text-gray-500">fit {optimizationTopFitnessLabel(candidate)}</span>
+																</div>
+																<div class="mt-2 flex flex-wrap gap-1">
+																	{#each candidateParams as chip}
+																		<span class="rounded border border-[#282828] px-1.5 py-0.5 font-mono text-[9px] text-gray-300">{chip}</span>
+																	{/each}
+																	{#each candidateExecution as chip}
+																		<span class="rounded border border-emerald-900/40 px-1.5 py-0.5 font-mono text-[9px] text-emerald-200">{chip}</span>
+																	{/each}
+																</div>
+															</div>
+														{/each}
+													</div>
+												</div>
+											{/if}
 										</button>
 									{/each}
 								</div>

@@ -240,6 +240,27 @@ async def lifespan(_app: FastAPI):
     # Configure logging FIRST so every subsequent startup step, the scheduler
     # loop, and the agent workers emit observable log lines under any launcher.
     _configure_runtime_logging()
+
+    # Surface missing/incompatible DECLARED dependencies at boot, under ANY
+    # launcher. The shell launchers preflight before starting, but a direct
+    # `uvicorn forven.api:app` / Docker run would otherwise only discover a
+    # lazily-imported missing dep (feedparser, trafilatura, yt-dlp, ...) deep
+    # into an operation. Best-effort + WARNING only: the app is already
+    # importing, so eager deps are fine; this catches the rest.
+    try:
+        from forven.preflight import check_dependencies
+
+        _dep_problems = check_dependencies()
+        if _dep_problems:
+            log.warning(
+                "Dependency preflight: %d declared dependency(ies) missing/incompatible "
+                "(fix with `pip install -e .`): %s",
+                len(_dep_problems),
+                "; ".join(_dep_problems),
+            )
+    except Exception:
+        log.exception("Dependency preflight check failed (continuing).")
+
     _bot_monitor_task: asyncio.Task | None = None
     _scheduler_task: asyncio.Task | None = None
     _agent_worker_task: asyncio.Task | None = None

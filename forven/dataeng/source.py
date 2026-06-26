@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -59,23 +60,52 @@ class Source(Protocol):
 
 
 class CircuitBreaker:
-    def __init__(self, failure_threshold: int = 3, recovery_successes: int = 1) -> None:
+    def __init__(
+        self,
+        failure_threshold: int = 3,
+        recovery_successes: int = 1,
+        recovery_timeout_seconds: float = 300.0,
+    ) -> None:
         self.failure_threshold = max(1, int(failure_threshold))
         self.recovery_successes = max(1, int(recovery_successes))
+        # After this long open, allow ONE half-open trial so a transient source
+        # outage self-heals instead of latching "open" until the process restarts.
+        self.recovery_timeout_seconds = max(0.0, float(recovery_timeout_seconds))
         self.consecutive_failures = 0
         self.consecutive_successes = 0
         self.status = "closed"
+        self._opened_at_monotonic: float | None = None
 
     def record_success(self) -> None:
         self.consecutive_failures = 0
         self.consecutive_successes += 1
-        if self.status in {"degraded", "open"} and self.consecutive_successes >= self.recovery_successes:
+        if self.status in {"degraded", "open", "half_open"} and self.consecutive_successes >= self.recovery_successes:
             self.status = "closed"
+            self._opened_at_monotonic = None
 
     def record_failure(self) -> None:
         self.consecutive_successes = 0
         self.consecutive_failures += 1
-        self.status = "open" if self.consecutive_failures >= self.failure_threshold else "degraded"
+        if self.consecutive_failures >= self.failure_threshold:
+            if self.status != "open":
+                self._opened_at_monotonic = time.monotonic()
+            self.status = "open"
+        else:
+            self.status = "degraded"
+
+    def allow_request(self) -> bool:
+        """Whether a request may be attempted now. A closed/degraded breaker always
+        allows. An open breaker transitions to half-open (one trial allowed) once the
+        recovery timeout has elapsed; the trial's record_success/record_failure then
+        closes or re-opens it. This is what lets the source recover without a restart."""
+        if self.status != "open":
+            return True
+        if self._opened_at_monotonic is None:
+            return True
+        if time.monotonic() - self._opened_at_monotonic >= self.recovery_timeout_seconds:
+            self.status = "half_open"
+            return True
+        return False
 
 
 class SourceRegistry:
@@ -111,7 +141,7 @@ class SourceRegistry:
             normalized = str(source_id or "").strip().lower()
             source = self._sources.get(normalized)
             breaker = self._breakers.get(normalized)
-            if source is not None and stream in source.capabilities and breaker is not None and breaker.status != "open":
+            if source is not None and stream in source.capabilities and breaker is not None and breaker.allow_request():
                 return source
         raise KeyError(f"no available source for stream: {stream.value}")
 

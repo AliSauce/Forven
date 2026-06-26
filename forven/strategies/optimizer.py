@@ -10,6 +10,7 @@ import itertools
 import json
 import logging
 import math
+import os
 import pkgutil
 import random
 import time
@@ -41,12 +42,160 @@ _NEVER_SIMULATED_RISK_AXES = frozenset(_UNSUPPORTED_BACKTEST_RISK_FIELDS)
 # Max combinations to prevent runaway searches
 MAX_GRID_COMBOS = 200
 TOP_N = 5  # Keep top N results
-GRID_SEARCH_WORKERS = 2  # Parallel backtest workers (kept low to avoid CPU saturation)
-COMBO_TIMEOUT_SECONDS = 30  # Per-combo timeout — kill stragglers
-GRID_TIMEOUT_SECONDS = 90  # Overall grid search timeout (90s — allows more strategies per cycle)
+MAX_OPTIMIZATION_TRIALS = 10_000
+
+# --- Adaptive grid execution budget ----------------------------------------
+# A non-vectorizable strategy (every custom strategy-creator type, plus built-ins
+# like atr_breakout that are NOT in backtest._VECTORIZABLE_TYPES) runs the per-bar
+# slow path at ~0.004 s/bar, so a single 365-day 1h backtest is ~35s. Vectorizable
+# built-ins are ~1000x faster. The old FIXED budget (2 workers, 90s overall, 30s
+# per combo) was tuned for the fast path and made slow-strategy optimization
+# mathematically impossible: 200 combos x 35s can never fit 90s, and a 30s combo
+# timeout < 35s killed every slow combo that DID finish. That stalled the whole
+# gauntlet (strategies could not pass `validation_optimization`, so nothing reached
+# walk-forward or paper). We now SIZE the grid to the estimated per-backtest cost so
+# both fast and slow strategies complete, comfortably inside the async polling budget
+# (the gauntlet abandons a still-'running' optimization only after
+# async_result_max_age_minutes, default 60min). No quality gate is touched: a slow
+# strategy simply gets a smaller (still real) LHS sample and must clear every
+# downstream robustness gate on its genuine metrics.
+GRID_SEARCH_WORKERS = 2  # legacy default; live worker count is adaptive (_grid_workers)
+COMBO_TIMEOUT_SECONDS = 30  # legacy default; live per-combo timeout is adaptive
+GRID_TIMEOUT_SECONDS = 90  # legacy default; live overall timeout is adaptive
+
+# Per-bar cost reflects the ISOLATED backtest (each combo runs in a spawned worker), which
+# measured ~0.009-0.011 s/bar end-to-end for the slow path — ~2x the ~0.0045 s/bar inline
+# cost — once Windows spawn + OHLCV pickle + the per-bar Python loop are all counted. Sizing
+# on the inline cost made the grid time out on its tail combos; the isolated estimate lets it
+# COMPLETE within budget.
+_SLOW_BACKTEST_SECONDS_PER_BAR = 0.0095        # measured isolated slow-path cost, padded
+_VECTORIZED_BACKTEST_SECONDS_PER_BAR = 0.0008  # vectorized path is ~10x+ faster (isolated)
+_PROCESS_SPAWN_OVERHEAD_SECONDS = 10.0         # residual per-combo spawn + candle IPC floor
+_GRID_TARGET_SECONDS = 15 * 60                 # wall-clock the grid AIMS to finish within (lets a FAST/vectorized strategy keep the full MAX_GRID_COMBOS grid; slow ones get a feasible LHS subset)
+_GRID_TIMEOUT_CEILING = 35 * 60                # never run a single grid longer than this (< 60min async budget)
+_GRID_MIN_COMBOS = 24                          # always sample at least this many — keep the search meaningful
+_GRID_MAX_WORKERS = 4                          # cap so live trading / scanners keep cores
+
+
+def _estimate_backtest_seconds(strategy_type: str | None, bars: int | None) -> float:
+    """Rough wall-clock for ONE backtest of `strategy_type` over `bars` candles.
+
+    Used only to SIZE the grid budget — never affects results. Non-vectorizable
+    strategies use the per-bar slow path and are ~10x+ slower than vectorized ones.
+    """
+    try:
+        from forven.strategies.backtest import _VECTORIZABLE_TYPES
+    except Exception:
+        _VECTORIZABLE_TYPES = frozenset()
+    n = int(bars) if bars else 8760
+    per_bar = (
+        _VECTORIZED_BACKTEST_SECONDS_PER_BAR
+        if str(strategy_type or "") in _VECTORIZABLE_TYPES
+        else _SLOW_BACKTEST_SECONDS_PER_BAR
+    )
+    return max(1.0, n * per_bar)
+
+
+def _grid_workers(n_combos: int) -> int:
+    cores = os.cpu_count() or 4
+    headroom = cores - 2 if cores > 3 else 2  # leave 2 cores for the live bot on multi-core hosts
+    return max(1, min(_GRID_MAX_WORKERS, headroom, max(1, n_combos)))
+
+
+def _grid_execution_budget(
+    strategy_type: str | None, bars: int | None, n_combos: int
+) -> tuple[int, int, float, float]:
+    """Return (workers, feasible_combos, combo_timeout_s, grid_timeout_s).
+
+    Sizes the grid so it finishes near `_GRID_TARGET_SECONDS` for the estimated
+    per-backtest cost, capped by `_GRID_TIMEOUT_CEILING` (well under the 60-min async
+    abandon budget so the optimization actually persists a result).
+    """
+    per_backtest = _estimate_backtest_seconds(strategy_type, bars)
+    per_combo = per_backtest + _PROCESS_SPAWN_OVERHEAD_SECONDS
+    workers = _grid_workers(n_combos)
+    feasible = max(_GRID_MIN_COMBOS, int(_GRID_TARGET_SECONDS * workers / per_combo))
+    feasible = min(feasible, n_combos)
+    # MUST generously exceed the full per-combo wall time (backtest + spawn + IPC), or a
+    # combo that actually finished gets reaped as a TimeoutError and counted as a loss.
+    combo_timeout = max(90.0, per_combo * 2.5)
+    grid_timeout = float(min(
+        _GRID_TIMEOUT_CEILING,
+        max(_GRID_TARGET_SECONDS, int(per_combo * feasible / max(workers, 1) * 1.5) + 60),
+    ))
+    return workers, feasible, combo_timeout, grid_timeout
 
 
 _LHS_SEED = 42  # Deterministic seed for reproducible LHS sampling
+_EXECUTION_ONLY_PARAM_AXES = frozenset({"leverage"})
+_STRICTLY_POSITIVE_EXECUTION_AXES = frozenset({
+    "initial_capital",
+    "leverage",
+    "risk_per_trade",
+    "fixed_size",
+    "atr_stop_multiplier",
+    "kelly_multiplier",
+    "kelly_lookback",
+    "stop_loss_pct",
+    "take_profit_pct",
+    "trailing_stop_pct",
+    "time_stop_bars",
+})
+
+
+def _finite_metric(metrics: dict, *keys: str, default: float = float("-inf")) -> float:
+    if not isinstance(metrics, dict):
+        return default
+    for key in keys:
+        raw = metrics.get(key)
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(value):
+            return value
+    return default
+
+
+def _normalize_objective(objective: str | None) -> str:
+    normalized = str(objective or "sharpe_ratio").strip().lower()
+    aliases = {
+        "sharpe": "sharpe_ratio",
+        "return": "total_return_pct",
+        "total_return": "total_return_pct",
+        "profit_factor_ratio": "profit_factor",
+        "win_rate_pct": "win_rate",
+        "fitness": "fitness",
+    }
+    normalized = aliases.get(normalized, normalized)
+    if normalized not in {"sharpe_ratio", "total_return_pct", "profit_factor", "win_rate", "fitness"}:
+        return "sharpe_ratio"
+    return normalized
+
+
+def _objective_value(metrics: dict, objective: str | None) -> float:
+    normalized = _normalize_objective(objective)
+    if normalized == "fitness":
+        return float(score_strategy(metrics))
+    if normalized == "sharpe_ratio":
+        return _finite_metric(metrics, "sharpe_ratio", "sharpe")
+    if normalized == "total_return_pct":
+        return _finite_metric(metrics, "total_return_pct", "total_return", "pnl_pct")
+    if normalized == "profit_factor":
+        return _finite_metric(metrics, "profit_factor", "pf")
+    if normalized == "win_rate":
+        return _finite_metric(metrics, "win_rate", "win_rate_pct")
+    return float(score_strategy(metrics))
+
+
+def _trial_budget(n_trials: int | None) -> int:
+    if n_trials is None:
+        return MAX_GRID_COMBOS
+    try:
+        budget = int(n_trials)
+    except (TypeError, ValueError):
+        return MAX_GRID_COMBOS
+    return max(1, min(budget, MAX_OPTIMIZATION_TRIALS))
 
 
 def _expand_range_dict_spec(spec: dict) -> list | None:
@@ -93,6 +242,31 @@ def _normalize_explicit_param_space(param_space: dict | None) -> dict | None:
         expanded = _expand_range_dict_spec(spec)
         normalized[name] = expanded if expanded is not None else spec
     return normalized
+
+
+def _sanitize_execution_axis_values(name: str, values: list) -> list:
+    """Drop impossible execution candidates from API/UI ranges before sampling."""
+    if name not in _STRICTLY_POSITIVE_EXECUTION_AXES and name != "fee_bps" and name != "slippage_bps":
+        return values
+
+    sanitized: list = []
+    for value in values:
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(numeric):
+            continue
+        if name in _STRICTLY_POSITIVE_EXECUTION_AXES and numeric <= 0:
+            continue
+        if name in {"fee_bps", "slippage_bps"} and numeric < 0:
+            continue
+        if name == "leverage" and numeric > 125:
+            continue
+        if name == "risk_per_trade" and numeric > 1:
+            continue
+        sanitized.append(value)
+    return sanitized
 
 
 def _lhs_sample(
@@ -150,9 +324,19 @@ def grid_search(
     strategy_type: str,
     param_space: dict,
     bars: int | None = None,
-    leverage: float = 3.0,
+    leverage: float | None = None,
     timeframe: str | None = None,
     regime_gate: bool = True,
+    execution_controls: dict | None = None,
+    base_params: dict | None = None,
+    execution_param_space: dict | None = None,
+    objective: str | None = "sharpe_ratio",
+    max_trials: int | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    fee_bps: float | None = None,
+    slippage_bps: float | None = None,
+    initial_capital: float | None = None,
 ) -> list[dict]:
     """Exhaustive grid search over parameter ranges.
 
@@ -168,13 +352,25 @@ def grid_search(
     Returns:
         Top N results sorted by fitness, each with params, metrics, fitness.
     """
-    # Generate all parameter combinations
-    param_names = list(param_space.keys())
-    param_ranges = []
+    # Generate all parameter/execution combinations. Strategy params are merged
+    # over the current persisted params for every trial; execution ranges are
+    # merged over the active execution profile for every trial.
+    param_space = param_space if isinstance(param_space, dict) else {}
+    param_space = {name: spec for name, spec in param_space.items() if name not in _EXECUTION_ONLY_PARAM_AXES}
+    execution_param_space = execution_param_space if isinstance(execution_param_space, dict) else {}
+    base_params = dict(base_params or {})
+    base_execution_controls = dict(execution_controls or {})
+    normalized_objective = _normalize_objective(objective)
 
-    for name in param_names:
+    axes: list[tuple[str, str]] = []
+    param_ranges: list[list] = []
+
+    for name in param_space:
         spec = param_space[name]
-        if isinstance(spec, (list, tuple)) and len(spec) == 3:
+        expanded = _expand_range_dict_spec(spec)
+        if expanded is not None:
+            param_ranges.append(expanded)
+        elif isinstance(spec, (list, tuple)) and len(spec) == 3:
             low, high, step = spec
             values = []
             v = low
@@ -186,6 +382,30 @@ def grid_search(
             param_ranges.append(spec)
         else:
             param_ranges.append([spec])
+        axes.append(("param", name))
+
+    for name in execution_param_space:
+        spec = execution_param_space[name]
+        expanded = _expand_range_dict_spec(spec)
+        if expanded is not None:
+            values = expanded
+        elif isinstance(spec, (list, tuple)) and len(spec) == 3:
+            low, high, step = spec
+            values = []
+            v = low
+            while v <= high:
+                values.append(v)
+                v += step
+        elif isinstance(spec, list):
+            values = spec
+        else:
+            values = [spec]
+        values = _sanitize_execution_axis_values(name, values)
+        if not values:
+            log.warning("Grid search %s: skipping invalid execution axis %s=%s", strategy_id, name, spec)
+            continue
+        param_ranges.append(values)
+        axes.append(("execution", name))
 
     combos = list(itertools.product(*param_ranges))
     if not combos:
@@ -194,14 +414,28 @@ def grid_search(
         # "max_workers must be greater than 0". No viable grid → return no results.
         log.warning("Grid search %s: no parameter combinations to evaluate (empty grid)", strategy_id)
         return []
-    if len(combos) > MAX_GRID_COMBOS:
+    # Size the grid to the estimated per-backtest cost so a slow (non-vectorizable)
+    # strategy still completes within the async budget. `feasible` caps how many
+    # combos can run in the wall-clock target; the explicit trial budget still wins
+    # when the operator asked for fewer.
+    _grid_workers_n, _grid_feasible, _grid_combo_timeout, _grid_overall_timeout = _grid_execution_budget(
+        strategy_type, bars, len(combos)
+    )
+    trial_budget = min(_trial_budget(max_trials), _grid_feasible)
+    if len(combos) > trial_budget:
         # P2-4: Latin Hypercube Sampling instead of deterministic first-N truncation.
-        combos = _lhs_sample(combos, param_ranges, MAX_GRID_COMBOS)
-        log.info("Grid search: %d total combos sampled to %d via LHS", len(list(itertools.product(*param_ranges))), len(combos))
+        _total_combos = len(combos)
+        combos = _lhs_sample(combos, param_ranges, trial_budget)
+        log.info(
+            "Grid search %s: %d total combos sampled to %d via LHS (feasible=%d, workers=%d, "
+            "combo_timeout=%.0fs, grid_timeout=%.0fs, est_per_backtest=%.1fs)",
+            strategy_id, _total_combos, len(combos), _grid_feasible, _grid_workers_n,
+            _grid_combo_timeout, _grid_overall_timeout, _estimate_backtest_seconds(strategy_type, bars),
+        )
 
     # P2-5: Parameter coverage telemetry
     coverage = {}
-    for dim, name in enumerate(param_names):
+    for dim, (_kind, name) in enumerate(axes):
         all_values = set(param_ranges[dim])
         sampled_values = {c[dim] for c in combos}
         coverage[name] = {
@@ -209,7 +443,16 @@ def grid_search(
             "sampled_values": len(sampled_values),
             "coverage_pct": round(len(sampled_values) / max(len(all_values), 1) * 100, 1),
         }
-    log.info("Grid search %s: %d combinations for %s | coverage: %s", strategy_id, len(combos), param_names, json.dumps(coverage))
+    axis_names = [name for _kind, name in axes]
+    log.info(
+        "Grid search %s: %d/%d combinations for %s objective=%s | coverage: %s",
+        strategy_id,
+        len(combos),
+        len(list(itertools.product(*param_ranges))),
+        axis_names,
+        normalized_objective,
+        json.dumps(coverage),
+    )
 
     # Pre-load candle data ONCE so all combos reuse it (huge speed gain,
     # avoids hammering the data API with N identical requests).
@@ -218,14 +461,35 @@ def grid_search(
         from forven.strategies.backtest import load_backtest_candles
         _prefetch_bars = bars if bars else 720
         _resolved_tf = timeframe or "1h"
-        shared_candles = load_backtest_candles(asset=asset, bars=_prefetch_bars, timeframe=_resolved_tf)
+        shared_candles = load_backtest_candles(
+            asset=asset,
+            bars=_prefetch_bars,
+            timeframe=_resolved_tf,
+            start_date=start_date,
+            end_date=end_date,
+        )
         log.info("Grid search pre-loaded %d candles for %s @ %s", len(shared_candles), asset, _resolved_tf)
     except Exception as exc:
         log.warning("Grid search candle pre-load failed for %s: %s — each combo will fetch independently", asset, exc)
 
     def _evaluate_combo(index_combo: tuple[int, tuple]) -> dict | None:
         i, combo = index_combo
-        params = dict(zip(param_names, combo))
+        param_overrides: dict = {}
+        execution_overrides: dict = {}
+        for (kind, name), value in zip(axes, combo):
+            if kind == "execution":
+                execution_overrides[name] = value
+            else:
+                param_overrides[name] = value
+        params = {**base_params, **param_overrides}
+        trial_execution_controls = {**base_execution_controls, **execution_overrides}
+        trial_leverage = leverage
+        if "leverage" in trial_execution_controls:
+            params["leverage"] = trial_execution_controls["leverage"]
+            try:
+                trial_leverage = float(trial_execution_controls["leverage"])
+            except (TypeError, ValueError):
+                trial_leverage = leverage
         try:
             bt = backtest_strategy(
                 strategy_id=f"{strategy_id}-opt-{i}",
@@ -233,20 +497,32 @@ def grid_search(
                 strategy_type=strategy_type,
                 params=params,
                 bars=bars,
-                leverage=leverage,
+                leverage=trial_leverage,
                 timeframe=timeframe,
+                start_date=start_date,
+                end_date=end_date,
                 candles_df=shared_candles,  # noqa: F821 (closure var; `del` below confuses ruff)
                 persist_legacy_run=False,
                 regime_gate=regime_gate,
+                fee_bps=fee_bps,
+                slippage_bps=slippage_bps,
+                initial_capital=initial_capital,
+                execution_controls=trial_execution_controls or None,
             )
             if bt.get("error"):
                 return None
             metrics = bt.get("metrics", {})
             fitness = score_strategy(metrics)
+            objective_score = _objective_value(metrics, normalized_objective)
             return {
-                "params": params,
+                "params": param_overrides,
+                "full_params": params,
+                "execution_controls": execution_overrides,
+                "full_execution_controls": trial_execution_controls,
                 "metrics": metrics,
                 "fitness": fitness,
+                "objective": normalized_objective,
+                "objective_value": objective_score,
                 "trades": metrics.get("total_trades", 0),
             }
         except Exception as e:
@@ -256,7 +532,11 @@ def grid_search(
     results = []
     timed_out = 0
     failed = 0
-    workers = max(1, min(GRID_SEARCH_WORKERS, len(combos)))
+    # Adaptive budget (sized above for this strategy's per-backtest cost), re-clamped
+    # to the FINAL combo count so a tiny grid doesn't spin up idle workers.
+    workers = max(1, min(_grid_workers_n, len(combos)))
+    combo_timeout_s = _grid_combo_timeout
+    grid_timeout_s = _grid_overall_timeout
     grid_start = time.monotonic()
     overall_timeout_message: str | None = None
 
@@ -266,26 +546,26 @@ def grid_search(
             for i, combo in enumerate(combos)
         }
         try:
-            for future in as_completed(futures, timeout=GRID_TIMEOUT_SECONDS):
+            for future in as_completed(futures, timeout=grid_timeout_s):
                 try:
-                    result = future.result(timeout=COMBO_TIMEOUT_SECONDS)
+                    result = future.result(timeout=combo_timeout_s)
                     if result is not None:
                         results.append(result)
                     else:
                         failed += 1
                 except TimeoutError:
                     timed_out += 1
-                    log.debug("Grid search combo timed out after %ds", COMBO_TIMEOUT_SECONDS)
+                    log.debug("Grid search combo timed out after %.0fs", combo_timeout_s)
                 except Exception as exc:
                     failed += 1
                     log.debug("Grid search combo error: %s", exc)
         except TimeoutError:
             pending = sum(1 for future in futures if not future.done())
             overall_timeout_message = (
-                f"Grid search timed out after {GRID_TIMEOUT_SECONDS}s "
+                f"Grid search timed out after {grid_timeout_s:.0f}s "
                 f"({len(results)} valid, {failed} failed, {pending} still running)"
             )
-            log.warning("Grid search %s: overall timeout after %ds, cancelling remaining futures", strategy_id, GRID_TIMEOUT_SECONDS)
+            log.warning("Grid search %s: overall timeout after %.0fs, cancelling remaining futures", strategy_id, grid_timeout_s)
             for f in futures:
                 f.cancel()
 
@@ -293,13 +573,14 @@ def grid_search(
     del shared_candles
     gc.collect()
 
-    # Sort by fitness descending
-    results.sort(key=lambda x: x["fitness"], reverse=True)
+    # Sort by the selected optimization objective; fitness is still retained as
+    # a secondary reported score for continuity with older runs.
+    results.sort(key=lambda x: x.get("objective_value", x["fitness"]), reverse=True)
 
     log.info(
-        "Grid search %s complete: %d/%d valid (%d timed out, %d failed), best fitness=%.1f (%.1fs)",
+        "Grid search %s complete: %d/%d valid (%d timed out, %d failed), best objective=%.4f (%.1fs)",
         strategy_id, len(results), len(combos), timed_out, failed,
-        results[0]["fitness"] if results else 0,
+        results[0].get("objective_value", results[0]["fitness"]) if results else 0,
         time.monotonic() - grid_start,
     )
 
@@ -317,7 +598,18 @@ def optimize_strategy(
     strategy_type: str | None = None,
     bars: int | None = None,
     param_space: dict | None = None,
+    base_params: dict | None = None,
     timeframe: str | None = None,
+    objective: str | None = "sharpe_ratio",
+    n_trials: int | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    execution_profile: dict | None = None,
+    execution_param_space: dict | None = None,
+    fee_bps: float | None = None,
+    slippage_bps: float | None = None,
+    initial_capital: float | None = None,
+    leverage: float | None = None,
 ) -> dict:
     """Optimize a strategy: grid search + WFA validation on best params.
 
@@ -331,13 +623,24 @@ def optimize_strategy(
         duration_days = int(settings["backtest_duration_days"])
         bars = duration_days * 24 # assume 1h for now
 
-    # Resolve strategy details if not provided
+    caller_base_params = dict(base_params) if isinstance(base_params, dict) else None
+
+    # Resolve strategy details if not provided; still preserve the strategy's
+    # stored defaults when asset/type are already supplied by the API layer.
     if not asset or not strategy_type:
-        asset, strategy_type, base_params = _resolve_strategy(strategy_id)
+        asset, strategy_type, resolved_base_params = _resolve_strategy(strategy_id)
         if not asset:
             return {"error": f"Strategy {strategy_id} not found"}
+        base_params = caller_base_params if caller_base_params is not None else resolved_base_params
     else:
-        base_params = {}
+        if caller_base_params is not None:
+            base_params = caller_base_params
+        else:
+            try:
+                _resolved_asset, _resolved_type, resolved_base_params = _resolve_strategy(strategy_id)
+                base_params = resolved_base_params
+            except Exception:
+                base_params = {}
 
     # Respect explicit tool-provided ranges before falling back to registry/defaults.
     resolved_param_space = _normalize_explicit_param_space(param_space)
@@ -373,31 +676,78 @@ def optimize_strategy(
 
     log.info("Optimizing %s (%s on %s)", strategy_id, strategy_type, asset)
 
+    # Source the strategy's execution profile so the grid + WFA judge on the real
+    # deployment sizing/stops instead of legacy full-notional. An empty/no-op
+    # profile normalizes back to the legacy path inside the engine.
+    from forven.strategies.backtest import execution_controls_from_params
+
+    _profile_params = base_params
+    if not _profile_params:
+        try:
+            _, _, _profile_params = _resolve_strategy(strategy_id)
+        except Exception:
+            _profile_params = {}
+    exec_controls = dict(execution_profile) if isinstance(execution_profile, dict) else execution_controls_from_params(_profile_params)
+    resolved_execution_param_space = _normalize_explicit_param_space(execution_param_space)
+    normalized_objective = _normalize_objective(objective)
+
     # Step 1: Grid search
     try:
         grid_results = grid_search(
             strategy_id, asset, strategy_type, resolved_param_space, bars=bars,
             timeframe=timeframe,
+            objective=normalized_objective,
+            max_trials=n_trials,
+            start_date=start_date,
+            end_date=end_date,
+            base_params=base_params,
+            execution_controls=exec_controls,
+            execution_param_space=resolved_execution_param_space,
+            fee_bps=fee_bps,
+            slippage_bps=slippage_bps,
+            initial_capital=initial_capital,
+            leverage=leverage,
         )
     except TimeoutError as exc:
-        detail = str(exc).strip() or f"Grid search timed out after {GRID_TIMEOUT_SECONDS}s"
+        detail = str(exc).strip() or "Grid search timed out"
         return {"error": detail}
 
     if not grid_results:
         return {"error": "Grid search produced no valid results"}
 
     best = grid_results[0]
-    log.info("Best grid result: fitness=%.1f, params=%s", best["fitness"], best["params"])
+    log.info(
+        "Best grid result: objective=%s value=%.4f fitness=%.1f params=%s execution=%s",
+        normalized_objective,
+        float(best.get("objective_value", best["fitness"])),
+        best["fitness"],
+        best["params"],
+        best.get("execution_controls") or {},
+    )
 
     # Step 2: WFA validation on best params (cap at 1440 bars = 60 days @ 1h)
     wfa_bars = min(bars, 1440)
+    best_full_params = best.get("full_params") if isinstance(best.get("full_params"), dict) else best["params"]
+    best_execution_controls = best.get("full_execution_controls") if isinstance(best.get("full_execution_controls"), dict) else exec_controls
+    try:
+        wfa_leverage = float(leverage if leverage is not None else best_full_params.get("leverage", 3.0))
+    except (TypeError, ValueError):
+        wfa_leverage = 3.0
     try:
         wfa_result = walk_forward(
             strategy_id=f"{strategy_id}-opt-best",
             asset=asset,
             strategy_type=strategy_type,
-            params=best["params"],
+            params=best_full_params,
             total_bars=wfa_bars,
+            timeframe=timeframe,
+            start_date=start_date,
+            end_date=end_date,
+            leverage=wfa_leverage,
+            fee_bps=fee_bps,
+            slippage_bps=slippage_bps,
+            initial_capital=float(initial_capital or 10000.0),
+            execution_controls=best_execution_controls,
         )
     except TimeoutError as exc:
         detail = str(exc).strip() or "Walk-forward validation timed out"
@@ -424,11 +774,17 @@ def optimize_strategy(
         "asset": asset,
         "strategy_type": strategy_type,
         "best_params": best["params"],
+        "best_full_params": best_full_params,
+        "best_execution_controls": best.get("execution_controls") or {},
+        "best_execution_profile": best_execution_controls,
         "best_fitness": best["fitness"],
+        "best_objective": normalized_objective,
+        "best_objective_value": best.get("objective_value", best["fitness"]),
         "best_metrics": best["metrics"],
         "wfa_verdict": wfa_result.get("verdict", "N/A"),
         "wfa_degradation": wfa_result.get("degradation", None),
         "validated": wfa_pass,
+        "n_trials": n_trials,
         "top_results": grid_results[:3],
     }
 

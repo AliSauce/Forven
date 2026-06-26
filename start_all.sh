@@ -222,6 +222,21 @@ if ! module_available "forven.api"; then
 	die "Required backend module not found: ${BACKEND_MODULE}"
 fi
 
+# Dependency completeness is driven by pyproject (the single source of truth) via
+# the preflight module, so a missing lazily-imported dep (feedparser, trafilatura,
+# yt-dlp, ...) is caught HERE at boot instead of mid-operation. Self-heal once,
+# then re-verify and fail loudly if still unsatisfied.
+info "Verifying declared Python dependencies..."
+if ! python3 -m forven.preflight; then
+	warn "Dependency preflight reported gaps; attempting 'pip install -e .'"
+	if ! python3 -m pip install -e . ; then
+		die "pip install -e . failed; resolve dependencies and retry."
+	fi
+	if ! python3 -m forven.preflight; then
+		die "Backend dependencies still unsatisfied after install (see preflight output)."
+	fi
+fi
+
 python3 -m uvicorn --app-dir "$UVICORN_APP_DIR" "$BACKEND_MODULE" --host "$BACKEND_HOST" --port "$BACKEND_PORT" --workers "$BACKEND_WORKERS" > "$BACKEND_LOG" 2>&1 &
 BACKEND_PID=$!
 PIDS+=("$BACKEND_PID")

@@ -188,9 +188,17 @@ _WALK_FORWARD_TIMEOUT = 180   # base/floor for the isolated walk-forward worker
 # even though the same strategy completes fine at 1y. But a generous flat value would let a
 # genuinely stuck strategy hang. So scale the budget with bar count — floored at the base
 # (unchanged behaviour for typical windows) and capped so a real runaway is still killed.
-_ISOLATION_TIMEOUT_PER_1K_BARS = 8   # extra seconds granted per 1,000 bars
-_BACKTEST_TIMEOUT_MAX = 300           # hard ceiling for a single backtest (5 min)
-_WALK_FORWARD_TIMEOUT_MAX = 600       # walk-forward re-runs N folds, so a larger ceiling
+# Granted per 1,000 bars. A NON-VECTORIZABLE strategy (every custom strategy-creator
+# type + built-ins not in _VECTORIZABLE_TYPES) runs the per-bar slow path at ~0.0045 s/bar
+# inline, but ~0.008-0.011 s/bar once Windows process-spawn + OHLCV pickle overhead is
+# added. The old 8 s/1k grant (cap 300s) left a 730-day/1h run (~17.5k bars) with only ~2s
+# of margin and HARD-capped larger windows below the real cost — so cost_stress,
+# confirmation_backtest and the 15m leg of timeframe_sweep timed out (or got razor-thin
+# margins) for slow strategies, silently blocking promotion. 16 s/1k @ a 600s ceiling gives
+# ~1.7-1.9x margin across windows while still killing a genuinely runaway strategy.
+_ISOLATION_TIMEOUT_PER_1K_BARS = 16  # extra seconds granted per 1,000 bars
+_BACKTEST_TIMEOUT_MAX = 600           # hard ceiling for a single backtest (10 min)
+_WALK_FORWARD_TIMEOUT_MAX = 900       # walk-forward re-runs N folds, so a larger ceiling
 
 
 def _scale_isolation_timeout(n_bars: int, base: int, ceiling: int) -> int:
@@ -362,8 +370,16 @@ def _isolated_walk_forward_worker(
     resolved_in_sample_pct: float,
     trade_mode: str = "long_only",  # default for daemon backward-compat
     include_funding: bool = True,
+    execution_controls: dict | None = None,
+    initial_capital: float = 10000.0,
 ) -> dict:
-    """Run walk-forward splits in an isolated child process."""
+    """Run walk-forward splits in an isolated child process.
+
+    ``execution_controls`` (already normalized by the caller, so it is either a
+    plain picklable dict or None) lets the walk-forward folds honor the
+    strategy's execution profile — stops/sizing — instead of legacy full-notional
+    sizing. None preserves the byte-identical legacy path.
+    """
     try:
         from forven.strategies.registry import discover
         discover()
@@ -407,6 +423,7 @@ def _isolated_walk_forward_worker(
                 strategy_obj, strategy_type=family_strategy_type,
                 fee_bps=fee_bps, slippage_bps=slippage_bps, regime_gate=regime_gate,
                 trade_mode=trade_mode,
+                execution_controls=execution_controls, initial_capital=initial_capital,
             )
             if include_funding:
                 is_trades, _ = _apply_funding_to_trades(
@@ -430,6 +447,7 @@ def _isolated_walk_forward_worker(
                     strategy_obj, strategy_type=family_strategy_type,
                     fee_bps=fee_bps, slippage_bps=slippage_bps, regime_gate=regime_gate,
                     trade_mode=trade_mode,
+                    execution_controls=execution_controls, initial_capital=initial_capital,
                 ),
                 oos_boundary,
             )
@@ -6262,15 +6280,13 @@ def _apply_funding_to_trades(
     return trades, all_complete
 
 
+from forven.strategies import sizing as _sizing
+
+
 def _clamp01(value: float) -> float:
-    """Clamp to [0, 1]; non-finite → 0."""
-    try:
-        v = float(value)
-    except (TypeError, ValueError):
-        return 0.0
-    if not np.isfinite(v):
-        return 0.0
-    return max(0.0, min(1.0, v))
+    """Clamp to [0, 1]; non-finite → 0. Delegates to the shared sizing module so
+    the backtest and the live/paper scanner share ONE implementation."""
+    return _sizing.clamp01(value)
 
 
 def _compute_atr_series(df: "pd.DataFrame", period: int = 14) -> "pd.Series":
@@ -6288,26 +6304,42 @@ def _compute_atr_series(df: "pd.DataFrame", period: int = 14) -> "pd.Series":
 
 
 def _kelly_fraction(closed_gross: list[float], lookback: int) -> float:
-    """Kelly f* = W − (1−W)/R from recent closed gross returns (pre-sizing).
+    """Kelly f* from recent closed gross returns. Delegates to shared sizing."""
+    return _sizing.kelly_fraction(closed_gross, lookback)
 
-    Returns 0 until there is at least one win and one loss in the window, so the
-    first trades size to zero rather than betting on no evidence.
+
+# The execution-control fields the engine actually simulates (the "honored"
+# profile). Mirrors api_core._collect_honored_backtest_execution_controls but
+# lives here so the optimizer/gauntlet/acceptance paths can source a strategy's
+# profile without importing the heavy api_core module.
+HONORED_EXECUTION_CONTROL_FIELDS = _sizing.HONORED_EXECUTION_CONTROL_FIELDS
+
+
+def execution_controls_from_params(params: dict | None) -> dict:
+    """Extract a strategy's execution profile from its persisted ``params`` blob.
+
+    The ONLY source is the explicit nested ``params['execution_profile']`` dict
+    that the Gauntlet Parameters pane writes. There is deliberately NO fallback to
+    honored field names at the TOP LEVEL of ``params``: many pre-existing
+    strategies carry inert ``stop_loss_pct`` / ``take_profit_pct`` /
+    ``risk_per_trade`` etc. in their params (the engine ignores them there — that
+    is precisely why ``optimizer._NEVER_SIMULATED_RISK_AXES`` exists — and those
+    values use inconsistent units, e.g. ``3.0`` percent-points vs ``0.025``
+    fractions). Activating them would silently evaluate a *different* strategy and
+    re-baseline it. A strategy with no explicit ``execution_profile`` therefore
+    returns ``{}`` -> normalized to ``None`` -> the byte-identical legacy path.
     """
-    if not closed_gross:
-        return 0.0
-    window = closed_gross[-max(int(lookback), 1):]
-    wins = [r for r in window if r > 0]
-    losses = [-r for r in window if r < 0]
-    n = len(window)
-    if n == 0 or not wins or not losses:
-        return 0.0
-    win_rate = len(wins) / n
-    avg_win = sum(wins) / len(wins)
-    avg_loss = sum(losses) / len(losses)
-    if avg_loss <= 0:
-        return 0.0
-    payoff = avg_win / avg_loss
-    return max(0.0, win_rate - (1.0 - win_rate) / payoff)
+    if not isinstance(params, dict):
+        return {}
+    source = params.get("execution_profile")
+    if not isinstance(source, dict):
+        return {}
+    out: dict = {}
+    for field in HONORED_EXECUTION_CONTROL_FIELDS:
+        value = source.get(field)
+        if value is not None:
+            out[field] = value
+    return out
 
 
 def _normalize_execution_controls(controls: dict | None) -> dict | None:
@@ -6316,66 +6348,7 @@ def _normalize_execution_controls(controls: dict | None) -> dict | None:
     A None return guarantees the simulator runs its byte-identical legacy path,
     so the autonomous/paper pipeline (which never passes these) is unaffected.
     """
-    if not isinstance(controls, dict):
-        return None
-
-    def _opt_pos(key: str) -> float | None:
-        raw = controls.get(key)
-        try:
-            v = float(raw)
-        except (TypeError, ValueError):
-            return None
-        return v if (np.isfinite(v) and v > 0) else None
-
-    sizing_mode = str(controls.get("sizing_mode") or "").strip().lower()
-    if sizing_mode in ("", "none", "full"):
-        sizing_mode = "full"
-    if sizing_mode not in ("full", "fixed", "fraction", "atr", "kelly"):
-        sizing_mode = "full"
-
-    stop_loss_pct = _opt_pos("stop_loss_pct")
-    take_profit_pct = _opt_pos("take_profit_pct")
-    trailing_stop_pct = _opt_pos("trailing_stop_pct")
-    raw_time_stop = controls.get("time_stop_bars")
-    try:
-        time_stop_bars = int(raw_time_stop) if raw_time_stop is not None else None
-    except (TypeError, ValueError):
-        time_stop_bars = None
-    if time_stop_bars is not None and time_stop_bars <= 0:
-        time_stop_bars = None
-
-    risk_per_trade = _opt_pos("risk_per_trade") or 0.02
-    fixed_size = _opt_pos("fixed_size")
-    atr_stop_multiplier = _opt_pos("atr_stop_multiplier") or 2.0
-    kelly_multiplier = _opt_pos("kelly_multiplier") or 0.5
-    try:
-        kelly_lookback = int(controls.get("kelly_lookback") or 100)
-    except (TypeError, ValueError):
-        kelly_lookback = 100
-    kelly_lookback = max(kelly_lookback, 1)
-
-    has_stop = (
-        any(x is not None for x in (stop_loss_pct, take_profit_pct, trailing_stop_pct, time_stop_bars))
-        or sizing_mode == "atr"
-    )
-    has_sizing = sizing_mode != "full"
-    if not has_stop and not has_sizing:
-        return None  # nothing active → legacy behaviour
-
-    return {
-        "sizing_mode": sizing_mode,
-        "stop_loss_pct": stop_loss_pct,
-        "take_profit_pct": take_profit_pct,
-        "trailing_stop_pct": trailing_stop_pct,
-        "time_stop_bars": time_stop_bars,
-        "risk_per_trade": float(risk_per_trade),
-        "fixed_size": fixed_size,
-        "atr_stop_multiplier": float(atr_stop_multiplier),
-        "kelly_multiplier": float(kelly_multiplier),
-        "kelly_lookback": kelly_lookback,
-        "needs_atr": sizing_mode == "atr",
-        "atr_period": 14,
-    }
+    return _sizing.normalize_execution_controls(controls)
 
 
 def _run_directional_signal_series(
@@ -6525,31 +6498,18 @@ def _run_directional_signal_series_with_controls(
     lev = max(float(leverage), 1e-9)
 
     def _entry_stop_dist_pct(entry_idx: int, entry_price: float) -> float | None:
-        if ec["sizing_mode"] == "atr" and atr_vals is not None:
-            atr = float(atr_vals[entry_idx])
-            if entry_price > 0 and atr > 0:
-                return (ec["atr_stop_multiplier"] * atr) / entry_price
-            return None
-        if ec["stop_loss_pct"] is not None:
-            return ec["stop_loss_pct"] / 100.0
-        if ec["trailing_stop_pct"] is not None:
-            return ec["trailing_stop_pct"] / 100.0
-        return None
+        atr_value = (
+            float(atr_vals[entry_idx])
+            if (ec["sizing_mode"] == "atr" and atr_vals is not None)
+            else None
+        )
+        return _sizing.entry_stop_dist_pct(ec, entry_price=entry_price, atr_value=atr_value)
 
     def _size_fraction(stop_dist_pct: float | None) -> float:
-        mode = ec["sizing_mode"]
-        if mode == "full":
-            return 1.0
-        if mode == "fixed":
-            if not ec["fixed_size"]:
-                return 1.0
-            return _clamp01(ec["fixed_size"] / max(float(initial_capital), 1e-9))
-        if mode == "kelly":
-            return _clamp01(ec["kelly_multiplier"] * _kelly_fraction(closed_gross, ec["kelly_lookback"]))
-        # fraction / atr → risk-based: lose ~risk_per_trade of equity at the stop.
-        if stop_dist_pct and stop_dist_pct > 0:
-            return _clamp01(ec["risk_per_trade"] / (stop_dist_pct * lev))
-        return _clamp01(ec["risk_per_trade"])
+        return _sizing.size_fraction(
+            ec, stop_dist_pct, leverage=lev,
+            initial_capital=initial_capital, closed_gross=closed_gross,
+        )
 
     def _finalize(at: dict, direction: str, exit_price: float, exit_idx: int,
                   exit_time: str, exit_reason: str, *, open_at_end: bool = False) -> None:
@@ -7661,7 +7621,16 @@ def backtest_strategy(
     if candles_df is not None and not candles_df.empty:
 
 
-        df = candles_df.tail(resolved_bars) if len(candles_df) > resolved_bars else candles_df
+        df = candles_df
+        if start_date or end_date:
+            df = _filter_backtest_frame_to_window(
+                df,
+                start_date=start_date,
+                end_date=end_date,
+                warmup_bars=210,
+            )
+        elif len(df) > resolved_bars:
+            df = df.tail(resolved_bars)
 
 
     else:
@@ -9437,11 +9406,15 @@ def walk_forward(
 
     end_date: str | None = None,
 
+    timeframe: str | None = None,
+
 
     trade_mode: TradeMode | None = None,
 
 
     allow_shorting: bool | None = None,
+    execution_controls: dict | None = None,
+    initial_capital: float = 10000.0,
 
 
 ) -> dict:
@@ -9605,7 +9578,7 @@ def walk_forward(
     if trade_mode_error:
         return {"error": trade_mode_error}
 
-    resolved_timeframe = str(params.get("timeframe") or settings.get("backtest_timeframe") or "1h").strip() or "1h"
+    resolved_timeframe = str(timeframe or params.get("timeframe") or settings.get("backtest_timeframe") or "1h").strip() or "1h"
 
 
 
@@ -9674,6 +9647,9 @@ def walk_forward(
     )
 
     resolved_include_funding = bool(settings.get("backtest_include_funding", True))
+    # Normalize the execution profile ONCE; None preserves the byte-identical
+    # legacy full-notional path, so strategies without a profile never re-baseline.
+    normalized_ec = _normalize_execution_controls(execution_controls)
 
     # P25-1: Log resolved WFA config for auditability
     log.info(
@@ -9854,6 +9830,8 @@ def walk_forward(
                 resolved_in_sample_pct,
                 resolved_trade_mode,
                 resolved_include_funding,
+                normalized_ec,
+                float(initial_capital),
             )
             try:
                 worker_result = future.result(timeout=walk_forward_timeout)
@@ -9888,6 +9866,8 @@ def walk_forward(
             resolved_in_sample_pct,
             resolved_trade_mode,
             resolved_include_funding,
+            normalized_ec,
+            float(initial_capital),
         )
 
     if "error" in worker_result:
@@ -10376,6 +10356,20 @@ def _run_signal_walk(checker, df, params: dict, warmup: int, leverage: float,
 
 
 
+
+    # The deterministic slow path below does NOT apply execution controls — it
+    # computes full-notional PnL with no stops/sizing. If an active profile was
+    # supplied, surface it loudly so a non-vectorizable strategy's result is not
+    # mistaken for a profile-honoring run (the vectorized/fast paths above DO honor
+    # it). Sourcing only fires for an explicit params['execution_profile'], so this
+    # only affects an operator-set profile on a slow-path strategy.
+    if _normalize_execution_controls(execution_controls) is not None:
+        log.warning(
+            "Execution profile NOT applied for %s: this non-vectorizable strategy runs the "
+            "deterministic slow path (full-notional, no stops). Its backtest/WFA results ignore "
+            "the configured execution profile.",
+            strategy_type or "strategy",
+        )
 
     # Limit the window passed to generate_signal to avoid O(n²) behaviour.
     # Strategies only need recent bars for indicators; passing the full

@@ -705,6 +705,11 @@ def _execute_gauntlet_step(
                         "status": "succeeded",
                         "best_params": opt_result.get("best_params", {}),
                         "best_fitness": opt_result.get("best_fitness"),
+                        # Persist the optimizer's own WFA outcome so the downstream
+                        # acceptance gate can read the precheck fields (it later runs
+                        # a fresh held-out bake-off as the decisive check).
+                        "validated": opt_result.get("validated"),
+                        "wfa_verdict": opt_result.get("wfa_verdict"),
                     },
                     created_at=datetime.now(timezone.utc).isoformat(),
                 )
@@ -769,20 +774,56 @@ def _execute_gauntlet_step(
             )
             return {"action": "apply_best_params", "detail": "strategy is operator-owned (paper/live); apply_best_params skipped"}
 
-        with get_db() as conn:
-            conn.execute(
-                "UPDATE strategies SET params = ?, updated_at = ? WHERE id = ?",
-                (json.dumps(best_params), datetime.now(timezone.utc).isoformat(), strategy_id),
+        # Acceptance gate (the single chokepoint): only replace the live params if
+        # the candidate beats the current baseline out-of-sample. status/validated/
+        # wfa_verdict may live in either persisted payload, so merge both.
+        optimization_metrics = {
+            **(metrics_payload if isinstance(metrics_payload, dict) else {}),
+            **(config_payload if isinstance(config_payload, dict) else {}),
+        }
+
+        from forven.strategies.optimization_acceptance import apply_optimized_params_if_accepted
+
+        def _write_best_params(decision):
+            with get_db() as conn:
+                conn.execute(
+                    "UPDATE strategies SET params = ?, updated_at = ? WHERE id = ?",
+                    (json.dumps(best_params), datetime.now(timezone.utc).isoformat(), strategy_id),
+                )
+            append_strategy_event(
+                strategy_id=strategy_id,
+                from_state=from_state,
+                to_state=from_state,
+                actor="system",
+                reason="Applied optimized params (passed out-of-sample acceptance gate)",
+                details={"params": best_params, "motion": "params_applied", "acceptance": decision.as_record()},
             )
+
+        outcome = apply_optimized_params_if_accepted(
+            strategy_id=strategy_id,
+            asset=symbol,
+            strategy_type=strategy_type,
+            current_params=params if isinstance(params, dict) else {},
+            candidate_params=best_params,
+            write_fn=_write_best_params,
+            optimization_metrics=optimization_metrics,
+            from_state=from_state,
+            eval_timeframe=timeframe,
+        )
+        if outcome.get("applied"):
+            return {"action": "apply_best_params", "detail": "Applied best params from optimization", "acceptance": outcome.get("decision")}
+
+        # "Baseline retained" is a SUCCESS, not a failure: the strategy keeps its
+        # current (more robust) params because the candidate did not beat them OOS.
         append_strategy_event(
             strategy_id=strategy_id,
             from_state=from_state,
             to_state=from_state,
             actor="system",
-            reason="Applied optimized params from latest optimization run",
-            details={"params": best_params, "motion": "params_applied"},
+            reason=f"Optimization rejected; baseline retained ({outcome.get('reason')})",
+            details={"motion": "optimization_rejected", "acceptance": outcome.get("decision")},
         )
-        return {"action": "apply_best_params", "detail": "Applied best params from optimization"}
+        return {"action": "apply_best_params", "detail": f"Baseline retained: {outcome.get('reason')}", "baseline_retained": True}
 
     # ── Step 4: Confirmation Backtest ────────────────────────────────
     if action == "run_confirmation_backtest":

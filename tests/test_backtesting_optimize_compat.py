@@ -13,7 +13,7 @@ from forven.backtesting import BacktestingClient
 from forven.db import get_db
 from forven.routers import strategies as strategies_router
 from forven.routers import verdict as verdict_router
-from forven.strategies.optimizer import _get_param_space, optimize_strategy
+from forven.strategies.optimizer import _get_param_space, grid_search, optimize_strategy
 
 
 def _insert_strategy(strategy_id: str, *, symbol: str = "BTC", timeframe: str = "1h") -> None:
@@ -499,7 +499,7 @@ def test_backtesting_client_sends_forven_api_and_operator_keys(monkeypatch):
 def test_optimize_strategy_uses_explicit_parameter_ranges(monkeypatch):
     captured: dict[str, object] = {}
 
-    def _fake_grid_search(strategy_id, asset, strategy_type, param_space, bars=None, leverage=3.0, timeframe=None):
+    def _fake_grid_search(strategy_id, asset, strategy_type, param_space, **kwargs):
         captured["param_space"] = param_space
         return [
             {
@@ -534,7 +534,7 @@ def test_optimize_strategy_uses_explicit_parameter_ranges(monkeypatch):
 def test_optimize_strategy_normalizes_frontend_parameter_range_dicts(monkeypatch):
     captured: dict[str, object] = {}
 
-    def _fake_grid_search(strategy_id, asset, strategy_type, param_space, bars=None, leverage=3.0, timeframe=None):
+    def _fake_grid_search(strategy_id, asset, strategy_type, param_space, **kwargs):
         captured["param_space"] = param_space
         return [
             {
@@ -564,6 +564,133 @@ def test_optimize_strategy_normalizes_frontend_parameter_range_dicts(monkeypatch
     assert captured["param_space"] == {"rsi_length": [5, 8, 11, 14]}
     assert result["best_params"] == {"rsi_length": 8}
     assert result["validated"] is True
+
+
+def test_optimize_strategy_honors_execution_ranges_objective_window_and_base_params(monkeypatch):
+    captured: dict[str, object] = {}
+
+    def _fake_grid_search(strategy_id, asset, strategy_type, param_space, **kwargs):
+        captured["grid"] = {
+            "strategy_id": strategy_id,
+            "asset": asset,
+            "strategy_type": strategy_type,
+            "param_space": param_space,
+            **kwargs,
+        }
+        return [
+            {
+                "params": {"rsi_length": 8},
+                "full_params": {"rsi_length": 8, "threshold": 20, "leverage": 4},
+                "execution_controls": {"stop_loss_pct": 3.0},
+                "full_execution_controls": {
+                    "sizing_mode": "fraction",
+                    "risk_per_trade": 0.02,
+                    "stop_loss_pct": 3.0,
+                },
+                "metrics": {"total_trades": 12, "sharpe": 1.1, "total_return_pct": 9.5},
+                "fitness": 55.0,
+                "objective": "total_return_pct",
+                "objective_value": 9.5,
+                "trades": 12,
+            }
+        ]
+
+    def _fake_walk_forward(**kwargs):
+        captured["wfa"] = kwargs
+        return {"verdict": "PASS", "degradation": 0.1}
+
+    monkeypatch.setattr("forven.strategies.optimizer.grid_search", _fake_grid_search)
+    monkeypatch.setattr("forven.strategies.optimizer.walk_forward", _fake_walk_forward)
+    monkeypatch.setattr("forven.api_core.get_settings", lambda: {"backtest_duration_days": 365})
+    monkeypatch.setattr("forven.vectordb.store_backtest_result", lambda **_kwargs: None)
+
+    result = optimize_strategy(
+        strategy_id="S-execution-real",
+        asset="BTC",
+        strategy_type="rsi_momentum",
+        bars=240,
+        timeframe="4h",
+        param_space={"rsi_length": [8, 14]},
+        base_params={"rsi_length": 14, "threshold": 20, "leverage": 2},
+        objective="total_return_pct",
+        n_trials=7,
+        start_date="2025-01-01T00:00:00Z",
+        end_date="2025-06-01T00:00:00Z",
+        execution_profile={"sizing_mode": "fraction", "risk_per_trade": 0.02},
+        execution_param_space={"stop_loss_pct": {"min": 2.0, "max": 3.0, "step": 1.0}},
+        fee_bps=8.0,
+        slippage_bps=4.0,
+        initial_capital=25_000.0,
+    )
+
+    grid = captured["grid"]
+    assert grid["param_space"] == {"rsi_length": [8, 14]}
+    assert grid["base_params"] == {"rsi_length": 14, "threshold": 20, "leverage": 2}
+    assert grid["execution_controls"] == {"sizing_mode": "fraction", "risk_per_trade": 0.02}
+    assert grid["execution_param_space"] == {"stop_loss_pct": [2.0, 3.0]}
+    assert grid["objective"] == "total_return_pct"
+    assert grid["max_trials"] == 7
+    assert grid["timeframe"] == "4h"
+    assert grid["start_date"] == "2025-01-01T00:00:00Z"
+    assert grid["end_date"] == "2025-06-01T00:00:00Z"
+    assert grid["fee_bps"] == 8.0
+    assert grid["slippage_bps"] == 4.0
+    assert grid["initial_capital"] == 25_000.0
+
+    wfa = captured["wfa"]
+    assert wfa["params"] == {"rsi_length": 8, "threshold": 20, "leverage": 4}
+    assert wfa["execution_controls"] == {
+        "sizing_mode": "fraction",
+        "risk_per_trade": 0.02,
+        "stop_loss_pct": 3.0,
+    }
+    assert wfa["timeframe"] == "4h"
+    assert wfa["start_date"] == "2025-01-01T00:00:00Z"
+    assert wfa["end_date"] == "2025-06-01T00:00:00Z"
+    assert wfa["leverage"] == 4.0
+
+    assert result["best_params"] == {"rsi_length": 8}
+    assert result["best_full_params"] == {"rsi_length": 8, "threshold": 20, "leverage": 4}
+    assert result["best_execution_controls"] == {"stop_loss_pct": 3.0}
+    assert result["best_execution_profile"]["stop_loss_pct"] == 3.0
+    assert result["best_objective"] == "total_return_pct"
+    assert result["best_objective_value"] == 9.5
+    assert result["validated"] is True
+
+
+def test_grid_search_sanitizes_legacy_leverage_axes(monkeypatch):
+    captured_leverage: list[float | None] = []
+
+    def _fake_backtest_strategy(**kwargs):
+        captured_leverage.append(kwargs.get("leverage"))
+        return {
+            "metrics": {
+                "total_trades": 10,
+                "sharpe": 1.0,
+                "total_return_pct": 5.0,
+                "win_rate": 50.0,
+                "profit_factor": 1.2,
+            }
+        }
+
+    monkeypatch.setattr("forven.strategies.optimizer.backtest_strategy", _fake_backtest_strategy)
+
+    results = grid_search(
+        "S-legacy-leverage-axis",
+        "BTC",
+        "rsi_momentum",
+        {"leverage": [0, 1], "rsi_length": [14]},
+        bars=240,
+        base_params={"leverage": 0, "rsi_length": 14},
+        execution_controls={"leverage": 1},
+        execution_param_space={"leverage": {"min": 0, "max": 2, "step": 1}},
+        max_trials=10,
+    )
+
+    assert results
+    assert set(captured_leverage) == {1.0, 2.0}
+    assert all(result["params"] == {"rsi_length": 14} for result in results)
+    assert all(result["execution_controls"]["leverage"] in {1, 2} for result in results)
 
 
 def _isolate_param_space_lookups(monkeypatch, *, registry_obj=None):
@@ -635,7 +762,7 @@ def test_optimize_strategy_explicit_risk_axes_survive(monkeypatch):
     # deliberate request — it must reach grid_search and best_params untouched.
     captured: dict[str, object] = {}
 
-    def _fake_grid_search(strategy_id, asset, strategy_type, param_space, bars=None, leverage=3.0, timeframe=None):
+    def _fake_grid_search(strategy_id, asset, strategy_type, param_space, **kwargs):
         captured["param_space"] = param_space
         return [
             {
