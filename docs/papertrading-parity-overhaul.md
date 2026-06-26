@@ -1,0 +1,101 @@
+# Paper-Trading ↔ Backtest Parity Overhaul
+
+**Branch:** `feat/papertrading-realworld-parity`
+**Started:** 2026-06-26
+**Objective:** Make paper trading a *perfect real-world replica* of backtest results so strategy decisions are trustworthy. Same signals, entries, exits, sizing (kelly/atr/fixed/…), stops/TP/trailing/time-stops, fees, slippage, and PnL — plus a chart with indicators, full-history trigger points (even before the strategy went live), all trades as markers, and active stop/TP lines.
+
+## Root finding (verified by two deep code-survey workflows)
+
+Paper (`forven/scanner.py`) is a **parallel reimplementation** of the backtest (`forven/strategies/backtest.py`); they agree almost nowhere. Verified divergences:
+
+- **Promotion is unreal.** Every gauntlet gating step backtests strategies **full-notional, no stops, ungated**, on a hand-maintained `_vectorized_signals` copy. `post_backtest_submit` reads sizing/stops only from the request body, never from `params['execution_profile']`, and **no backend code ever persists an execution_profile**. So promoted strategies were scored on something you'd never trade.
+- **Signal drift:** 10 of 16 builtin types differ between the backtest's vectorized copy and the class `generate_signal` paper runs. Severe: `ichimoku` (backtest = 0 trades), `supertrend` (different algorithm), `williams_r` (inverted ADX). Causes: always-on volume filter in the backtest copy + ADX min/max canonicalization mismatches.
+- **Entry:** backtest fills next-bar open; paper fills signal-bar close.
+- **Exits:** backtest is intrabar vs high/low, fills at the level, supports trailing + time-stop; paper triggers on a closing-price percent breach, fills at close, no trailing/time-stop, and reads stops from a different param location than sizing (so profile-only stops are invisible to it).
+- **Costs:** backtest nets fees+slippage; paper stores gross and sizes off a gross, fee-blind equity.
+- **Data:** backtest reads **Binance spot**; paper + chart read **HyperLiquid perps**.
+- **Chart:** all four requirements fail — indicators are a third reimplementation (simple-MA, guessed periods); no full-history triggers for arbitrary strategies; trade markers limited to last 500 bars; active SL/TP lines never drawn.
+
+## Locked decisions (user, 2026-06-26)
+
+1. **Scope = unify all + re-score now.** One realistic engine for backtest, gauntlet, and paper; re-baseline every promoted strategy (some demoted).
+2. **Price source = HyperLiquid perps** (the live venue). Backtest moves onto the traded series; ingest HL history; remove the silent Binance fallback.
+3. **Entry fill = next bar's open** (signal on closed bar i → fill at open of i+1), both engines.
+4. **Costs = net** of fees + slippage; sizing-equity is net too; use the venue fee schedule.
+
+## Target architecture — one shared execution kernel
+
+New module `forven/strategies/execution_kernel.py`: a deterministic engine that, given an ordered OHLCV frame + a strategy + a normalized execution profile, produces trades, an equity curve, and markers (filled + unfilled triggers). It owns: signal (single source = `strategy.generate_signals`), next-bar-open entry, sizing (`sizing.py`), intrabar stop/TP/trailing/time-stop exits with the fill conventions, net fee+slippage drag, and one PnL/equity convention (net, leverage-consistent, sizing off running net equity → naturally compounds and matches a compounded backtest).
+
+- **Backtest** runs the kernel over the full history (replaces `_run_directional_signal_series`, `_run_directional_signal_series_with_controls`, `_run_vectorized_backtest`, and the slow per-bar path with this one kernel).
+- **Scanner (paper/live)** advances the *same* kernel one closed bar at a time, persisting position/trailing/bars_held/equity state between calls.
+- **Acceptance = a replay parity test:** for a representative strategy set, the backtest over a fixed window and a bar-by-bar scanner replay over the same bars must produce trade-for-trade identical results (entry/exit time, price, size, pnl within epsilon). This test *is* the definition of done.
+
+## Phases
+
+### Phase 0 — Foundations & safety net
+- [x] **Parity harness** (`tests/test_execution_parity.py`): proves the kernel's replay-safety — batch backtest == bar-by-bar incremental replay, trade-for-trade, across all sizing modes (fraction/atr/kelly/fixed/legacy) and all exit types (stop/tp/trailing/time-stop/signal/end-of-data), long/short/both. 28 tests green. This locks the "scanner drives the same kernel" approach. Phase 2 extends it to a real scanner replay.
+- [ ] **One canonical indicator module**: Wilder ATR/ADX/RSI (+EMA/Bollinger/MACD/etc.) in `forven/strategies/indicators.py`; everything (signal gen, sizing stop-distance, chart) imports it. Kill the 3–4 duplicate ATR/ADX/RSI impls.
+- [ ] **One candle-access function** used by backtest + scanner + chart: HyperLiquid perps, consistent `clean_ohlcv`, consistent closed-bar trim, UTC open-time grid. Ingest HL perp history into the lake; point `load_backtest_candles` at it; remove the silent Binance→HL fallback and the 1h-only daemon-cache asymmetry.
+
+### Phase 1 — Single signal source  ✅ (core complete)
+- [x] All 13 class-backed vectorizable types now own one vectorized `generate_signals`, with `generate_signal` delegating to it. The backtest's `_resolve_strategy_vectorized_signals` prefers `generate_signals`, so the drifted `_vectorized_signals` ladder is now dead for these — both engines run the same signal. Ported: rsi_momentum, bollinger (the *registered* `BollingerS00120Strategy`), keltner, macd, stochastic, supertrend, williams_r, orb, ichimoku, funding (ema_cross/donchian/parabolic_sar were already single-source).
+- [x] New correct parity test `tests/test_signal_source_parity.py`: per-bar == vectorized at many bars *with prefix-stability* + non-vacuity, across all 13. 14 green. Replaces the old test's flawed compare-against-`_vectorized_signals`.
+- [x] Bugs fixed en route: **supertrend** class was non-functional (basic-band cross that can't fire) → restored real trend-flip SuperTrend; **registry `_f_supertrend`** had NaN-propagation pinning direction at -1 (broke the chart indicator too) → NaN-safe band seeding; ichimoku 0-trades bug fixed.
+- [x] Regression: 902 passed / 2 skipped / 0 new failures (full suite, 3m36s).
+- [ ] Follow-ups (deferred): delete dead `_vectorized_signals` + `_run_vectorized_backtest` and rewrite the old `test_strategy_signal_parity.py` that pins them; resolve the 3 *classless* vectorizable types (vwap, bollinger_reversion, funding_direction) — confirm no active strategy uses them, else they still diverge; resolve the duplicate `TYPE_NAME="bollinger"` classes.
+- **Re-score note:** `supertrend` and `bollinger` strategies will behave materially differently under canonical logic than what they were promoted on — flag in Phase 3 demotions.
+
+### Phase 2 — Shared execution kernel  ✅ (vectorized strategies)
+- [x] Extracted `forven/strategies/execution_kernel.py` — `simulate(df, signals, …, ec)` returns closed trades + still-open positions (no force-close), owning entry (next-bar open), sizing, intrabar stop/TP/trailing/time-stop, net drag, one PnL convention. Backtest force-closes open positions at the final bar for its accounting.
+- [x] Backtest dispatcher (`_run_directional_signal_series`) now routes **everything** through the kernel. Proven **byte-identical** to the old controls kernel for profiled strategies (`test_kernel_extraction_is_byte_identical`, 24 combos).
+- [x] **Decision #1 applied:** no actionable profile (None/{}/`full`) → default 1% fraction sizing via the kernel (matching the scanner), not legacy full-notional. Updated the 2 tests that pinned the old behavior. Full backtest/strategy/gauntlet suite green (892 + the unrelated pre-existing verdict failure).
+- [x] **Shared pipeline `run_strategy_execution`** (in `backtest.py`): the ONE `generate_signals → regime-mask → kernel` path. Proven to reproduce the backtest walk exactly (`test_shared_execution_pipeline.py`: rsi_momentum/ema_cross/supertrend × regime-gate on/off). The backtest walk now *calls* it (byte-identical refactor; 101 targeted tests green). Returns a `KernelResult` (closed + open) without force-closing, so the scanner can use the identical function and leave the position live.
+- [x] **Reconciler (pure logic) `forven/strategies/paper_reconcile.py`:** `reconcile(KernelResult, recorded) → actions` (open / close / backfill / refresh), matched by `(direction, entry_time)`; closes/backfills before opens; robust to missed scan cycles (backfill).
+- [x] **End-to-end parity PROVEN (`test_paper_reconcile_parity.py`, 6 green):** a bar-by-bar scanner replay (kernel + reconciler applied to an in-memory trade store) reproduces the backtest trade-for-trade — rsi_momentum/ema_cross/supertrend × every-bar AND sparse (missed-cycle) replay. The scanner DB layer just applies the actions.
+- [x] **Scanner DB wiring DONE:** `scanner.manage_positions_via_kernel` = fetch history (HL, `paper_kernel_history_bars` default 1500) → `run_strategy_execution` → `reconcile` → apply via existing persistence (`_open_trade_db`/`register`/`_update_trade_fill`/`close_trade_record`), storing the kernel's **net** pnl (override of `close_trade_record`'s gross) and sizing units from the kernel `size_fraction`. Wired into `_apply_execution_actions` behind `paper_kernel_execution` (default **on**), PAPER-stage only, with legacy fallback when a strategy has no vectorized signals. Config matches the promotion backtest (leverage, fee/slippage, `regime_gate=False`, trade_mode, initial_capital).
+- [x] **Verified:** `test_scanner_kernel_paper_integration.py` drives the path bar-by-bar against a real temp DB and asserts persisted paper trades == backtest (entry/exit/net-pnl/size/reason). 79 scanner+parity tests green, no regressions.
+- [ ] Follow-ups: per-bar (non-vectorized custom) strategies still use the legacy path (need a generate_signal→signals adapter so the kernel covers them too — also fixes the backtest slow-path full-notional bug); kelly uses the 1500-bar window (long but finite) — exact kelly parity needs the full backtest history; **data source**: paper kernel runs on HL perps (the live venue, correct per decision #2) while the backtest still reads Binance — the backtest must move to HL for true parity (Phase 3 / data unification).
+- [ ] Legacy cleanup: remove the now-dead full-notional loop in `_run_directional_signal_series` and the `_vectorized_signals`/`_run_vectorized_backtest` paths.
+
+**Parity nuances uncovered (must address in the live-loop wiring / Phase 3):**
+- *Kelly evidence window:* the scanner currently loads only 300 bars. Non-kelly sizing (fraction/atr/fixed) is window-independent → parity holds with adequate warmup. **Kelly** sizing depends on the full prior-trade `closed_gross` series, so kelly strategies need the scanner to run the kernel over the same long history the backtest uses (load a generous window, not 300).
+- *Regime gate:* the promotion **confirmation backtest runs `regime_gate=False`** (verified), while `walk_forward` forces `True` and paper forces `relaxed_trade_filters=True` (ungated). For paper to match the promotion baseline, the scanner's kernel call should use `regime_gate=False`; Phase 3 makes gating consistent end-to-end.
+- *Entry timing in live:* the scanner runs at bar close; the kernel models the entry at the just-closed bar's *open* (next-bar-open after the signal bar) — a known past price. Correct for a paper *replica*; the live path (Phase 5) fills at real-time price.
+
+### Phase 3 — Promotion/gauntlet unification + re-score  ✅ (per user decisions)
+**User decisions:** backtest STAYS on Binance (deep, industry-standard data) — HL's candle history is too shallow for deep gauntlets (1h≈208d vs 730d window); re-score is PAPER-stage only, CONFIRMATION-only.
+- [x] **Profile threading:** one chokepoint edit in `run_strategy_execution` — when no explicit controls, derive `execution_controls_from_params(params)` (else default 1%). The gauntlet/backtest now size & stop EXACTLY like paper. Proven (`test_shared_execution_pipeline::test_profile_is_threaded_from_params...`). Near-no-op on today's population (only ~3/4347 carry a profile) but correct + future-proof.
+- [x] **Engine parity already live in the gauntlet:** because the gauntlet runs through the shared kernel (Phase 2), every new backtest already sizes (profile/1%) + nets fees+slippage + runs unified signals. So most of Phase 3's intent was already achieved; the persisted metrics are just stale.
+- [x] **Regime-gate consistency:** paper (`manage_positions_via_kernel`, `regime_gate=False`) already matches the promotion confirmation backtest (also `regime_gate=False`). (walk_forward's internal `True` is a robustness-leg detail, noted.)
+- [x] **Re-score tool** `scripts/rescore_paper_strategies.py`: re-runs each paper strategy's confirmation backtest under the new engine, reports old→new metrics + a viability flag (DEAD/UNPROFITABLE/THIN). Read-only by default; `--apply` refreshes stored metrics (paper-only, stage untouched); demotion left to the UI (which closes positions). Tested (`test_rescore_paper_strategies.py`). **Operator action: run it, review, demote losers via the UI.**
+- [ ] Recommended (operator toggle, not auto-enabled): turn on `source_reconciliation` so the HL(paper)-vs-Binance(backtest) price divergence is flagged — the safety net for the accepted venue mismatch (major perps track within bps; >2% gets flagged).
+- Data swap to HL: **dropped** per decision. Backtest=Binance, paper=HL; tracked closely + reconciliation flags drift.
+
+### Phase 4 — Chart overhaul  ✅
+- [x] **Backend bundle** `GET /api/paper/sessions/{id}/chart` → `paper.get_paper_session_chart`: ONE call returning bars (HL, widened to 2000) + REAL registry indicators (replaces the simple-MA/guessed reimplementation via `_chart_indicator_specs` → `indicators.compute_indicator`) + **full-history triggers** (`generate_signals` over the whole frame, incl. pre-live) + **actual trade markers** (recorded paper trades) + **active stop/take-profit/trailing** levels from the open position. Tested (`test_paper_chart_bundle.py`, 4 green).
+- [x] **Frontend renderer** `ChartWorkspace.svelte`: new `triggerMarkers` prop (dim circles, distinct from solid trade arrows) + new `priceLines` prop → `createPriceLine` for active SL/TP/trailing (separate `positionLinesMap`, survives `setData`).
+- [x] **Trading page** `PaperTrades.svelte`: single `loadChartBundle` (replaces the 500-bar `getReplayBars` + `getSessionIndicators` + `getTradeMarkers`) → real indicators, triggers, all trades (2000-bar window, no edge-collapse), SL/TP/trail lines. `paper.ts` `getPaperSessionChart` + types; barrel re-exports. `svelte-check`: 0 errors.
+- Indicator coverage: rule_engine (declared specs) + the main builtins (rsi_momentum, ema_cross, bollinger, keltner, macd, supertrend, stochastic, donchian, parabolic_sar, williams_r, ichimoku, funding, vwap). Others render bars+triggers+trades with no overlay (a warning, NOT a guessed reimpl).
+
+### Phase 5 — Live consistency & cleanup  ✅
+- [x] **PnL double-count bug fixed** (`trade_state.close_trade_record` + `trading._calculate_closed_trade_pnl`): `size` (units) already embeds leverage, so `pnl_usd = price_move * units` — the old `* leverage` was a leverage² double-count that overstated dollar PnL and the promotion-gate metrics. Regression tests added; 3 tests that pinned the buggy value corrected.
+- [x] **Live decision parity (gated, default OFF)** — `live_kernel_execution` flag + `manage_positions_via_kernel(execution_type="live")`: live takes the SAME kernel decisions (signals/stops/trailing/time-stop) as paper/backtest, but fills at REAL Hyperliquid prices via the existing `_execute_direct` path (all safety gates + real avgPx). Opt-in, testnet-first. Routing/gating/can_open/pending-reconcile tested (`test_kernel_live_parity.py`).
+- [x] **Manual-SL gap fixed** — a manual absolute SL/TP on a kernel-managed strategy is now enforced (`_kernel_handle_manual_exits`); `manual_pause` still detaches. Tested.
+- [x] **Manual opens through the sizing mirror** — `open_manual_position` sizes via `sizing.position_units` (same fraction math as the auto/kernel path).
+- [x] **Dead SIM engine decommissioned** — deleted `forven/simulation.py`, `forven/routers/simulation.py`, the simulation router from `api.py`, and the gating test. Boot import verified. Kept `sim/clock.py` (the live time source), `sim/data_pump.py` + `sim/mock_exchange.py` (harmless dead code behind the never-true `is_sim_active()` guard — deferred to an isolated diff per plan).
+- [x] PnL convention: per user, the historical equity-fraction unification + backfill is **deferred** (kernel-managed paper/live already use the correct convention; the double-count bug — the real issue — is fixed). 62 focused tests green.
+- [ ] Follow-ups (noted, not blocking): per-bar custom-strategy `generate_signal→signals` adapter (so the kernel covers them in backtest+paper, also fixing the slow-path full-notional backtest); resolve the 3 classless vectorizable types (vwap/bollinger_reversion/funding_direction) then delete `_vectorized_signals`/`_run_vectorized_backtest`; remove the `mock_exchange` dead guards; kelly evidence series (read pre-size gross); live manual-SL enforcement when live_kernel is on.
+
+## Gate for every phase
+The parity harness + the existing test suite must stay green. No phase is "done" until its slice of the parity matrix reads MATCH.
+
+## Status log
+- 2026-06-26: Two survey workflows complete; decisions locked; branch + plan created. Beginning Phase 0.
+- 2026-06-26: Phase 0 done — kernel replay-safety parity harness green (28 tests), canonical indicator library confirmed.
+- 2026-06-26: Phase 1 core done — single signal source across 13 vectorizable types; supertrend + registry supertrend bugs fixed; 902/902 (+2 skip) regression-clean. Next: Phase 2 (extract kernel stepper, wire scanner to it).
+- 2026-06-26: Phase 2 engine + parity logic done — execution_kernel.simulate (byte-identical), shared run_strategy_execution (backtest now uses it), no-profile→1% unified, pure reconciler, and the **end-to-end backtest==scanner-replay proof** (6 green) + a 999-pass regression.
+- 2026-06-26: Phase 2 SCANNER WIRING DONE — `manage_positions_via_kernel` wired into the scan loop (gated `paper_kernel_execution`, default on, paper-stage, legacy fallback). DB integration test proves persisted paper trades == backtest. **A restart now runs the shared engine for paper-stage vectorized strategies.**
+- 2026-06-26: Phase 3 DONE (backtest stays on Binance per user; profile threading; re-score tool) and Phase 4 (CHART) DONE — bundle endpoint + ChartWorkspace triggerMarkers/priceLines + PaperTrades bundle loader; real indicators, full-history triggers, all trades, active SL/TP/trail.
+- 2026-06-26: Chart trigger BUG fixed (was a per-bar signal-state band; now sparse kernel events, pre-live only) + trade-label declutter.
+- 2026-06-26: Phase 5 DONE — PnL leverage double-count bug fixed; gated live decision parity (live_kernel_execution, default OFF, real fills via _execute_direct); manual-SL gap fixed; manual opens via sizing mirror; dead SIM engine removed (boot verified). **ALL 5 PHASES COMPLETE.** Remaining = noted non-blocking follow-ups + operator actions (run the re-score tool; verify the chart live; commit; enable live_kernel_execution on testnet when ready).
