@@ -166,6 +166,28 @@
 		'trailing_stop_pct',
 		'time_stop_bars',
 	]);
+	// The sizing parameter(s) each mode needs, with their default seed values. When an
+	// operator switches Sizing Mode, applySizingModeDefaults() fills any of these that are
+	// still blank so a freshly-selected mode is immediately valid/runnable instead of
+	// surfacing a "must be greater than 0" error on an empty required field. Values mirror
+	// the engine defaults in forven/strategies/backtest.py _resolve_execution_controls
+	// (risk_per_trade 0.02, atr_stop_multiplier 2.0, kelly_multiplier 0.5, kelly_lookback
+	// 100). Fixed notional has no engine default — an empty value sizes at full equity — so
+	// it seeds from the configured Initial Capital (a 1x notional reference) at apply time,
+	// falling back to this constant.
+	type SizingNumericField = 'risk_per_trade' | 'fixed_size' | 'atr_stop_multiplier' | 'kelly_multiplier' | 'kelly_lookback';
+	const SIZING_MODE_FIELD_DEFAULTS: Record<SizingMode, Partial<Record<SizingNumericField, string>>> = {
+		full: {},
+		fraction: { risk_per_trade: '0.02' },
+		fixed: { fixed_size: '10000' },
+		atr: { risk_per_trade: '0.02', atr_stop_multiplier: '2' },
+		kelly: { kelly_multiplier: '0.5', kelly_lookback: '100' },
+	};
+	// Fraction risk sizing needs a stop distance (the engine sizes by risk_per_trade / stop),
+	// and validateExecutionDraft rejects the mode without a stop loss or trailing stop. Seed
+	// this default stop loss when Fraction is selected and neither is set, so it's runnable
+	// in one click. ATR risk derives its stop from atr_stop_multiplier, so it needs no seed.
+	const FRACTION_DEFAULT_STOP_LOSS_PCT = '2';
 
 	let strategyId = '';
 	let returnTo = '/lab';
@@ -962,7 +984,7 @@
 			leverage: DEFAULT_EXECUTION_LEVERAGE,
 			sizing_mode: 'full',
 			risk_per_trade: '0.02',
-			fixed_size: '',
+			fixed_size: '10000',
 			atr_stop_multiplier: '2',
 			kelly_multiplier: '0.5',
 			kelly_lookback: '100',
@@ -971,6 +993,34 @@
 			trailing_stop_pct: '',
 			time_stop_bars: '',
 		};
+	}
+
+	// Seed the newly-selected sizing mode's parameters with sensible defaults, but only
+	// where the operator hasn't already supplied (or loaded from a run) a value — so
+	// switching modes never clobbers an explicit entry. Fixed notional prefers the current
+	// Initial Capital (a 1x notional reference) over the static fallback.
+	function applySizingModeDefaults(mode: SizingMode): void {
+		const defaults = SIZING_MODE_FIELD_DEFAULTS[mode];
+		const next: ExecutionProfileDraft = { ...executionDraft };
+		let changed = false;
+		for (const [key, fallback] of Object.entries(defaults) as [SizingNumericField, string][]) {
+			if (String(next[key] ?? '').trim()) continue;
+			if (key === 'fixed_size') {
+				const capital = optionalNumber(next.initial_capital);
+				next.fixed_size = capital !== undefined && capital > 0 ? String(capital) : fallback;
+			} else {
+				next[key] = fallback;
+			}
+			changed = true;
+		}
+		// Make Fraction risk runnable in one click: seed a stop loss only when the operator
+		// has set neither a stop loss nor a trailing stop, so an existing trailing stop is
+		// never overridden.
+		if (mode === 'fraction' && !next.stop_loss_pct.trim() && !next.trailing_stop_pct.trim()) {
+			next.stop_loss_pct = FRACTION_DEFAULT_STOP_LOSS_PCT;
+			changed = true;
+		}
+		if (changed) executionDraft = next;
 	}
 
 	function buildExecutionDraftFromRecord(record: Record<string, unknown>, base: ExecutionProfileDraft): ExecutionProfileDraft {
@@ -3782,7 +3832,7 @@
 							</label>
 							<label class="block text-[10px] uppercase tracking-wide text-gray-500">
 								Sizing Mode
-								<select bind:value={executionDraft.sizing_mode} class="mt-1 w-full rounded border border-[#2b2b2b] bg-black px-3 py-2 text-xs text-white outline-none focus:border-cyan-700">
+								<select bind:value={executionDraft.sizing_mode} on:change={() => applySizingModeDefaults(executionDraft.sizing_mode)} class="mt-1 w-full rounded border border-[#2b2b2b] bg-black px-3 py-2 text-xs text-white outline-none focus:border-cyan-700">
 									<option value="full">Full equity</option>
 									<option value="fraction">Fraction risk</option>
 									<option value="fixed">Fixed notional</option>

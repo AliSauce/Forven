@@ -32,6 +32,7 @@ from forven.exchange.risk import (
     release,
     sync_from_trades,
 )
+from forven.strategies import sizing as _sizing
 from forven.market_cache import (
     load_price_snapshot,
     load_candle_snapshot,
@@ -560,6 +561,69 @@ def _get_account_equity() -> float:
     return _ACCOUNT_FALLBACK
 
 
+_PAPER_SANDBOX_INITIAL_CAPITAL = 10_000.0
+
+
+def _get_paper_strategy_equity(strategy_id: str) -> float:
+    """Current paper-sandbox equity for a strategy: the $10k starting capital plus
+    its realized closed-trade PnL. Mirrors the "Capital" figure on the paper card
+    (``api_domains/paper.py``: initial_capital + total_pnl). Each paper strategy is
+    an ISOLATED sandbox, so its position must be sized as a % of THIS balance — not
+    the shared live/daemon equity (``_get_account_equity``), which is what produced
+    the piddly mis-sized paper positions.
+    """
+    sid = str(strategy_id or "").strip()
+    if not sid:
+        return _PAPER_SANDBOX_INITIAL_CAPITAL
+    try:
+        with get_db() as conn:
+            row = conn.execute(
+                """
+                SELECT COALESCE(SUM(pnl_usd), 0.0) AS realized
+                FROM trades
+                WHERE COALESCE(NULLIF(strategy_id, ''), strategy) = ?
+                  AND status = 'CLOSED'
+                  AND LOWER(COALESCE(execution_type, '')) IN ('paper', 'paper_challenger', 'simulation')
+                """,
+                (sid,),
+            ).fetchone()
+        realized = float((dict(row).get("realized") if row else 0.0) or 0.0)
+    except Exception:
+        realized = 0.0
+    equity = _PAPER_SANDBOX_INITIAL_CAPITAL + realized
+    return equity if equity > 0 else _PAPER_SANDBOX_INITIAL_CAPITAL
+
+
+def _recent_strategy_returns(strategy_id: str, lookback: int = 200) -> list[float]:
+    """Recent closed-trade fractional returns for a strategy (oldest→newest), a
+    best-effort proxy for the backtest's pre-size gross returns. Used ONLY for
+    kelly sizing; empty history → kelly sizes to zero (matches the backtest's
+    no-evidence behaviour)."""
+    sid = str(strategy_id or "").strip()
+    if not sid:
+        return []
+    try:
+        with get_db() as conn:
+            rows = conn.execute(
+                """
+                SELECT pnl_pct FROM trades
+                WHERE COALESCE(NULLIF(strategy_id, ''), strategy) = ?
+                  AND status = 'CLOSED' AND pnl_pct IS NOT NULL
+                ORDER BY COALESCE(NULLIF(closed_at, ''), created_at) ASC
+                LIMIT ?
+                """,
+                (sid, int(max(lookback, 1))),
+            ).fetchall()
+        out: list[float] = []
+        for r in rows:
+            val = dict(r).get("pnl_pct")
+            if val is not None:
+                out.append(float(val))
+        return out
+    except Exception:
+        return []
+
+
 def _load_live_price_cache() -> tuple[dict[str, float], float | None]:
     """Fetch live prices directly from exchange API, fall back to daemon cache."""
     from forven.sim.clock import is_sim_active
@@ -883,6 +947,12 @@ def _guard_open_trade_execution_intent(
         raise ValueError(f"trading blocked for trade {trade_id}: {reason}")
 
     signal_data = parse_trade_signal_data(trade.get("signal_data"))
+    # The scanner sizes paper/live by mirroring the backtest's execution profile
+    # and stamps the result here. When present, this guard trusts that
+    # authoritative size and skips the risk-budget caps (exact-parity sizing),
+    # keeping only the safety gates and a tamper check.
+    _sizing_meta = signal_data.get("sizing") if isinstance(signal_data.get("sizing"), dict) else {}
+    _mirror_sized = bool(_sizing_meta.get("mirror_sized"))
     resolved_stop_loss = (
         _coerce_positive_float(stop_loss)
         or _coerce_positive_float(signal_data.get("stop_loss"))
@@ -916,7 +986,7 @@ def _guard_open_trade_execution_intent(
     except Exception:
         limits = {}
     max_risk_per_trade = _coerce_positive_float(limits.get("max_risk_per_trade"))
-    if max_risk_per_trade is not None and requested_risk_pct > max_risk_per_trade + 1e-9:
+    if not _mirror_sized and max_risk_per_trade is not None and requested_risk_pct > max_risk_per_trade + 1e-9:
         raise ValueError(
             f"trade {trade_id} risk {requested_risk_pct:.2%} exceeds current per-trade limit {max_risk_per_trade:.2%}"
         )
@@ -954,28 +1024,40 @@ def _guard_open_trade_execution_intent(
     if resolved_stop_loss is None:
         raise ValueError(f"trade execution requires a protective stop for trade {trade_id}")
 
-    atr_14 = _coerce_positive_float(signal_data.get("atr_14"))
-    if atr_14 is None:
-        atr_14 = _coerce_positive_float(signal_data.get("atr"))
-    account_equity = _get_account_equity()
-    max_size, sizing_meta = calculate_position_size(
-        asset=asset,
-        direction=direction,
-        entry_price=float(reference_price),
-        stop_loss_price=resolved_stop_loss,
-        account_equity=float(account_equity),
-        risk_pct=float(requested_risk_pct),
-        leverage=float(leverage or 1.0),
-        atr_14=atr_14,
-    )
-    if max_size <= 0:
-        raise ValueError(f"trade {trade_id} failed safe-sizing validation: {sizing_meta}")
-
-    size_tolerance = max(1e-6, max_size * 0.001)
-    if float(size) > max_size + size_tolerance:
-        raise ValueError(
-            f"trade {trade_id} requested size {float(size):.6f} exceeds safe max {float(max_size):.6f}"
+    account_equity = _coerce_positive_float(_sizing_meta.get("portfolio_equity")) or _get_account_equity()
+    if _mirror_sized:
+        # Backtest-mirror size is authoritative: don't re-clamp to a risk-budget
+        # max. Guard only against tampering — the executed size must match the
+        # units the scanner planned and stamped.
+        planned = _coerce_positive_float(_sizing_meta.get("units"))
+        if planned is not None:
+            tol = max(1e-6, planned * 0.01)
+            if abs(float(size) - planned) > tol:
+                raise ValueError(
+                    f"trade {trade_id} size {float(size):.6f} != planned {planned:.6f} (mirror-sized)"
+                )
+    else:
+        atr_14 = _coerce_positive_float(signal_data.get("atr_14"))
+        if atr_14 is None:
+            atr_14 = _coerce_positive_float(signal_data.get("atr"))
+        max_size, sizing_meta = calculate_position_size(
+            asset=asset,
+            direction=direction,
+            entry_price=float(reference_price),
+            stop_loss_price=resolved_stop_loss,
+            account_equity=float(account_equity),
+            risk_pct=float(requested_risk_pct),
+            leverage=float(leverage or 1.0),
+            atr_14=atr_14,
         )
+        if max_size <= 0:
+            raise ValueError(f"trade {trade_id} failed safe-sizing validation: {sizing_meta}")
+
+        size_tolerance = max(1e-6, max_size * 0.001)
+        if float(size) > max_size + size_tolerance:
+            raise ValueError(
+                f"trade {trade_id} requested size {float(size):.6f} exceeds safe max {float(max_size):.6f}"
+            )
 
     risk_plan = _build_entry_risk_plan(
         direction=direction,
@@ -4100,7 +4182,13 @@ def manage_positions(
         # long book's net position. Paper/simulation are local sandboxes and
         # are never routed (open_book stays None -> stored book NULL).
         open_book = None
-        sizing_equity = account_equity
+        # Size off the strategy's OWN portfolio: paper/sim → its isolated sandbox
+        # balance ($10k + realized PnL); live → the (book/wallet) account equity.
+        # The live book override below may further refine the live value.
+        if execution_type in ("paper", "paper_challenger", "simulation"):
+            sizing_equity = _get_paper_strategy_equity(strat_id)
+        else:
+            sizing_equity = account_equity
         live_books_on = False
         if execution_type == "live":
             from forven.exchange import books
@@ -4180,6 +4268,10 @@ def manage_positions(
             alloc_risk = min(max(float(risk_pct or 0.01), 0.0005), 0.02)
             reason = "paper test mode bypass"
         else:
+            # Gates only (kill-switch / daily-loss / margin / one-per-asset /
+            # cooldown), NOT a size cap: the position is sized authoritatively by
+            # mirroring the backtest's execution profile below, so the per-trade
+            # and portfolio-budget caps must not clamp it (exact-parity sizing).
             allowed, alloc_risk, reason = can_open(
                 asset=strat["asset"],
                 direction=direction,
@@ -4187,6 +4279,7 @@ def manage_positions(
                 risk_pct=risk_pct,
                 execution_type=execution_type,
                 book=open_book,
+                enforce_risk_caps=False,
             )
         if not allowed:
             log.info("[%s] BLOCKED by portfolio risk: %s", strat_id, reason)
@@ -4286,19 +4379,66 @@ def manage_positions(
             # The strategy's stop_loss (if set) determines the risk distance.
             # If no strategy stop, use ATR-based sizing for the position.
             strat_timeframe = str(strat.get("timeframe") or p.get("timeframe") or "1h").strip().lower() or "1h"
+            # ── Sizing: MIRROR the backtest ──────────────────────────────────
+            # Read the strategy's execution profile (the SAME one the backtest
+            # sizes from) and size identically via the shared sizing module, off
+            # the strategy's PORTFOLIO equity (sizing_equity — paper sandbox
+            # capital / live wallet, resolved above). When the strategy carries no
+            # profile, default to 1% risk of the portfolio. This is what makes
+            # paper/live execution match the backtest and ends the piddly,
+            # mis-sized positions.
             strategy_risk_pct = float(p.get("risk_pct", alloc_risk))
-            size, sizing_meta = calculate_position_size(
-                asset=strat["asset"],
-                direction=direction,
-                entry_price=price,
-                stop_loss_price=stop_loss,
-                account_equity=sizing_equity,
-                risk_pct=strategy_risk_pct,
-                leverage=float(p.get("leverage", 1.0)),
-                atr_14=atr_14,
-                fee_bps=risk_fee_bps,
-                slippage_bps=risk_slippage_bps,
+            _controls = _sizing.normalize_execution_controls(_sizing.extract_execution_profile(p))
+            if _controls is None:
+                _controls = _sizing.default_controls()
+            _profile_initial_capital = (
+                _coerce_positive_float((p.get("execution_profile") or {}).get("initial_capital"))
+                or _PAPER_SANDBOX_INITIAL_CAPITAL
             )
+            _leverage = float(p.get("leverage", 1.0) or 1.0)
+            # Stop distance (fraction of price): profile stop → derived signal stop
+            # → ATR×1.5 → 3% floor, mirroring the backtest's stop-distance basis.
+            _stop_dist_pct = _sizing.entry_stop_dist_pct(_controls, entry_price=float(price), atr_value=atr_14)
+            if _stop_dist_pct is None:
+                if stop_loss is not None and price:
+                    _stop_dist_pct = abs(float(price) - float(stop_loss)) / float(price)
+                elif atr_14 and price:
+                    _stop_dist_pct = (float(atr_14) * 1.5) / float(price)
+                else:
+                    _stop_dist_pct = 0.03
+            _closed_gross = (
+                _recent_strategy_returns(strat_id) if _controls.get("sizing_mode") == "kelly" else None
+            )
+            _size_fraction = _sizing.size_fraction(
+                _controls, _stop_dist_pct, leverage=_leverage,
+                initial_capital=_profile_initial_capital, closed_gross=_closed_gross,
+            )
+            size = round(
+                _sizing.position_units(
+                    equity=float(sizing_equity), size_fraction=_size_fraction,
+                    leverage=_leverage, entry_price=float(price),
+                ),
+                6,
+            )
+            # Effective per-trade risk recorded for the position/risk widgets:
+            # risk_per_trade for the risk-based modes, else the deployed fraction.
+            if _controls.get("sizing_mode") in ("fraction", "atr"):
+                alloc_risk = float(_controls.get("risk_per_trade") or strategy_risk_pct)
+            else:
+                alloc_risk = min(float(_size_fraction), 1.0)
+            sizing_meta = {
+                "method": _controls.get("sizing_mode"),
+                "sizing_mode": _controls.get("sizing_mode"),
+                "source": "default_1pct" if _controls.get("is_default") else "execution_profile",
+                "mirror_sized": True,
+                "size_fraction": round(float(_size_fraction), 8),
+                "units": size,
+                "portfolio_equity": round(float(sizing_equity), 4),
+                "leverage": _leverage,
+                "stop_distance_pct": round(float(_stop_dist_pct), 8),
+                "stop_distance": round(float(_stop_dist_pct) * float(price), 8),
+                "risk_budget_usd": round(float(sizing_equity) * float(alloc_risk), 4),
+            }
 
             # Min-notional preflight (Approach C / live): Hyperliquid rejects
             # orders under ~$10 notional. Dividing capital across books/strategies

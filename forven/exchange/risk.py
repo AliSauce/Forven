@@ -493,10 +493,17 @@ def can_open(
     *,
     execution_type: str | None = None,
     book: str | None = None,
+    enforce_risk_caps: bool = True,
 ) -> tuple[bool, float, str]:
     """Check if a new position can be opened.
 
     Returns: (allowed, allocated_risk_pct, reason)
+
+    enforce_risk_caps: when False, the per-trade risk cap (Rule 0b) and the
+    portfolio-budget clamp/block (Rule 3) are skipped — for callers that size a
+    position authoritatively (mirroring the backtest's execution profile) and
+    want the safety GATES (kill-switch, daily-loss, margin, one-per-asset,
+    cooldown) without a size cap. Defaults True to preserve all legacy behavior.
 
     execution_type selects the scope for the concurrency / one-per-asset /
     portfolio-budget checks:
@@ -529,8 +536,9 @@ def can_open(
         if not allowed:
             return False, 0.0, reason
 
-        # Rule 0b: Per-trade risk cap
-        if risk_pct > max_risk_per_trade:
+        # Rule 0b: Per-trade risk cap (skipped when the caller sizes
+        # authoritatively, e.g. mirroring the backtest — enforce_risk_caps=False).
+        if enforce_risk_caps and risk_pct > max_risk_per_trade:
             return False, 0.0, f"Risk {risk_pct:.1%} exceeds per-trade max {max_risk_per_trade:.1%}. Needs Judder's approval."
 
         # Rule 0c: Actual exchange margin limit check.
@@ -681,7 +689,7 @@ def can_open(
         else:
             new_net = current_net - risk_pct
 
-        if abs(new_net) > portfolio_budget:
+        if enforce_risk_caps and abs(new_net) > portfolio_budget:
             remaining = portfolio_budget - abs(current_net)
             if remaining <= 0.001:
                 return False, 0.0, (

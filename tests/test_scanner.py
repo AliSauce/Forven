@@ -710,11 +710,7 @@ def test_manage_positions_opens_short_and_derives_short_stop_above_entry(monkeyp
 
     monkeypatch.setattr(scanner_mod, "_get_open_trades", lambda _sid: [])
     monkeypatch.setattr(scanner_mod, "can_open", lambda **_kwargs: (True, 0.01, "ok"))
-    monkeypatch.setattr(
-        scanner_mod,
-        "calculate_position_size",
-        lambda **_kwargs: (0.75, {"method": "atr", "stop_distance": 5.0}),
-    )
+    monkeypatch.setattr(scanner_mod, "_get_paper_strategy_equity", lambda _sid: 10_000.0)
     monkeypatch.setattr(
         scanner_mod,
         "_build_entry_risk_plan",
@@ -779,8 +775,12 @@ def test_manage_positions_opens_short_and_derives_short_stop_above_entry(monkeyp
     )
 
     assert opened["direction"] == "short"
-    assert opened["signal_data"]["stop_loss"] == 105.0
-    assert opened["signal_data"]["risk_plan"]["stop_loss_price"] == 105.0
+    # No strategy stop and no ATR → mirror sizing falls back to a 3% stop distance,
+    # so the short's protective stop sits 3% above entry (this matches prior
+    # *production* behaviour; the old 5% assertion came from a monkeypatched
+    # calculate_position_size that no longer drives sizing).
+    assert opened["signal_data"]["stop_loss"] == 103.0
+    assert opened["signal_data"]["risk_plan"]["stop_loss_price"] == 103.0
     assert [fill["fill_kind"] for fill in fills] == ["entry"]
     assert fills[0]["fill_price"] == 100.0
     assert fills[0]["trade_id"] == "E-SHORT-1"
@@ -961,11 +961,8 @@ def test_manage_positions_uses_dynamic_position_sizing(monkeypatch):
 
     monkeypatch.setattr(scanner_mod, "_get_open_trades", lambda _sid: [])
     monkeypatch.setattr(scanner_mod, "can_open", lambda **_kwargs: (True, 0.01, "ok"))
-    monkeypatch.setattr(
-        scanner_mod,
-        "calculate_position_size",
-        lambda **_kwargs: (1.234567, {"method": "atr", "stop_distance": 2.5}),
-    )
+    # Paper sizing now mirrors the backtest off the strategy's sandbox equity.
+    monkeypatch.setattr(scanner_mod, "_get_paper_strategy_equity", lambda _sid: 10_000.0)
     monkeypatch.setattr(
         scanner_mod,
         "_open_trade_db",
@@ -1016,8 +1013,13 @@ def test_manage_positions_uses_dynamic_position_sizing(monkeypatch):
         account_equity=10_000.0,
     )
 
-    assert opened["size"] == 1.234567
-    assert opened["signal_data"]["sizing"]["method"] == "atr"
+    # Mirror sizing: no execution profile → default 1% risk of the $10k paper
+    # sandbox over the 2% stop, at 2x leverage → size_fraction 0.01/(0.02*2)=0.25
+    # → 2.5 ETH (loss-at-stop = 2.5 * 40 = $100 = 1% of equity).
+    assert opened["size"] == 2.5
+    assert opened["signal_data"]["sizing"]["mirror_sized"] is True
+    assert opened["signal_data"]["sizing"]["sizing_mode"] == "fraction"
+    assert opened["signal_data"]["sizing"]["source"] == "default_1pct"
     assert opened["signal_data"]["risk_plan"]["stop_loss_price"] == 1960.0
     assert opened["signal_data"]["risk_plan"]["take_profit_price"] == 2080.0
     assert opened["signal_data"]["risk_plan"]["rr_ratio"] == 2.0

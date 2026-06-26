@@ -6280,15 +6280,13 @@ def _apply_funding_to_trades(
     return trades, all_complete
 
 
+from forven.strategies import sizing as _sizing
+
+
 def _clamp01(value: float) -> float:
-    """Clamp to [0, 1]; non-finite → 0."""
-    try:
-        v = float(value)
-    except (TypeError, ValueError):
-        return 0.0
-    if not np.isfinite(v):
-        return 0.0
-    return max(0.0, min(1.0, v))
+    """Clamp to [0, 1]; non-finite → 0. Delegates to the shared sizing module so
+    the backtest and the live/paper scanner share ONE implementation."""
+    return _sizing.clamp01(value)
 
 
 def _compute_atr_series(df: "pd.DataFrame", period: int = 14) -> "pd.Series":
@@ -6306,44 +6304,15 @@ def _compute_atr_series(df: "pd.DataFrame", period: int = 14) -> "pd.Series":
 
 
 def _kelly_fraction(closed_gross: list[float], lookback: int) -> float:
-    """Kelly f* = W − (1−W)/R from recent closed gross returns (pre-sizing).
-
-    Returns 0 until there is at least one win and one loss in the window, so the
-    first trades size to zero rather than betting on no evidence.
-    """
-    if not closed_gross:
-        return 0.0
-    window = closed_gross[-max(int(lookback), 1):]
-    wins = [r for r in window if r > 0]
-    losses = [-r for r in window if r < 0]
-    n = len(window)
-    if n == 0 or not wins or not losses:
-        return 0.0
-    win_rate = len(wins) / n
-    avg_win = sum(wins) / len(wins)
-    avg_loss = sum(losses) / len(losses)
-    if avg_loss <= 0:
-        return 0.0
-    payoff = avg_win / avg_loss
-    return max(0.0, win_rate - (1.0 - win_rate) / payoff)
+    """Kelly f* from recent closed gross returns. Delegates to shared sizing."""
+    return _sizing.kelly_fraction(closed_gross, lookback)
 
 
 # The execution-control fields the engine actually simulates (the "honored"
 # profile). Mirrors api_core._collect_honored_backtest_execution_controls but
 # lives here so the optimizer/gauntlet/acceptance paths can source a strategy's
 # profile without importing the heavy api_core module.
-HONORED_EXECUTION_CONTROL_FIELDS = (
-    "sizing_mode",
-    "fixed_size",
-    "risk_per_trade",
-    "atr_stop_multiplier",
-    "kelly_multiplier",
-    "kelly_lookback",
-    "stop_loss_pct",
-    "take_profit_pct",
-    "trailing_stop_pct",
-    "time_stop_bars",
-)
+HONORED_EXECUTION_CONTROL_FIELDS = _sizing.HONORED_EXECUTION_CONTROL_FIELDS
 
 
 def execution_controls_from_params(params: dict | None) -> dict:
@@ -6379,66 +6348,7 @@ def _normalize_execution_controls(controls: dict | None) -> dict | None:
     A None return guarantees the simulator runs its byte-identical legacy path,
     so the autonomous/paper pipeline (which never passes these) is unaffected.
     """
-    if not isinstance(controls, dict):
-        return None
-
-    def _opt_pos(key: str) -> float | None:
-        raw = controls.get(key)
-        try:
-            v = float(raw)
-        except (TypeError, ValueError):
-            return None
-        return v if (np.isfinite(v) and v > 0) else None
-
-    sizing_mode = str(controls.get("sizing_mode") or "").strip().lower()
-    if sizing_mode in ("", "none", "full"):
-        sizing_mode = "full"
-    if sizing_mode not in ("full", "fixed", "fraction", "atr", "kelly"):
-        sizing_mode = "full"
-
-    stop_loss_pct = _opt_pos("stop_loss_pct")
-    take_profit_pct = _opt_pos("take_profit_pct")
-    trailing_stop_pct = _opt_pos("trailing_stop_pct")
-    raw_time_stop = controls.get("time_stop_bars")
-    try:
-        time_stop_bars = int(raw_time_stop) if raw_time_stop is not None else None
-    except (TypeError, ValueError):
-        time_stop_bars = None
-    if time_stop_bars is not None and time_stop_bars <= 0:
-        time_stop_bars = None
-
-    risk_per_trade = _opt_pos("risk_per_trade") or 0.02
-    fixed_size = _opt_pos("fixed_size")
-    atr_stop_multiplier = _opt_pos("atr_stop_multiplier") or 2.0
-    kelly_multiplier = _opt_pos("kelly_multiplier") or 0.5
-    try:
-        kelly_lookback = int(controls.get("kelly_lookback") or 100)
-    except (TypeError, ValueError):
-        kelly_lookback = 100
-    kelly_lookback = max(kelly_lookback, 1)
-
-    has_stop = (
-        any(x is not None for x in (stop_loss_pct, take_profit_pct, trailing_stop_pct, time_stop_bars))
-        or sizing_mode == "atr"
-    )
-    has_sizing = sizing_mode != "full"
-    if not has_stop and not has_sizing:
-        return None  # nothing active → legacy behaviour
-
-    return {
-        "sizing_mode": sizing_mode,
-        "stop_loss_pct": stop_loss_pct,
-        "take_profit_pct": take_profit_pct,
-        "trailing_stop_pct": trailing_stop_pct,
-        "time_stop_bars": time_stop_bars,
-        "risk_per_trade": float(risk_per_trade),
-        "fixed_size": fixed_size,
-        "atr_stop_multiplier": float(atr_stop_multiplier),
-        "kelly_multiplier": float(kelly_multiplier),
-        "kelly_lookback": kelly_lookback,
-        "needs_atr": sizing_mode == "atr",
-        "atr_period": 14,
-    }
+    return _sizing.normalize_execution_controls(controls)
 
 
 def _run_directional_signal_series(
@@ -6588,31 +6498,18 @@ def _run_directional_signal_series_with_controls(
     lev = max(float(leverage), 1e-9)
 
     def _entry_stop_dist_pct(entry_idx: int, entry_price: float) -> float | None:
-        if ec["sizing_mode"] == "atr" and atr_vals is not None:
-            atr = float(atr_vals[entry_idx])
-            if entry_price > 0 and atr > 0:
-                return (ec["atr_stop_multiplier"] * atr) / entry_price
-            return None
-        if ec["stop_loss_pct"] is not None:
-            return ec["stop_loss_pct"] / 100.0
-        if ec["trailing_stop_pct"] is not None:
-            return ec["trailing_stop_pct"] / 100.0
-        return None
+        atr_value = (
+            float(atr_vals[entry_idx])
+            if (ec["sizing_mode"] == "atr" and atr_vals is not None)
+            else None
+        )
+        return _sizing.entry_stop_dist_pct(ec, entry_price=entry_price, atr_value=atr_value)
 
     def _size_fraction(stop_dist_pct: float | None) -> float:
-        mode = ec["sizing_mode"]
-        if mode == "full":
-            return 1.0
-        if mode == "fixed":
-            if not ec["fixed_size"]:
-                return 1.0
-            return _clamp01(ec["fixed_size"] / max(float(initial_capital), 1e-9))
-        if mode == "kelly":
-            return _clamp01(ec["kelly_multiplier"] * _kelly_fraction(closed_gross, ec["kelly_lookback"]))
-        # fraction / atr → risk-based: lose ~risk_per_trade of equity at the stop.
-        if stop_dist_pct and stop_dist_pct > 0:
-            return _clamp01(ec["risk_per_trade"] / (stop_dist_pct * lev))
-        return _clamp01(ec["risk_per_trade"])
+        return _sizing.size_fraction(
+            ec, stop_dist_pct, leverage=lev,
+            initial_capital=initial_capital, closed_gross=closed_gross,
+        )
 
     def _finalize(at: dict, direction: str, exit_price: float, exit_idx: int,
                   exit_time: str, exit_reason: str, *, open_at_end: bool = False) -> None:
