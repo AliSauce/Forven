@@ -388,13 +388,17 @@ export interface StrategyOpenPosition {
 // open position's stop / take-profit were recomputed from the new profile.
 export interface OpenPositionUpdateEntry {
 	trade_id: string;
-	asset: string;
-	direction: 'long' | 'short';
-	is_live: boolean;
-	entry_price: number | null;
-	stop_loss: { old: number | null; new: number | null };
-	take_profit: { old: number | null; new: number | null };
-	trailing_stop_pct: number | null;
+	// Present on a SUCCESSFUL per-trade apply.
+	asset?: string;
+	direction?: 'long' | 'short';
+	is_live?: boolean;
+	entry_price?: number | null;
+	stop_loss?: { old: number | null; new: number | null };
+	take_profit?: { old: number | null; new: number | null };
+	trailing_stop_pct?: number | null;
+	// Present INSTEAD when applying to this trade failed; the param save still succeeded
+	// (the backend records the failure here and never raises).
+	error?: string;
 }
 
 export interface OpenPositionUpdate {

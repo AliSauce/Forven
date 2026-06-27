@@ -52,7 +52,6 @@ from forven.exchange.risk import (
 )
 from forven.market_cache import normalize_prices, publish_price_snapshot, publish_candle_snapshot
 from forven.market_data import (
-    fetch_hyperliquid_candles,
     fetch_market_candles,
     fetch_binance_prices,
     resolve_market_data_source,

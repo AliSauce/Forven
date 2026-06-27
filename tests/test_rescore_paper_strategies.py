@@ -6,7 +6,6 @@ import importlib.util
 import json
 from pathlib import Path
 
-import pytest
 
 _SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "rescore_paper_strategies.py"
 _spec = importlib.util.spec_from_file_location("rescore_paper_strategies", _SCRIPT)

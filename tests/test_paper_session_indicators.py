@@ -38,7 +38,8 @@ def test_session_indicators_follow_requested_timeframe_and_classify_panels(monke
 
     monkeypatch.setattr(paper_domain, "_find_compat_paper_session", lambda session_id, include_deployed=True: session)
 
-    def _fake_fetch(asset: str, *, bars: int = 300, interval: str = "1h", end_time=None, clean: bool = False):
+    def _fake_fetch(asset: str, *, bars: int = 300, interval: str = "1h", end_time=None,
+                    clean: bool = False, include_unclosed: bool = False, **_):
         requested_intervals.append(interval)
         return frame.tail(bars)
 

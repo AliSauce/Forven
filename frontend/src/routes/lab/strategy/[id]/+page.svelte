@@ -2995,6 +2995,19 @@
 	function notifyOpenPositionUpdate(update: OpenPositionUpdate | null | undefined): void {
 		if (!update?.affected) return;
 		for (const p of update.positions ?? []) {
+			// The backend records a per-trade apply FAILURE as { trade_id, error } (no
+			// direction/asset) and never raises — the param save itself still succeeded.
+			// Surface that as its own error toast instead of dereferencing p.direction on the
+			// error variant, which would throw and turn a successful save into a false
+			// "failed" toast (and skip the post-save container refresh).
+			if (!p.direction) {
+				addToast(
+					`Open position not updated${p.asset ? ` (${p.asset})` : ''}: ${p.error ?? 'apply failed'}`,
+					'error',
+					`/lab/strategy/${encodeURIComponent(strategyId)}`,
+				);
+				continue;
+			}
 			addToast(
 				`Updated open ${p.direction.toUpperCase()} ${p.asset}: SL ${formatPositionPrice(p.stop_loss?.old)} → ${formatPositionPrice(p.stop_loss?.new)}, TP ${formatPositionPrice(p.take_profit?.old)} → ${formatPositionPrice(p.take_profit?.new)}`,
 				'info',

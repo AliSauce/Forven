@@ -40,7 +40,7 @@ from forven.market_cache import (
 )
 from forven.market_data import (
     fetch_hyperliquid_candles,
-    fetch_hyperliquid_funding_rate,
+    fetch_hyperliquid_funding_rate,  # noqa: F401 — re-exported as a test mock.patch target
     fetch_market_candles,
     fetch_market_funding_rate,
     resolve_market_data_source,
@@ -2566,6 +2566,39 @@ def check_ema_cross_signal(df: pd.DataFrame, p: dict) -> dict:
 
 # ─── Signal Router ────────────────────────────────────────────────────────────
 
+def _latest_directional_signals(strategy_instance, df: pd.DataFrame) -> dict | None:
+    """Last-bar long/short entry/exit booleans from a strategy's vectorized
+    ``DirectionalSignals``, or ``None`` if it doesn't expose them.
+
+    The display ``entry_signal``/``exit_signal`` are direction-AGNOSTIC (entry = any
+    entry, exit = any exit). For a reversal strategy a single bar is both a SHORT entry
+    and a LONG exit, so both light up and the dashboard reads "enter AND exit at once".
+    Surfacing the four directional flags lets the UI show entry/exit for the RELEVANT
+    side. This is cosmetic only — the kernel always executes off the directional signals.
+    """
+    try:
+        from forven.strategies.base import DirectionalSignals
+
+        sigs = strategy_instance.generate_signals(df)
+    except Exception:
+        return None
+    if not isinstance(sigs, DirectionalSignals):
+        return None
+
+    def _last(series) -> bool:
+        try:
+            return bool(series.iloc[-1])
+        except Exception:
+            return False
+
+    return {
+        "long_entry": _last(sigs.long_entries),
+        "short_entry": _last(sigs.short_entries),
+        "long_exit": _last(sigs.long_exits),
+        "short_exit": _last(sigs.short_exits),
+    }
+
+
 def get_signal(
     strat_id: str,
     strat: dict,
@@ -2614,6 +2647,12 @@ def get_signal(
                 signal_dict = signal.to_dict()
                 signal_dict.setdefault("direction", str(getattr(signal, "direction", "long") or "long"))
             signal_dict.setdefault("direction", "long")
+            # Surface the four directional signals so the dashboard can show entry/exit for
+            # the RELEVANT side (a reversal bar is both a short-entry and a long-exit; the
+            # collapsed entry_signal/exit_signal made the UI read "entry AND exit at once").
+            _dir = _latest_directional_signals(strategy_instance, df)
+            if _dir is not None:
+                signal_dict["directional_signals"] = _dir
             # Custom Signal objects often omit price (it defaults to 0). A zero
             # price corrupts position sizing and paper fills — fall back to the
             # closed-candle price the signal was computed from.
@@ -5098,6 +5137,14 @@ def _blocked_scan_row(
 # is distinct from None, which means the strategy is genuinely non-vectorizable.
 KERNEL_SKIP_SCAN = object()
 
+# The kernel's intrabar PRICE exits. For a faithful kernel trade these close the recorded
+# paper trade directly; for a LATE hop-in they are the HISTORICAL position's levels (the
+# original entry's geometry), NOT the hop-in's re-anchored ones, so they're deferred to
+# the re-anchored-stop monitor (_kernel_handle_late_entry_exits). A strategy SIGNAL/
+# time-stop exit is NOT in this set, so it still closes a late trade (the strategy itself
+# decided to get out, independent of price).
+_KERNEL_PRICE_EXIT_REASONS = frozenset({"stop_loss", "take_profit", "trailing_stop"})
+
 
 def _paper_kernel_execution_enabled() -> bool:
     """Master switch for kernel-driven paper execution (parity path)."""
@@ -5140,6 +5187,52 @@ def _paper_kernel_backfill_bars() -> int:
         return 6
 
 
+# Stamped by scripts/reset_paper_trades.py --apply so the kernel's recording window restarts
+# at the reset. Read by _resolve_paper_go_live; without it a still-old stage_changed_at would
+# make the post-reset scan replay the whole pre-reset history into the fresh book.
+PAPER_BOOK_RESET_KV_KEY = "paper:book_reset_at"
+
+
+def _parse_iso_ts(value):
+    """Parse an ISO-ish timestamp string → aware UTC datetime (tolerant of space-vs-'T' and
+    a missing tz). None when it won't parse."""
+    from datetime import datetime, timezone
+    s = str(value or "").strip().replace(" ", "T")
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+def _resolve_paper_go_live(strat: dict):
+    """Start of this strategy's CURRENT paper book — the kernel's trade-recording cutoff.
+
+    = the LATEST of when it (re-)entered its stage (``stage_changed_at``) and the last global
+    paper-book reset (``PAPER_BOOK_RESET_KV_KEY``), capped at now so a skewed future stamp
+    can't freeze recording. Returns an aware datetime, or None when no anchor exists (the
+    caller then falls back to the bounded recent-bars window).
+
+    Anchoring the cutoff here — not on a sliding N-bar window — is the Finding-3 fix: every
+    trade since go-live is recorded/backfilled no matter how long the scanner was down, while
+    a fresh/reset book still never replays its pre-go-live history (those stay chart triggers).
+    It also splits recovery cleanly: a position ENTERED after go-live records faithfully at its
+    real entry; one held from BEFORE go-live is the late hop-in (current-price entry)."""
+    try:
+        reset_raw = kv_get(PAPER_BOOK_RESET_KV_KEY, None)
+    except Exception:
+        reset_raw = None
+    candidates = [
+        ts for ts in (_parse_iso_ts(strat.get("stage_changed_at")), _parse_iso_ts(reset_raw))
+        if ts is not None
+    ]
+    if not candidates:
+        return None
+    return min(max(candidates), get_now())
+
+
 def _is_kernel_paper_strategy(strat: dict) -> bool:
     """Kernel paper execution applies to PAPER-stage strategies only; live keeps the
     legacy path until the live-consistency phase."""
@@ -5176,12 +5269,18 @@ def _kernel_recorded_trades(strat_id: str) -> list[dict]:
     """Recorded kernel-managed paper trades (open + recently closed) shaped for the
     reconciler. ``entry_time`` is the kernel bar timestamp stored at open, so it lines
     up with the KernelResult's entries."""
+    # Cover the FULL kernel replay window. The kernel re-simulates ~_paper_kernel_history_bars
+    # bars every scan; any in-window recorded trade ABSENT from this snapshot would be seen as
+    # missing and re-backfilled as a DUPLICATE (compounding paper-equity corruption). Bound the
+    # cap generously above the max trades that window can hold (≈ bars × 2 directions) instead
+    # of a fixed small limit, so a high-frequency book is fully covered.
+    _cap = max(2000, _paper_kernel_history_bars() * 3)
     out: list[dict] = []
     with get_db() as conn:
         rows = conn.execute(
             "SELECT * FROM trades WHERE COALESCE(strategy_id, strategy) = ? "
-            "AND status IN ('OPEN','CLOSED') ORDER BY opened_at DESC LIMIT 800",
-            (strat_id,),
+            "AND status IN ('OPEN','CLOSED') ORDER BY opened_at DESC LIMIT ?",
+            (strat_id, int(_cap)),
         ).fetchall()
     for r in rows:
         row = dict(r)
@@ -5213,6 +5312,25 @@ def _kernel_recorded_trades(strat_id: str) -> list[dict]:
             })
         # CLOSED without kernel_entry_time → irrelevant to the kernel view; skip.
     return out
+
+
+def _kernel_trade_exists(strat_id: str, direction: str, kernel_entry_time: str) -> bool:
+    """True if ANY recorded trade (open or closed) already carries this ``kernel_entry_time``
+    for this strategy+direction. An UNCAPPED existence check (independent of the reconciler
+    snapshot's row cap) used to dedupe backfills, so the same kernel round-trip can never be
+    re-recorded twice. Fails open (returns False) on a query hiccup — the snapshot cap above
+    is sized to make a genuine miss impossible, so this is belt-and-suspenders."""
+    try:
+        with get_db() as conn:
+            hit = conn.execute(
+                "SELECT 1 FROM trades WHERE COALESCE(strategy_id, strategy) = ? "
+                "AND lower(COALESCE(direction, 'long')) = ? "
+                "AND json_extract(signal_data, '$.kernel_entry_time') = ? LIMIT 1",
+                (strat_id, str(direction or "long").strip().lower(), str(kernel_entry_time)),
+            ).fetchone()
+        return hit is not None
+    except Exception:
+        return False
 
 
 def _kernel_open_paper_trade(strat_id: str, strat: dict, action, *, sizing_equity: float, leverage: float,
@@ -5358,8 +5476,35 @@ def _kernel_close_recorded(strat_id: str, strat: dict, row: dict, trade: dict, d
 def _kernel_close_paper_trade(strat_id: str, strat: dict, action) -> str | None:
     trade = action.trade or {}
     if action.recorded and action.recorded.get("_row"):
-        return _kernel_close_recorded(strat_id, strat, action.recorded["_row"], trade, action.direction)
-    # Backfill: opened AND closed between scans — record the completed trade.
+        row = action.recorded["_row"]
+        sd = parse_trade_signal_data(row.get("signal_data"))
+        if sd.get("late_entry"):
+            # Never record an exit AT/BEFORE the hop-in entry: a kernel signal/time exit that
+            # fills on the very bar we hopped in on would stamp closed_at <= opened_at — a
+            # backwards, negative-duration trade with nonsense PnL. Defer it; a later bar's
+            # exit or the re-anchored monitor closes it (same closed-bars-only spirit as the
+            # monitor's idx > hop_ts skip).
+            _ex_t, _op_t = _parse_iso_ts(trade.get("exit_time")), _parse_iso_ts(row.get("opened_at"))
+            if _ex_t is not None and _op_t is not None and _ex_t <= _op_t:
+                return None
+            # A LATE hop-in's PRICE exits are owned by its RE-ANCHORED stop/target (enforced
+            # intrabar by _kernel_handle_late_entry_exits), NOT by the kernel's historical
+            # stop/target — those sit at the original entry's geometry, far from the hop-in
+            # price. Defer a kernel price-stop close — BUT only when there's actually a
+            # re-anchored level to enforce. A trailing-only position re-anchors to no
+            # stop/target (stop_loss_price/take_profit_price both None); deferring its price
+            # exit would strand it unprotected (riding to the kernel's far historical stop), so
+            # let the kernel exit close it. A strategy SIGNAL/time-stop exit always closes it.
+            _has_reanchor = sd.get("stop_loss_price") is not None or sd.get("take_profit_price") is not None
+            if _has_reanchor and str(trade.get("exit_reason") or "") in _KERNEL_PRICE_EXIT_REASONS:
+                return None
+        return _kernel_close_recorded(strat_id, strat, row, trade, action.direction)
+    # Backfill: opened AND closed between scans — record the completed trade. Guard against
+    # re-recording one already booked: if ANY trade already carries this kernel_entry_time,
+    # it IS recorded (just absent from the capped reconciler snapshot) — skip, so a busy book
+    # can't duplicate-count it (and inflate paper equity) on every subsequent scan.
+    if _kernel_trade_exists(strat_id, action.direction, action.entry_time):
+        return None
     from forven.strategies.paper_reconcile import ReconcileAction
     sizing_equity = _get_paper_strategy_equity(strat_id)
     leverage = float((strat.get("params") or {}).get("leverage", 1.0) or 1.0)
@@ -5412,6 +5557,11 @@ def _kernel_close_orphan(action, *, last_close: float, last_time: str) -> str | 
     row = (action.recorded or {}).get("_row")
     if row is None or not last_close or last_close <= 0:
         return None
+    # A LATE hop-in is owned by the re-anchored stop/target monitor, never the converge
+    # path: flattening it at the last bar would bypass its real (re-anchored) stop and
+    # close at an arbitrary current price. Leave it for _kernel_handle_late_entry_exits.
+    if parse_trade_signal_data(row.get("signal_data")).get("late_entry"):
+        return None
     trade_id = str(row.get("id"))
     direction = str(action.direction or "long")
     close_trade_record(
@@ -5455,6 +5605,100 @@ def _kernel_handle_manual_exits(strat_id: str, current_price: float) -> list[str
         _update_trade_fill(trade_id=trade_id, fill_price=price, fill_kind="exit", signal_price=price)
         _close_trade_db(trade_id, price, pnl_pct, pnl_usd, close_reason=reason)
         out.append(f"MANUAL-{reason.upper()} {trade.get('asset')} @ {price:.6g}")
+    return out
+
+
+def _kernel_handle_late_entry_exits(strat_id: str, strat: dict, df: "pd.DataFrame") -> list[str]:
+    """Enforce a LATE hop-in's RE-ANCHORED stop / take-profit — the live-faithful exit.
+
+    A late hop-in (see late-entry-hop-in) enters at the CURRENT price with its stop and
+    target re-anchored to that price (preserving the kernel position's risk-distance so
+    1% sizing still holds). But the shared kernel only ever reproduces the HISTORICAL
+    position's geometry (its original entry/stop), so it NEVER triggers the hop-in's
+    re-anchored levels. Without this, the re-anchored stop is display-only and the trade
+    actually rides to the kernel's historical stop — a far larger real loss than the 1%
+    the position was sized for.
+
+    This closes that gap exactly as a live resting stop/target would: each scan, check the
+    re-anchored levels intrabar against every bar that has CLOSED since the hop-in, filling
+    at the FIRST breach (stop checked before target; gap-through fills at the level — the
+    same conventions as ``execution_kernel.simulate``). The partial bar we entered during
+    is skipped (its path relative to our entry is unknown), matching the engine's
+    closed-bars-only philosophy. A strategy SIGNAL / time-stop exit still closes the trade
+    via the reconciler, so the trade exits at the re-anchored stop OR a strategy exit,
+    whichever comes first. Paper-only; late hop-ins never occur on the live path.
+    """
+    out: list[str] = []
+    if df is None or getattr(df, "empty", True) or len(df) == 0:
+        return out
+    try:
+        idx = df.index
+        opens = df["open"].astype(float)
+        highs = df["high"].astype(float)
+        lows = df["low"].astype(float)
+    except Exception:
+        return out
+
+    for trade in _get_open_trades(strat_id):
+        sd = parse_trade_signal_data(trade.get("signal_data"))
+        if not sd.get("late_entry") or sd.get("manual_pause"):
+            continue
+        direction = str(trade.get("direction") or "long").strip().lower()
+        is_long = direction != "short"
+        stop = _coerce_positive_float(sd.get("stop_loss_price"))
+        target = _coerce_positive_float(sd.get("take_profit_price"))
+        if stop is None and target is None:
+            continue  # nothing to enforce
+
+        hop_raw = trade.get("opened_at") or sd.get("opened_at")
+        try:
+            hop_ts = pd.Timestamp(hop_raw)
+            if hop_ts.tzinfo is None:
+                hop_ts = hop_ts.tz_localize("UTC")
+            mask = (idx > hop_ts).to_numpy() if hasattr(idx > hop_ts, "to_numpy") else (idx > hop_ts)
+        except Exception:
+            continue
+        if not bool(getattr(mask, "any", lambda: False)()):
+            continue
+
+        sub_opens = opens[mask].to_numpy()
+        sub_highs = highs[mask].to_numpy()
+        sub_lows = lows[mask].to_numpy()
+        sub_idx = idx[mask]
+
+        exit_price: float | None = None
+        exit_reason = ""
+        exit_time = ""
+        for i in range(len(sub_idx)):
+            o, h, l = float(sub_opens[i]), float(sub_highs[i]), float(sub_lows[i])
+            if is_long:
+                if stop is not None and l <= stop:
+                    exit_price, exit_reason = min(o, stop), "stop_loss"  # gap-through fills at open
+                elif target is not None and h >= target:
+                    exit_price, exit_reason = target, "take_profit"
+            else:
+                if stop is not None and h >= stop:
+                    exit_price, exit_reason = max(o, stop), "stop_loss"
+                elif target is not None and l <= target:
+                    exit_price, exit_reason = target, "take_profit"
+            if exit_price is not None:
+                exit_time = str(sub_idx[i])
+                break
+        if exit_price is None or exit_price <= 0:
+            continue
+
+        # Route through the SAME late-close path the reconciler uses (entry-based PnL from
+        # the hop-in price, kernel exit-bar timestamp), passing the re-anchored breach as a
+        # synthetic kernel trade. pnl_pct is ignored for late closes (recomputed from entry).
+        synthetic = {
+            "exit_price": float(exit_price),
+            "pnl_pct": 0.0,
+            "exit_reason": exit_reason,
+            "exit_time": exit_time,
+        }
+        msg = _kernel_close_recorded(strat_id, strat, dict(trade), synthetic, direction)
+        if msg:
+            out.append(msg)
     return out
 
 
@@ -5663,12 +5907,16 @@ def manage_positions_via_kernel(strat_id: str, strat: dict, *, account_equity=No
     is_live = str(execution_type).strip().lower() == "live"
     sizing_equity = _get_account_equity() if is_live else _get_paper_strategy_equity(strat_id)
     # Only RECORD activity from go-live forward — never replay the strategy's entire
-    # would-be history as trades (that flooded a fresh/reset book). The recent window
-    # gives scan-timing + downtime tolerance (missed bars still get backfilled, matched
-    # by direction+entry_time so no duplicates); pre-cutoff trades show on the chart as
-    # triggers, not recorded trades. Closes/refreshes of recorded trades are unaffected.
+    # would-be history as trades (that floods a fresh/reset book). Pre-cutoff trades show
+    # on the chart as triggers, not recorded trades; closes/refreshes of already-recorded
+    # trades are unaffected. The cutoff is the paper book's GO-LIVE (stage_changed_at or the
+    # last reset) so ANY downtime — not just the last few bars — backfills every missed trade
+    # since go-live (matched by direction+entry_time, so no duplicates). Falls back to a
+    # bounded recent-bars window when there's no go-live anchor (legacy rows / tests).
     _backfill_bars = min(_paper_kernel_backfill_bars(), len(df))
-    recent_cutoff = str(df.index[-_backfill_bars]) if len(df) >= 2 else None
+    _default_cutoff = str(df.index[-_backfill_bars]) if len(df) >= 2 else None
+    _go_live = _resolve_paper_go_live(strat)
+    recent_cutoff = _go_live.isoformat() if _go_live is not None else _default_cutoff
     # Anchor the orphan-close guard to the FIRST bar the kernel can actually replay
     # (df.index[KERNEL_WARMUP+1]), not df.index[0]; otherwise a long-held open whose
     # entry predates the kernel's tradable window is unreproducible and wrongly orphaned.
@@ -5736,6 +5984,13 @@ def manage_positions_via_kernel(strat_id: str, strat: dict, *, account_equity=No
             out.extend(_kernel_handle_manual_exits(strat_id, float(df["close"].iloc[-1])))
         except Exception as exc:
             log.error("[%s] kernel paper manual-exit check failed: %s", strat_id, exc, exc_info=True)
+        # Enforce a LATE hop-in's RE-ANCHORED stop/target (a live resting order would).
+        # The kernel only reproduces the HISTORICAL position's geometry, so a hop-in's own
+        # stop/target must be checked here, intrabar, against the bars since the hop-in.
+        try:
+            out.extend(_kernel_handle_late_entry_exits(strat_id, strat, df))
+        except Exception as exc:
+            log.error("[%s] kernel paper late-entry stop check failed: %s", strat_id, exc, exc_info=True)
 
     if diagnostics is not None:
         diagnostics[strat_id] = {

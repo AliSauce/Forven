@@ -21,7 +21,7 @@ counterpart is backfilled, so a gap in scanner uptime never loses trades.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Literal
 
 from forven.strategies.execution_kernel import KernelResult
@@ -129,7 +129,12 @@ def reconcile(res: KernelResult, recorded: list[dict], *, recent_cutoff: str | N
                        its SL/TP/trailing for display.
     """
     def _recent(entry_time: str) -> bool:
-        return recent_cutoff is None or str(entry_time) >= recent_cutoff
+        # entry_time >= recent_cutoff, but via the tolerant timestamp parse (space-vs-'T',
+        # tz present/absent) so the cutoff can be ANY ISO-ish string — e.g. a persisted
+        # paper go-live timestamp — not only the kernel's exact pandas-Timestamp format.
+        # Falls back to a raw string compare when either side won't parse, so it's identical
+        # to the old behaviour for same-format inputs.
+        return recent_cutoff is None or not _ts_lt(entry_time, recent_cutoff)
 
     recorded_by_key: dict[tuple[str, str], dict] = {}
     recorded_open_by_dir: dict[str, dict] = {}
@@ -180,14 +185,25 @@ def reconcile(res: KernelResult, recorded: list[dict], *, recent_cutoff: str | N
         if r_dir is not None and id(r_dir) not in matched:
             refreshes.append(ReconcileAction("refresh", direction, entry_time, position=pos, recorded=r_dir))
             matched.add(id(r_dir))
+        elif r is not None:
+            # A recorded trade ALREADY exists for this exact kernel position (an OPEN match
+            # was handled above, so this ``r`` is CLOSED). The kernel still holds the position,
+            # but the close was a deliberate exit the kernel can't see — a manual close/flip,
+            # or a late hop-in finalized at its re-anchored stop. RE-OPENING it would silently
+            # revert the user's action and double-count its PnL, so suppress the open. (When
+            # the kernel later genuinely exits, the close loop matches this closed row and is a
+            # no-op; a NEW signal enters on a fresh bar = a new entry_time = r is None = opens.)
+            continue
         elif _recent(entry_time):  # don't adopt a position that opened before tracking began
             opens.append(ReconcileAction("open", direction, entry_time, position=pos))
         elif late_entry:
             # Stale-but-still-held signal: the kernel entered before the recording window
-            # and never exited, so the strategy STILL wants this position. Don't replay the
-            # old entry — HOP IN at the current price/time (the scanner re-anchors entry,
+            # and never exited, so the strategy STILL wants this position (and ``r is None``
+            # here — a recorded counterpart was handled by the branches above). Don't replay
+            # the old entry — HOP IN at the current price/time (the scanner re-anchors entry,
             # stop and target to "now"). Keyed by the kernel's historical entry_time so the
-            # next scan reconciles it as a REFRESH, not a duplicate open.
+            # next scan reconciles it as a REFRESH, not a duplicate open. The ``r is not None``
+            # branch above is what prevents RE-HOPPING once a hop-in has been recorded.
             opens.append(ReconcileAction("open", direction, entry_time, position=pos, late_entry=True))
 
     # ORPHAN CLOSE: a recorded OPEN trade the kernel can no longer see (no exact match,

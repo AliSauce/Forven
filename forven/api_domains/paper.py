@@ -8,7 +8,7 @@ from fastapi import HTTPException
 from forven import api_core as core
 from forven.api_domains import trading as trading_domain
 from forven.db import _now, get_db, kv_get, kv_set
-from forven.market_data import fetch_hyperliquid_candles, fetch_market_candles
+from forven.market_data import fetch_market_candles
 from forven.scheduler import enable_job
 from forven.trade_state import parse_trade_signal_data
 
@@ -409,9 +409,46 @@ def _resolve_session_trade_mode(params: dict, position_sides: set[str]) -> str:
     return "long_only"
 
 
-def _build_session_runtime_fields(signal_snapshot: dict, timestamp: str) -> tuple[dict, list[dict], str]:
+def _scoped_entry_exit(signal_snapshot: dict, position_sides: set | None) -> tuple[bool, bool]:
+    """Direction-aware ``(entry_active, exit_active)`` for the dashboard.
+
+    The snapshot's ``entry_signal``/``exit_signal`` are direction-AGNOSTIC (entry = any
+    side's entry, exit = any side's exit), so a reversal bar — one that is simultaneously
+    a SHORT entry AND a LONG exit — reads as "enter AND exit at once". When the snapshot
+    carries the four directional flags, report entry/exit for the side that actually
+    matters: the HELD position's side, else the side whose entry is firing. Falls back to
+    the collapsed values for legacy snapshots without directional flags.
+    """
+    directional = signal_snapshot.get("directional_signals")
+    if not isinstance(directional, dict):
+        return bool(signal_snapshot.get("entry_signal")), bool(signal_snapshot.get("exit_signal"))
+    sides = {str(s).strip().lower() for s in (position_sides or set())}
+    sides = {s for s in sides if s in {"long", "short"}}
+    side = None
+    if len(sides) == 1:
+        side = next(iter(sides))                                       # the held position's side
+    elif bool(directional.get("short_entry")) and not bool(directional.get("long_entry")):
+        side = "short"                                                 # flat, a short entry is firing
+    elif bool(directional.get("long_entry")) and not bool(directional.get("short_entry")):
+        side = "long"                                                  # flat, a long entry is firing
+    if side:
+        return bool(directional.get(f"{side}_entry")), bool(directional.get(f"{side}_exit"))
+    # No position and no single-sided entry: surface any entry as informational, but there
+    # is no position to exit, so don't raise a (cross-side) exit signal.
+    return bool(directional.get("long_entry") or directional.get("short_entry")), False
+
+
+def _build_session_runtime_fields(
+    signal_snapshot: dict, timestamp: str, position_sides: set | None = None
+) -> tuple[dict, list[dict], str]:
+    entry_active, exit_active = _scoped_entry_exit(signal_snapshot, position_sides)
+
     indicators: dict[str, dict] = {}
     for name, value in signal_snapshot.items():
+        # entry_signal/exit_signal are re-added below as direction-SCOPED values;
+        # directional_signals is the nested carrier, not a chart indicator.
+        if name in {"entry_signal", "exit_signal", "directional_signals"}:
+            continue
         numeric = trading_domain._coerce_optional_float(value)
         if numeric is None:
             continue
@@ -420,10 +457,11 @@ def _build_session_runtime_fields(signal_snapshot: dict, timestamp: str) -> tupl
             "value": numeric,
             "timestamp": timestamp,
         }
+    if any(k in signal_snapshot for k in ("entry_signal", "exit_signal", "directional_signals")):
+        indicators["entry_signal"] = {"name": "entry_signal", "value": 1.0 if entry_active else 0.0, "timestamp": timestamp}
+        indicators["exit_signal"] = {"name": "exit_signal", "value": 1.0 if exit_active else 0.0, "timestamp": timestamp}
 
     pending_signals: list[dict] = []
-    entry_active = bool(signal_snapshot.get("entry_signal"))
-    exit_active = bool(signal_snapshot.get("exit_signal"))
     if entry_active:
         pending_signals.append(
             {
@@ -596,7 +634,9 @@ def _collect_compat_paper_sessions(
         signal_snapshot = _session_signal_snapshot(strategy_row, scanner_signals)
         diagnostic_snapshot = _session_diagnostic_snapshot(strategy_row, scanner_diagnostics)
         diagnostic_blocked_reason = str(diagnostic_snapshot.get("blocked_reason") or "").strip()
-        indicators, pending_signals, last_signal = _build_session_runtime_fields(signal_snapshot, scanner_ts)
+        indicators, pending_signals, last_signal = _build_session_runtime_fields(
+            signal_snapshot, scanner_ts, position_sides=position_sides
+        )
         if "price" not in indicators and current_price > 0:
             indicators["price"] = {
                 "name": "price",
@@ -1896,7 +1936,6 @@ def get_paper_session_chart(
     bars = _load_session_bars(session, limit=max(min(int(limit or 2000), 2000), 100), timeframe_override=timeframe)
     frame = _bars_to_frame(bars)
 
-    import pandas as pd
 
     main_indicators: list[dict] = []
     sub_indicators: list[dict] = []

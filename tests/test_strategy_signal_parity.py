@@ -182,7 +182,9 @@ def test_verdict_router_import_smoke():
 
     route_paths = [route.path for route in module.router.routes]
     assert route_paths.count("/verdict/run") == 1
-    assert route_paths.count("/verdict/{result_id}") == 1
+    # GET /verdict/{result_id} was intentionally removed — verdicts are not persisted, so
+    # there is nothing to fetch by id (see forven/routers/strategies.py). Guard the removal.
+    assert route_paths.count("/verdict/{result_id}") == 0
     assert route_paths.count("/verdict/guide") == 1
 
 

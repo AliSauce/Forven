@@ -82,6 +82,17 @@ def main(argv=None) -> int:
     shutil.copy2(db_path, backup)
     print(f"\nBacked up DB -> {backup}")
 
+    # Stamp the paper-book reset so the kernel's recording window restarts HERE — BEFORE any
+    # destructive delete. Without it, a still-old stage_changed_at would make the next scan
+    # replay the whole pre-reset history into the fresh book (it backfills every trade since
+    # go-live by design). Stamping first means an interrupt can never leave an emptied-but-
+    # unstamped book (which would re-flood); the slow ``forven.scanner`` import also happens
+    # before the wipe, not between wipe and stamp.
+    from forven.db import kv_set
+    from forven.scanner import PAPER_BOOK_RESET_KV_KEY
+    from forven.sim.clock import get_now
+    kv_set(PAPER_BOOK_RESET_KV_KEY, get_now().isoformat())
+
     ph = _placeholders(types)
     with get_db() as conn:
         conn.execute(f"DELETE FROM portfolio_positions WHERE COALESCE(execution_type,'paper') IN ({ph})", types)
@@ -93,6 +104,7 @@ def main(argv=None) -> int:
         conn.execute("DELETE FROM kv WHERE key = 'pending_post_mortems'")
 
     print(f"Deleted {deleted} trades + cleared risk slots, signal markers, and stale post-mortems.")
+    print("Stamped paper-book go-live = now (kernel records from here; no pre-reset replay).")
     print("Paper sessions/equity reset automatically (derived from trades).")
     print("Restart/refresh the app for a clean slate. Backup retained above if you need to roll back.")
     return 0
