@@ -7072,6 +7072,34 @@ def _signals_from_per_bar(
     return result
 
 
+def _isolated_strategy_exec_enabled() -> bool:
+    """Phase 2: route UNTRUSTED (custom) strategy signal generation through the
+    out-of-process worker. OFF by default. Returns False inside a worker
+    (FORVEN_IN_STRATEGY_WORKER) so the worker runs in-process and never recursively
+    spawns. Honors FORVEN_ISOLATED_STRATEGY_EXEC, else the cheap isolated_strategy_exec
+    KV flag (read like the per-bar-adapter gate, NOT get_settings(), on the hot path)."""
+    if os.environ.get("FORVEN_IN_STRATEGY_WORKER"):
+        return False
+    override = os.environ.get("FORVEN_ISOLATED_STRATEGY_EXEC")
+    if override is not None and override.strip() != "":
+        return override.strip().lower() in {"1", "true", "yes", "on"}
+    try:
+        from forven.scanner import _scanner_bool_setting
+        return _scanner_bool_setting("isolated_strategy_exec", False)
+    except Exception:
+        return False
+
+
+def _strategy_should_isolate(strategy_obj) -> bool:
+    """Isolate ONLY untrusted custom strategies (forven.strategies.custom.*) — builtins
+    and composites are first-party and run in-process. Requires a vectorized
+    generate_signals; the per-bar generate_signal path is not yet isolated."""
+    if strategy_obj is None or not hasattr(strategy_obj, "generate_signals"):
+        return False
+    module = str(getattr(type(strategy_obj), "__module__", "") or "")
+    return ".custom." in module or module.endswith(".strategies.custom")
+
+
 def run_strategy_execution(
     df: "pd.DataFrame",
     strategy_obj,
@@ -7103,7 +7131,24 @@ def run_strategy_execution(
     provide one, so this is the common path.
     """
     runtime_params = _strategy_runtime_params(params, strategy_obj)
-    vectorized = _resolve_strategy_vectorized_signals(strategy_obj, df)
+    default_direction = "short" if trade_mode == "short_only" else str(
+        runtime_params.get("direction") or runtime_params.get("position") or "long"
+    ).strip().lower()
+
+    if _isolated_strategy_exec_enabled() and _strategy_should_isolate(strategy_obj):
+        # Run the untrusted custom strategy's signal logic OUT-OF-PROCESS (secret-free
+        # env, network denied, confined FS). The worker normalizes with this exact
+        # trade_mode/default_direction, so re-normalizing below is idempotent and the
+        # result is byte-identical to the in-process path. Returns None when the
+        # strategy has no vectorized generate_signals (→ per-bar path, in-process).
+        from forven.sandbox.strategy_worker import compute_directional_signals_isolated
+        _iso_type = getattr(strategy_obj, "strategy_type", None) or strategy_type
+        vectorized = compute_directional_signals_isolated(
+            df, str(_iso_type), dict(getattr(strategy_obj, "params", {}) or {}),
+            trade_mode=trade_mode, default_direction=default_direction,
+        )
+    else:
+        vectorized = _resolve_strategy_vectorized_signals(strategy_obj, df)
     if vectorized is None and _per_bar_kernel_adapter_enabled():
         # ADAPTER: the strategy has no vectorized generate_signals, but the kernel can
         # still run it by walking its per-bar generate_signal into signal series — so
@@ -7121,9 +7166,6 @@ def run_strategy_execution(
 
     sid = getattr(strategy_obj, "strategy_id", None) or strategy_type or "custom"
     source = f"strategy:{sid}"
-    default_direction = "short" if trade_mode == "short_only" else str(
-        runtime_params.get("direction") or runtime_params.get("position") or "long"
-    ).strip().lower()
     signals = _normalize_directional_signal_payload(
         vectorized, df.index, default_direction=default_direction,
         trade_mode=trade_mode, label_prefix=source,

@@ -114,10 +114,13 @@ def _install_network_deny() -> None:
     socket.create_connection = _deny  # type: ignore[assignment]
 
 
-def _compute_signals(workdir: Path) -> None:
+def _compute_signals(workdir: Path) -> bool:
     """Build the requested strategy and write its DirectionalSignals (4 bool columns)
     to out.parquet. Assumes the registry is already populated (discover() done).
-    Runs the UNTRUSTED strategy's generate_signals."""
+    Runs the UNTRUSTED strategy's generate_signals. Returns True when vectorized
+    signals were produced, False when the strategy has NO vectorized generate_signals
+    (payload None) — the parent then falls back to the per-bar path, exactly as the
+    in-process ``_resolve_strategy_vectorized_signals`` returning None does."""
     from forven.strategies import registry
     from forven.strategies.backtest import _normalize_directional_signal_payload
 
@@ -130,6 +133,8 @@ def _compute_signals(workdir: Path) -> None:
         raise StrategyWorkerError(f"unknown strategy type {strategy_type!r}")
     strat = cls("isolated", dict(request.get("params") or {}))
     payload = strat.generate_signals(df)
+    if payload is None:
+        return False
     signals = _normalize_directional_signal_payload(
         payload,
         df.index,
@@ -146,6 +151,7 @@ def _compute_signals(workdir: Path) -> None:
         index=df.index,
     )
     out.to_parquet(workdir / "out.parquet")
+    return True
 
 
 def _prepare_worker_runtime():
@@ -169,8 +175,8 @@ def _run_worker(workdir: Path) -> int:
     status_path = workdir / "status.json"
     try:
         _prepare_worker_runtime()
-        _compute_signals(workdir)
-        status_path.write_text(json.dumps({"ok": True}), encoding="utf-8")
+        vectorized = _compute_signals(workdir)
+        status_path.write_text(json.dumps({"ok": True, "vectorized": vectorized}), encoding="utf-8")
         return 0
     except BaseException as exc:  # noqa: BLE001 — report ANY failure as structured status
         try:
@@ -198,9 +204,9 @@ def _serve() -> int:
         try:
             msg = json.loads(line)
             workdir = Path(msg["workdir"])
-            _compute_signals(workdir)
-            (workdir / "status.json").write_text(json.dumps({"ok": True}), encoding="utf-8")
-            ack = {"ok": True}
+            vectorized = _compute_signals(workdir)
+            (workdir / "status.json").write_text(json.dumps({"ok": True, "vectorized": vectorized}), encoding="utf-8")
+            ack = {"ok": True, "vectorized": vectorized}
         except BaseException as exc:  # noqa: BLE001 — a bad request must not kill the worker
             ack = {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:2000]}
         sys.stdout.write(json.dumps(ack) + "\n")
@@ -358,9 +364,11 @@ def compute_directional_signals_isolated(
     trade_mode: str,
     default_direction: str = "long",
     timeout: int = DEFAULT_TIMEOUT_SECONDS,
-) -> DirectionalSignals:
+) -> "DirectionalSignals | None":
     """Build the strategy and run its ``generate_signals(df)`` in an isolated,
-    secret-free, network-denied subprocess, returning normalized DirectionalSignals.
+    secret-free, network-denied subprocess, returning normalized DirectionalSignals
+    — or ``None`` when the strategy has no vectorized ``generate_signals`` (so the
+    caller falls back to the per-bar path, exactly as the in-process resolver does).
 
     Uses a persistent per-process worker (spawned lazily, reused across calls). Output
     is identical to building the same strategy in-process and normalizing its
@@ -407,6 +415,9 @@ def compute_directional_signals_isolated(
         if not ack.get("ok"):
             detail = ack.get("error") or _read_status_error(workdir) or "unknown error"
             raise StrategyWorkerError(f"isolated signal generation for {strategy_type!r} failed: {detail}")
+
+        if not ack.get("vectorized", True):
+            return None  # no vectorized generate_signals → caller uses the per-bar path
 
         out_path = workdir / "out.parquet"
         if not out_path.exists():

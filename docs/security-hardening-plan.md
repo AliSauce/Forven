@@ -124,13 +124,16 @@ Effort: **S** ≈ ½–1 day · **M** ≈ 1–3 days · **L** ≈ 1–2 weeks.
 > path. **(1) DONE — persistent worker:** `strategy_worker.py` now has a `--serve` mode that
 > imports + `discover()`s ONCE then loops on stdin requests; a reusable client (reader thread +
 > queue + respawn-on-death/timeout) keeps the `compute_directional_signals_isolated` API and
-> amortizes the ~15s startup across calls (parity + reuse tests green). **Remaining (the
-> bulk):** (2) the per-bar `generate_signal` walk (`_run_signal_walk`), intertwined with the
-> kernel, isn't isolated yet; (3) the real integration — refactor backtest + scanner so the
-> parent **stops importing custom code** for the signal path (get strategy metadata from the DB
-> row, delegate build+execution to the worker). (3) is the trading-core-sensitive part: routing
-> only `generate_signals` is insufficient because the untrusted module's TOP-LEVEL code already
-> ran at in-process build time — the parent must avoid the import entirely.
+> amortizes the ~15s startup across calls (parity + reuse tests green). **(2) DONE — backtest
+> wiring (flag-gated):** `run_strategy_execution` routes a CUSTOM strategy's vectorized
+> `generate_signals` through the worker when `FORVEN_ISOLATED_STRATEGY_EXEC` is on (OFF by
+> default; builtins/composites untouched). A full off-vs-on backtest yields byte-identical
+> kernel trades (`test_isolated_backtest_matches_in_process`). **Remaining:** (3) the per-bar
+> `generate_signal` walk and the scanner path aren't routed yet; (4) FULL isolation still needs
+> the parent to STOP IMPORTING custom code — today `discover()` imports every custom in-process
+> (AST-gated, once at startup) and `strategy_obj` is built in-process, so what's isolated is the
+> heavy, repeated `generate_signals` EXECUTION, not the one-time import / `__init__`. Closing
+> that is the registry-loading refactor (large) — track separately.
 >
 > **Key design constraint discovered:** a strategy run in the worker sees ONLY the input
 > frame — no DB, no network. So **all data a strategy needs must be enriched onto the df by

@@ -141,3 +141,90 @@ def test_persistent_worker_is_reused_across_calls(monkeypatch):
     assert _as_lists(sig1) == _as_lists(inproc)
     assert _as_lists(sig2) == _as_lists(inproc)
     assert len(sig3.long_entries) == 250
+
+
+# --- P2.3: flag-gated backtest isolation must be byte-identical to in-process ---
+
+def _gbm_frame(n: int = 400, seed: int = 4) -> pd.DataFrame:
+    rng = np.random.default_rng(seed)
+    steps = rng.normal(0.0005, 0.02, size=n).cumsum()
+    close = 100.0 * np.exp(steps)
+    spread = np.abs(rng.normal(0.0, 0.012, size=n)) + 0.004
+    high = close * (1.0 + spread)
+    low = close * (1.0 - spread)
+    openp = np.empty(n)
+    openp[0] = close[0]
+    openp[1:] = close[:-1] * (1.0 + rng.normal(0.0, 0.004, size=n - 1))
+    high = np.maximum.reduce([high, openp, close])
+    low = np.minimum.reduce([low, openp, close])
+    idx = pd.date_range("2024-01-01", periods=n, freq="1h", tz="UTC")
+    return pd.DataFrame(
+        {"open": openp, "high": high, "low": low, "close": close, "volume": 1000.0}, index=idx
+    )
+
+
+def _pick_isolatable_custom_type(df):
+    """Find a registered CUSTOM strategy (forven.strategies.custom.*) with vectorized
+    signals whose ISOLATED output already matches in-process — i.e. pure (OHLCV-only)
+    and reproducible out-of-process. Filters out data-dependent strategies."""
+    from forven.strategies import registry
+    from forven.strategies.backtest import _normalize_directional_signal_payload as _norm
+
+    registry.discover()
+    tried = 0
+    for type_name, cls in sorted(registry._TYPE_MAP.items()):
+        if ".custom." not in str(getattr(cls, "__module__", "")):
+            continue
+        try:
+            payload = cls("probe", {}).generate_signals(df)
+        except Exception:  # noqa: BLE001
+            continue
+        if payload is None:
+            continue
+        tried += 1
+        if tried > 40:
+            break
+        try:
+            inproc = _norm(payload, df.index, trade_mode="long_only", default_direction="long")
+            iso = compute_directional_signals_isolated(
+                df, type_name, dict(cls("probe", {}).params), trade_mode="long_only", default_direction="long"
+            )
+        except Exception:  # noqa: BLE001 — data-dependent strategy errors in the DB-less worker
+            continue
+        if iso is not None and _as_lists(inproc) == _as_lists(iso):
+            return type_name, cls
+    return None, None
+
+
+def test_isolated_backtest_matches_in_process(monkeypatch):
+    """A FULL run_strategy_execution on a custom strategy must produce IDENTICAL kernel
+    trades whether the signals are generated in-process or in the isolated worker."""
+    import forven.strategies.execution_kernel as ek
+    from forven.strategies import backtest as bt
+
+    monkeypatch.delenv("FORVEN_IN_STRATEGY_WORKER", raising=False)
+    df = _gbm_frame()
+    type_name, cls = _pick_isolatable_custom_type(df)
+    if type_name is None:
+        pytest.skip("no pure isolatable custom strategy with vectorized signals available")
+
+    strat = cls("iso-parity", {})
+    kw = dict(
+        params=strat.params, warmup=50, leverage=2.0, fee_bps=4.5, slippage_bps=2.0,
+        regime_gate=True, trade_mode="long_only", execution_controls=None,
+        initial_capital=10000.0, strategy_type=type_name,
+    )
+
+    monkeypatch.delenv("FORVEN_ISOLATED_STRATEGY_EXEC", raising=False)  # OFF → in-process
+    res_off = bt.run_strategy_execution(df, strat, **kw)
+    monkeypatch.setenv("FORVEN_ISOLATED_STRATEGY_EXEC", "1")  # ON → worker
+    res_on = bt.run_strategy_execution(df, strat, **kw)
+
+    assert res_off is not None and res_on is not None, f"[{type_name}] unexpected None KernelResult"
+    drag = ek.round_trip_drag(4.5, 2.0, 2.0)
+    trades_off = ek.force_close(res_off, df, leverage=2.0, round_trip_drag=drag, trade_mode="long_only")
+    trades_on = ek.force_close(res_on, df, leverage=2.0, round_trip_drag=drag, trade_mode="long_only")
+    assert trades_on == trades_off, (
+        f"[{type_name}] isolated backtest diverged from in-process: "
+        f"off={len(trades_off)} trades, on={len(trades_on)}"
+    )
