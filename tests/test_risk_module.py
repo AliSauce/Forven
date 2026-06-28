@@ -290,6 +290,56 @@ class TestKillSwitch:
         assert result["action"] is None
         assert result["kill_switch"] is False
 
+    def test_books_aggregate_to_exchange_rebaselines_no_false_kill(self, forven_db):
+        """RISK-STATE-2: disabling books collapses aggregate->master equity. Without a
+        basis re-baseline that is a phantom ~95% drawdown that false-fires the kill
+        switch and force-flattens live positions. Any real-source basis change re-baselines."""
+        update_equity(10000.0, source="books_aggregate")  # live connect, HWM=10000
+        result = update_equity(500.0, source="exchange")   # books off -> master only
+        assert result["kill_switch"] is False
+        assert result["action"] is None
+        assert result["high_water_mark"] == 500.0
+
+    def test_live_basis_change_preserves_fired_daily_halt(self, forven_db):
+        """RISK-STATE-1: a live<->live basis change must NOT lift an already-fired
+        daily-loss halt (only the INITIAL paper->live connect clears a paper halt)."""
+        from forven.db import kv_get, kv_set
+        from forven.sim.clock import get_now
+
+        update_equity(10000.0, source="exchange")  # initial live connect
+        state = kv_get("risk_state", {})
+        state["daily_loss_halt"] = True
+        state["daily_loss_halt_date"] = get_now().date().isoformat()  # today -> survives the rollover
+        kv_set("risk_state", state)
+
+        update_equity(9800.0, source="books_aggregate")  # live<->live basis flip
+        assert kv_get("risk_state", {}).get("daily_loss_halt") is True
+
+    def test_transient_paper_sample_ignored_in_live_session(self, forven_db, monkeypatch):
+        """RISK-STATE-1: in a LIVE session a transient paper-source fallback must not
+        mutate the live risk state, so the recovery tick can't re-baseline the HWM or
+        clear a fired halt."""
+        import forven.config as cfg
+        from forven.db import kv_get, kv_set
+        from forven.sim.clock import get_now
+
+        monkeypatch.setattr(cfg, "get_execution_mode", lambda: "live")
+        update_equity(10000.0, source="exchange")  # live, HWM=10000
+        state = kv_get("risk_state", {})
+        state["daily_loss_halt"] = True
+        state["daily_loss_halt_date"] = get_now().date().isoformat()
+        kv_set("risk_state", state)
+
+        update_equity(50.0, source="paper")  # transient fallback -> ignored
+        st = kv_get("risk_state", {})
+        assert st.get("daily_loss_halt") is True       # halt preserved
+        assert st.get("high_water_mark") == 10000.0     # HWM untouched
+        assert st.get("equity_source") == "exchange"    # source not flapped to paper
+
+        # Recovery to live does NOT re-baseline/clear (prev_source stayed exchange).
+        update_equity(9900.0, source="exchange")
+        assert kv_get("risk_state", {}).get("daily_loss_halt") is True
+
 
 class TestKillSwitchToggle:
     """Kill-switch auto-trigger enable/disable toggle."""

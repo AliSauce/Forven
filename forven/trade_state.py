@@ -157,6 +157,7 @@ def close_trade_record(
     extra_signal_data: dict | None = None,
     closed_at: str | None = None,
     only_if_open: bool = True,
+    pnl_override: dict | None = None,
 ) -> dict | None:
     normalized_trade_id = str(trade_id or "").strip()
     if not normalized_trade_id:
@@ -273,6 +274,24 @@ def close_trade_record(
                 # that overstated pnl_usd (and the promotion-gate metrics it feeds).
                 pnl_usd = (resolved_exit_price - entry_price) * size * signed
 
+        # DB-1 / SCANAPPLY-2: a caller (the kernel close) can supply the authoritative
+        # NET pnl so the close + net_pnl_pct + the equity-fraction parity flag are written
+        # in ONE transaction below. Previously the kernel wrote the close, then OVERRODE the
+        # pnl in a second transaction — a crash in the gap left a CLOSED row at the wrong
+        # (margin) scale with a NULL net and no flag. Folding it here makes the close atomic.
+        net_pnl_pct_val = None
+        if pnl_override and not incomplete:
+            _ov_pnl_pct = _coerce_optional_float(pnl_override.get("pnl_pct"))
+            _ov_pnl_usd = _coerce_optional_float(pnl_override.get("pnl_usd"))
+            _ov_net = _coerce_optional_float(pnl_override.get("net_pnl_pct"))
+            if _ov_pnl_pct is not None:
+                pnl_pct = _ov_pnl_pct
+            if _ov_pnl_usd is not None:
+                pnl_usd = _ov_pnl_usd
+            net_pnl_pct_val = _ov_net if _ov_net is not None else _ov_pnl_pct
+            if pnl_override.get("equity_fraction"):
+                signal_data["pnl_is_equity_fraction"] = True
+
         if close_reason is not None:
             signal_data["close_reason"] = str(close_reason)
         signal_data["close_incomplete"] = bool(incomplete)
@@ -281,30 +300,59 @@ def close_trade_record(
         elif close_price_source:
             signal_data["close_price_source"] = str(close_price_source)
 
-        conn.execute(
-            """
-            UPDATE trades
-            SET status='CLOSED',
-                closed_at=?,
-                exit_price=?,
-                signal_exit_price=?,
-                pnl=?,
-                pnl_pct=?,
-                pnl_usd=?,
-                signal_data=?
-            WHERE id=?
-            """,
-            (
-                resolved_closed_at,
-                round(float(resolved_exit_price), 8) if resolved_exit_price is not None else None,
-                round(float(persisted_signal_exit_price), 8) if persisted_signal_exit_price is not None else None,
-                round(float(pnl_usd), 4) if pnl_usd is not None else None,
-                round(float(pnl_pct), 6) if pnl_pct is not None else None,
-                round(float(pnl_usd), 4) if pnl_usd is not None else None,
-                json.dumps(signal_data),
-                normalized_trade_id,
-            ),
-        )
+        if net_pnl_pct_val is not None:
+            # Atomic close WITH the caller-supplied net equity-fraction (kernel path).
+            conn.execute(
+                """
+                UPDATE trades
+                SET status='CLOSED',
+                    closed_at=?,
+                    exit_price=?,
+                    signal_exit_price=?,
+                    pnl=?,
+                    pnl_pct=?,
+                    pnl_usd=?,
+                    net_pnl_pct=?,
+                    signal_data=?
+                WHERE id=?
+                """,
+                (
+                    resolved_closed_at,
+                    round(float(resolved_exit_price), 8) if resolved_exit_price is not None else None,
+                    round(float(persisted_signal_exit_price), 8) if persisted_signal_exit_price is not None else None,
+                    round(float(pnl_usd), 4) if pnl_usd is not None else None,
+                    round(float(pnl_pct), 8) if pnl_pct is not None else None,
+                    round(float(pnl_usd), 4) if pnl_usd is not None else None,
+                    round(float(net_pnl_pct_val), 8),
+                    json.dumps(signal_data),
+                    normalized_trade_id,
+                ),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE trades
+                SET status='CLOSED',
+                    closed_at=?,
+                    exit_price=?,
+                    signal_exit_price=?,
+                    pnl=?,
+                    pnl_pct=?,
+                    pnl_usd=?,
+                    signal_data=?
+                WHERE id=?
+                """,
+                (
+                    resolved_closed_at,
+                    round(float(resolved_exit_price), 8) if resolved_exit_price is not None else None,
+                    round(float(persisted_signal_exit_price), 8) if persisted_signal_exit_price is not None else None,
+                    round(float(pnl_usd), 4) if pnl_usd is not None else None,
+                    round(float(pnl_pct), 6) if pnl_pct is not None else None,
+                    round(float(pnl_usd), 4) if pnl_usd is not None else None,
+                    json.dumps(signal_data),
+                    normalized_trade_id,
+                ),
+            )
 
     return {
         "updated": True,

@@ -15,6 +15,7 @@ Strategies:
 import json
 import logging
 import sqlite3
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
@@ -3404,6 +3405,58 @@ def _execute_direct(
                 order_meta["entry_exchange_order_id"] = exchange_order_id
             if order_meta:
                 _update_trade_signal_data(trade_id, order_meta)
+            # HL-1: the entry filled but a protective leg was rejected by the
+            # exchange (e.g. "would immediately trigger" in a fast move). The
+            # position is REAL and now tracked (fill recorded above) — arm the
+            # missing leg with a standalone reduce-only order. If that also fails,
+            # flag it (the periodic reconcile's _repair_position_protection re-arms a
+            # missing stop as a backstop) and raise a CRITICAL operator alert. NEVER
+            # discard the fill (the unprotected-orphan bug).
+            _protective_failed = result.get("protective_leg_failed") or []
+            if _protective_failed and fill is not None and not is_sim_active():
+                from forven.exchange.hyperliquid import place_protective_stop, place_take_profit
+                _prot_kwargs = {"testnet": testnet}
+                if vault_address:
+                    _prot_kwargs["vault_address"] = vault_address
+                if "stop" in _protective_failed and stop_loss is not None:
+                    try:
+                        _ps = place_protective_stop(asset, direction, size, float(stop_loss), **_prot_kwargs)
+                        if isinstance(_ps, dict) and not _ps.get("error") and _ps.get("stop_order_id"):
+                            _update_trade_signal_data(trade_id, {
+                                "exchange_stop_order_id": str(_ps["stop_order_id"]),
+                                "protective_stop_rearmed": True,
+                            })
+                        else:
+                            _update_trade_signal_data(trade_id, {"protective_stop_unarmed": True})
+                            _err = (_ps or {}).get("error") if isinstance(_ps, dict) else None
+                            log.error(
+                                "[%s] %s entry FILLED but stop leg rejected AND re-arm failed (trade=%s): %s — "
+                                "periodic reconcile will retry", strat_id, asset, trade_id, _err,
+                            )
+                            try:
+                                from forven.notifications import emit_notification
+                                emit_notification(
+                                    "trade_protective_unarmed", severity="critical", source="scanner",
+                                    title=f"Live position temporarily UNPROTECTED ({asset})",
+                                    summary=f"{asset} {direction} entry filled but the protective stop could not be armed; reconcile will retry.",
+                                    body=f"trade={trade_id}: {_err}",
+                                    dedupe_key=f"protective_unarmed:{trade_id}",
+                                )
+                            except Exception:
+                                pass
+                    except Exception as _exc:
+                        _update_trade_signal_data(trade_id, {"protective_stop_unarmed": True})
+                        log.error("[%s] re-arm stop after rejected bracket leg raised for %s trade=%s: %s", strat_id, asset, trade_id, _exc)
+                if "take_profit" in _protective_failed and take_profit is not None:
+                    try:
+                        _tp = place_take_profit(asset, direction, size, float(take_profit), **_prot_kwargs)
+                        if isinstance(_tp, dict) and not _tp.get("error") and _tp.get("take_profit_order_id"):
+                            _update_trade_signal_data(trade_id, {
+                                "exchange_take_profit_order_id": str(_tp["take_profit_order_id"]),
+                                "protective_tp_rearmed": True,
+                            })
+                    except Exception as _exc:
+                        log.warning("[%s] re-arm take-profit after rejected bracket leg failed for %s trade=%s: %s", strat_id, asset, trade_id, _exc)
         log_activity("trade", "scanner", f"OPEN {strat_id} {asset} trade={trade_id} fill={fill}")
         return result
 
@@ -5511,44 +5564,41 @@ def _kernel_close_recorded(strat_id: str, strat: dict, row: dict, trade: dict, d
     pnl_usd = round(float(equity_at_entry) * pnl_pct_net, 4)
     exit_reason = str(trade.get("exit_reason") or "signal")
     _update_trade_fill(trade_id=trade_id, fill_price=exit_price, fill_kind="exit", signal_price=exit_price)
-    close_trade_record(
-        trade_id, signal_exit_price=exit_price, exit_price=exit_price,
-        close_reason=exit_reason, close_price_source="kernel",
-        extra_signal_data={"kernel_exit_time": trade.get("exit_time"), "kernel_managed": True},
-    )
-    # Stamp closed_at with the kernel's actual EXIT-bar time (close_trade_record records
-    # wall-clock; the trade really closed on the bar the kernel exited on, so the recorded
-    # trade lands on the correct bars instead of the scan moment).
+    # closed_at = the kernel's actual EXIT-bar time (the trade really closed on the bar the
+    # kernel exited on, not the scan moment). close_trade_record stamps it directly.
     _exit_time = trade.get("exit_time")
     _closed_at = str(_exit_time).replace(" ", "T") if _exit_time else None
     if late:
         # LATE hop-in: the recorded entry is the (later) hop-in price, NOT the kernel's
-        # historical entry — so close_trade_record's entry-based PnL is the correct one for
-        # this position. Do NOT override it with the kernel's historical-entry net pnl;
-        # only stamp the kernel exit-bar time. (Display pnl is computed from the recorded
-        # entry below for the log line.)
-        if _closed_at:
-            with get_db() as conn:
-                conn.execute("UPDATE trades SET closed_at=? WHERE id=?", (_closed_at, trade_id))
+        # historical entry — so close_trade_record's entry-based (margin) PnL is the correct
+        # one for this position; do NOT override it with the kernel's historical-entry net,
+        # and do NOT flag it equity-fraction (it stays out of the promotion gate). One atomic
+        # close stamps the kernel exit-bar time. (Display pnl computed from the recorded entry.)
+        close_trade_record(
+            trade_id, signal_exit_price=exit_price, exit_price=exit_price,
+            close_reason=exit_reason, close_price_source="kernel", closed_at=_closed_at,
+            extra_signal_data={"kernel_exit_time": trade.get("exit_time"), "kernel_managed": True},
+        )
         _our_entry = _coerce_positive_float(row.get("entry_price") or row.get("signal_entry_price")) or 0.0
         _lev = float(row.get("leverage") or 1.0)
         _sgn = 1.0 if str(direction).strip().lower() == "long" else -1.0
         disp_pnl = ((exit_price - _our_entry) / _our_entry * _sgn * _lev) if _our_entry > 0 else 0.0
         return f"KERNEL-CLOSE (late) {strat.get('asset')} {direction} @ {exit_price:.6g} pnl={disp_pnl * 100:.2f}% ({exit_reason})"
-    # Faithful kernel trade: override with the kernel's NET values (close_trade_record
-    # computes a gross, position-return pnl; the kernel pnl_pct is net-of-drag, size-scaled
-    # equity impact).
-    with get_db() as conn:
-        if _closed_at:
-            conn.execute(
-                "UPDATE trades SET pnl_pct=?, net_pnl_pct=?, pnl=?, pnl_usd=?, closed_at=? WHERE id=?",
-                (round(pnl_pct_net, 8), round(pnl_pct_net, 8), pnl_usd, pnl_usd, _closed_at, trade_id),
-            )
-        else:
-            conn.execute(
-                "UPDATE trades SET pnl_pct=?, net_pnl_pct=?, pnl=?, pnl_usd=? WHERE id=?",
-                (round(pnl_pct_net, 8), round(pnl_pct_net, 8), pnl_usd, pnl_usd, trade_id),
-            )
+    # Faithful kernel trade: write the kernel's NET equity-fraction values (the kernel
+    # pnl_pct is net-of-drag, size-scaled equity impact — close_trade_record's own pnl is a
+    # gross MARGIN return). DB-1 / SCANAPPLY-2 + PROMOTION-GATE-PARITY-2/3: pass them via
+    # pnl_override so close_trade_record writes status=CLOSED + pnl/pnl_pct/net_pnl_pct/
+    # pnl_usd + closed_at + the pnl_is_equity_fraction flag in ONE atomic transaction (no
+    # separate override UPDATE that a crash could tear, leaving a wrong-scale unflagged row).
+    close_trade_record(
+        trade_id, signal_exit_price=exit_price, exit_price=exit_price,
+        close_reason=exit_reason, close_price_source="kernel", closed_at=_closed_at,
+        extra_signal_data={"kernel_exit_time": trade.get("exit_time"), "kernel_managed": True},
+        pnl_override={
+            "pnl_pct": round(pnl_pct_net, 8), "net_pnl_pct": round(pnl_pct_net, 8),
+            "pnl_usd": pnl_usd, "equity_fraction": True,
+        },
+    )
     return f"KERNEL-CLOSE {strat.get('asset')} {direction} @ {exit_price:.6g} pnl={pnl_pct_net * 100:.2f}% ({exit_reason})"
 
 
@@ -5842,6 +5892,7 @@ def _kernel_open_live_trade(strat_id: str, strat: dict, action, *, sizing_equity
     market order + resting SL/TP, real avgPx fill) and the can_open safety gate;
     sizes via the kernel's size_fraction off live account equity."""
     from forven.exchange.risk import can_open
+    from forven.exchange import books
     from forven.strategies import sizing as _sizing
 
     asset = str(strat.get("asset") or "")
@@ -5850,9 +5901,45 @@ def _kernel_open_live_trade(strat_id: str, strat: dict, action, *, sizing_equity
     ref_price = _coerce_positive_float(pos.get("entry_price"))
     if not asset or ref_price is None:
         return None
-    # Keep the live safety gates (kill-switch/daily-halt/one-per-asset/cooldown); size
-    # authoritatively from the kernel (enforce_risk_caps=False keeps gates, drops the cap).
-    allowed, alloc_risk, why = can_open(asset, direction, strat_id, execution_type="live", enforce_risk_caps=False)
+
+    # DIRECTION-BOOKS-1 / LIVE-4: route the NEW live position to its direction
+    # sub-account (Approach C), exactly like the legacy live path. Books OFF =>
+    # ("main", None) => master wallet (unchanged behaviour). Long-only mode skips a
+    # short with an operator-facing warning; a dedicated sub-account sizes off ITS
+    # balance (fail closed if unreadable, never mis-size off the master wallet); and
+    # the M7 cross-book self-trade guard defers an entry that could cross.
+    books_on = False
+    try:
+        books_on = books.books_enabled()
+    except Exception:
+        books_on = False
+    open_book, book_skip_reason = (books.resolve_open_book(direction) if books_on else (None, None))
+    if books_on:
+        if open_book is None:
+            log.warning("[%s] LONG-ONLY: skipping %s live short — %s", strat_id, asset, book_skip_reason)
+            _notify_long_only_mode(asset)
+            return f"SKIPPED {asset} short — long-only (no short book)"
+        _book_addr = books.book_address(open_book)
+        if _book_addr:
+            _book_eq = _book_account_equity(_book_addr)
+            if _book_eq and _book_eq > 0:
+                sizing_equity = _book_eq
+            else:
+                log.warning(
+                    "[%s] BLOCKED %s live — could not read %s-book sub-account balance; "
+                    "not sizing a real order off the master wallet", strat_id, asset, open_book,
+                )
+                return f"BLOCKED {asset} live — {open_book}-book balance unavailable for sizing"
+        if books.short_book_available():
+            _cross, _cross_reason = _opposite_book_would_cross(asset, open_book)
+            if _cross:
+                log.warning("[%s] DEFERRED %s live — %s", strat_id, asset, _cross_reason)
+                return f"SKIPPED {asset} — {_cross_reason}"
+
+    # Keep the live safety gates (kill-switch/daily-halt/one-per-asset/cooldown),
+    # scoped to the routed book; size authoritatively from the kernel
+    # (enforce_risk_caps=False keeps gates, drops the cap).
+    allowed, alloc_risk, why = can_open(asset, direction, strat_id, execution_type="live", book=open_book, enforce_risk_caps=False)
     if not allowed:
         return f"BLOCKED {asset} live — {why}"
     size_fraction = float(pos.get("size_fraction") or 0.0)
@@ -5869,17 +5956,31 @@ def _kernel_open_live_trade(strat_id: str, strat: dict, action, *, sizing_equity
         "take_profit": target_price, "take_profit_price": target_price,
         "direction": direction, "source": "scanner.kernel.live",
     }
+    # Pass book only when direction books are active so the books-off path keeps the
+    # exact prior signature (book stays NULL = master wallet).
+    _open_extra = {"book": open_book} if open_book is not None else {}
     try:
-        trade_id = _open_trade_db(strat_id, asset, direction, ref_price, units, risk_pct, float(leverage), signal_data, execution_type="live")
+        trade_id = _open_trade_db(strat_id, asset, direction, ref_price, units, risk_pct, float(leverage), signal_data, execution_type="live", **_open_extra)
     except sqlite3.IntegrityError:
         return None  # duplicate-open guard (concurrent scan / pending reconcile)
     try:
-        register(trade_id, asset, direction, strat_id, risk_pct, ref_price, execution_type="live")
+        register(trade_id, asset, direction, strat_id, risk_pct, ref_price, execution_type="live", **_open_extra)
     except Exception:
         pass
-    _execute_direct("open", trade_id, strat_id, asset, direction, units, ref_price,
-                    stop_loss=stop_price, take_profit=target_price, leverage=float(leverage))
-    return f"LIVE-KERNEL-OPEN {asset} {direction} x{units}"
+    # LIVE-1 / DIRECTION-BOOKS-2: a failed real open must NOT leave a phantom OPEN
+    # trade holding a risk slot (and later book a fabricated CLOSE). Wrap the
+    # exchange call and, on failure, hand it to _report_execution_failure — which
+    # self-heals the unfilled OPEN (marks it FAILED, frees the slot) and alerts the
+    # operator — mirroring the legacy _open_via_execution path.
+    try:
+        _execute_direct("open", trade_id, strat_id, asset, direction, units, ref_price,
+                        stop_loss=stop_price, take_profit=target_price, leverage=float(leverage))
+    except Exception as exc:
+        log.error("[%s] live kernel open failed for %s trade=%s: %s", strat_id, asset, trade_id, exc)
+        _report_execution_failure(strat_id, "open", trade_id, str(exc))
+        return f"LIVE-KERNEL-OPEN {asset} FAILED — {exc}"
+    _book_tag = f" [{open_book}]" if open_book and open_book != books.MAIN_BOOK else ""
+    return f"LIVE-KERNEL-OPEN {asset} {direction} x{units}{_book_tag}"
 
 
 def _kernel_close_live_trade(strat_id: str, strat: dict, action) -> str | None:
@@ -5897,7 +5998,23 @@ def _kernel_close_live_trade(strat_id: str, strat: dict, action) -> str | None:
     ref_price = _coerce_positive_float(trade.get("exit_price")) or 0.0
     reason = str(trade.get("exit_reason") or "signal")
 
-    result = _execute_direct("close", trade_id, strat_id, asset, direction, size, ref_price, close_reason=reason)
+    # DB-4 / RACE-2: a prior live close that left no confirmed fill is marked
+    # pending_close_reconcile but stays OPEN for the periodic reconcile sweep to
+    # finalize. Do NOT re-issue a fresh reduce-only close every scan (and don't let
+    # a concurrent scan double-fire) — hold it. (Mirror of the legacy guard.)
+    if _trade_pending_close_reconcile(row):
+        return f"LIVE-KERNEL-CLOSE {asset} pending-reconcile (held)"
+
+    # LIVE-2: a failed real reduce-only close must surface to the operator and keep
+    # the trade OPEN for retry, mirroring the legacy _close_via_execution path (the
+    # kernel path previously let the exception propagate to a bare log.error with no
+    # operator notification).
+    try:
+        result = _execute_direct("close", trade_id, strat_id, asset, direction, size, ref_price, close_reason=reason)
+    except Exception as exc:
+        log.error("[%s] live kernel close failed for %s trade=%s: %s", strat_id, asset, trade_id, exc)
+        _report_execution_failure(strat_id, "close", trade_id, str(exc))
+        return f"LIVE-KERNEL-CLOSE {asset} FAILED — {exc} (held for retry)"
     state = str(result.get("_close_reconcile_state") or "").strip().lower() if isinstance(result, dict) else ""
     if state in ("pending", "partial"):
         return f"LIVE-KERNEL-CLOSE {asset} {state}"
@@ -6094,6 +6211,33 @@ def manage_positions_via_kernel(strat_id: str, strat: dict, *, account_equity=No
     close_applier = _kernel_close_live_trade if is_live else _kernel_close_paper_trade
     label = "live" if is_live else "paper"
 
+    # DATA-2 / LIVE-5 / FREEZE-2: the kernel execution path (the DEFAULT for paper
+    # AND live real fills) had no bar-staleness gate — only the legacy signal path
+    # did (DI-1). On a feed stall (cache serving old candles, an outage on thaw) it
+    # could OPEN a real order off an hours-old signal bar. Fail CLOSED on NEW entries
+    # when the last closed bar is stale; still manage (close/refresh/orphan) existing
+    # positions so a live position can always be exited.
+    data_is_stale = False
+    try:
+        _last_bar = df.index[-1]
+        _last_ts = float(_last_bar.timestamp()) if hasattr(_last_bar, "timestamp") else None
+    except Exception:
+        _last_ts = None
+    if _last_ts is not None:
+        _bar_secs = _TIMEFRAME_SECONDS.get(timeframe, 3600)
+        try:
+            _max_bars = float((kv_get("forven:settings", {}) or {}).get("scanner_max_candle_staleness_bars", 2) or 2)
+        except Exception:
+            _max_bars = 2.0
+        _age_since_close = get_now().timestamp() - (_last_ts + _bar_secs)
+        if _max_bars > 0 and _age_since_close > _max_bars * _bar_secs:
+            data_is_stale = True
+            log.warning(
+                "[%s] kernel %s: last closed %s bar is %.0fs past close (> %g bars) — "
+                "blocking NEW entries (stale feed), still managing existing positions",
+                strat_id, label, timeframe, _age_since_close, _max_bars,
+            )
+
     # A LATE hop-in must enter at the REAL current price/time — NOT the last CLOSED bar,
     # whose close is the price as of its END (up to a full timeframe stale: a 4h bar closed
     # at 16:00 is ~hours old by an 18:45 scan) and whose open timestamp would mis-place the
@@ -6131,6 +6275,25 @@ def manage_positions_via_kernel(strat_id: str, strat: dict, *, account_equity=No
     for a in actions_plan:
         try:
             if a.kind == "open":
+                if data_is_stale:
+                    out.append(f"BLOCKED {asset} {label} open — stale candle data (feed may be down)")
+                    continue
+                if not is_live:
+                    # RISK-1: honor operator STOP / kill-switch / daily-loss-halt /
+                    # cooldown on the now-default kernel paper open path (the legacy
+                    # paper path gates via can_open; this one did not). Backfill opens
+                    # (historical completed trades) go straight to the applier, NOT
+                    # through this branch, so the recorded paper history stays faithful.
+                    try:
+                        from forven.exchange.risk import can_open as _can_open_gate
+                        _g_ok, _g_alloc, _g_why = _can_open_gate(
+                            asset, a.direction, strat_id, execution_type="paper", enforce_risk_caps=False,
+                        )
+                    except Exception:
+                        _g_ok, _g_why = True, ""  # a transient gate-read error must not wedge paper management
+                    if not _g_ok:
+                        out.append(f"BLOCKED {asset} paper open — {_g_why}")
+                        continue
                 if is_live and live_equity_unavailable:
                     log.warning(
                         "[%s] kernel live: real account equity unavailable — skipping OPEN %s "
@@ -6808,11 +6971,42 @@ def _build_signal_diagnostics(
     return diagnostics
 
 
+# RACE-1: in-process single-flight guard for the EXECUTION phase of a scan.
+# run_scan is invoked from several callers that share ONE process (the scheduler
+# thread, the API request thread, control_plane ops, the CLI), with no
+# coordination — two execution scans could interleave on the same OPEN trade and
+# each compute open/close/refresh actions for it. Serialize so only one execution
+# scan runs at a time; a concurrent trigger degrades to a signal-only scan rather
+# than racing. (Cross-PROCESS overlap is additionally bounded by the scheduler's
+# per-job lock and the reduce-only / unique-open-index safety nets.)
+_RUN_SCAN_EXEC_LOCK = threading.Lock()
+
+
 def run_scan(*, execute_positions: bool = True) -> dict:
     """Run strategy evaluation, optionally applying execution actions.
 
     `execute_positions=False` performs a signal-only scan that does not open/close trades.
+
+    The EXECUTION phase is single-flighted (RACE-1): if another execution scan is
+    already running in this process, this call degrades to signal-only so two scans
+    never interleave on the same open position.
     """
+    if not (execute_positions and _scanner_execution_enabled()):
+        return _run_scan_impl(execute_positions=execute_positions)
+    if not _RUN_SCAN_EXEC_LOCK.acquire(blocking=False):
+        log.warning(
+            "run_scan: an execution scan is already in progress in this process — "
+            "running SIGNAL-ONLY this tick to avoid interleaving on open positions."
+        )
+        return _run_scan_impl(execute_positions=False)
+    try:
+        return _run_scan_impl(execute_positions=True)
+    finally:
+        _RUN_SCAN_EXEC_LOCK.release()
+
+
+def _run_scan_impl(*, execute_positions: bool = True) -> dict:
+    """Inner scan body. Call ``run_scan`` (the single-flight wrapper) instead."""
     init_db()
     requested_execution = bool(execute_positions)
     execution_allowed = bool(requested_execution and _scanner_execution_enabled())

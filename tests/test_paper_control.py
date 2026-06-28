@@ -361,6 +361,22 @@ def test_live_open_respects_gate(forven_db, monkeypatch):
     assert exc.value.status_code == 409
 
 
+def test_live_open_requires_protective_stop(forven_db, monkeypatch):
+    # RISK-3: a manual LIVE open with no stop is a naked, unbounded-loss real
+    # position — refuse it (the gate passes, so this is the stop guard firing).
+    from fastapi import HTTPException
+
+    _insert_paper_strategy()
+    _set_mid("BTC", 100.0)
+    monkeypatch.setattr(pc, "_session_is_live", lambda session: True)
+    monkeypatch.setattr(pc.risk_mod, "can_open", lambda *a, **k: (True, 0.01, "ok"))
+
+    with pytest.raises(HTTPException) as exc:
+        pc.open_manual_position(STRATEGY_ID, direction="long", size=1.0)  # no stop_loss_price
+    assert exc.value.status_code == 400
+    assert "protective stop" in exc.value.detail.lower()
+
+
 def test_live_open_places_market_order_and_registers(forven_db, monkeypatch):
     import forven.exchange.hyperliquid as hl
 
@@ -446,7 +462,8 @@ def test_live_open_routes_to_short_book(forven_db, monkeypatch):
 
     monkeypatch.setattr(hl, "market_order", _fake_market)
 
-    pc.open_manual_position(STRATEGY_ID, direction="short", size=1.0)
+    # A live position requires a protective stop (RISK-3); a short's stop sits above entry.
+    pc.open_manual_position(STRATEGY_ID, direction="short", size=1.0, stop_loss_price=110.0)
 
     assert seen["vault"] == "0xSHORT"  # routed to the short sub-account
     from forven.db import get_db

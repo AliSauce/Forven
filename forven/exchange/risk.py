@@ -2195,9 +2195,48 @@ def reconcile_exchange_positions(
                 db_by_asset.setdefault(asset, []).append({"id": adopted["trade_id"], "asset": asset})
                 continue
 
+            # LIVE-EXCHANGE-RECONCILE-1: a real exchange position with no matching SQLite
+            # trade that appears DURING a run (an open whose DB insert crashed, a
+            # partial-fill survivor, a manual position) must NOT sit naked until the next
+            # restart's adopt pass. Even when we do NOT adopt it here (periodic pass,
+            # adopt_missing_in_sqlite False), place/repair an EMERGENCY protective stop so
+            # an unmanaged orphan can't ride to liquidation. Tracking/adoption is still
+            # surfaced as a discrepancy for operator review.
+            _orphan_protection = None
+            try:
+                _orphan_repair_kwargs = {"account_address": account_address} if account_address else {}
+                _orphan_protection, open_orders = _repair_position_protection(
+                    position,
+                    matched_trade=None,
+                    open_orders=open_orders,
+                    price_map=price_map,
+                    testnet=testnet,
+                    **_orphan_repair_kwargs,
+                )
+            except Exception as _orphan_prot_exc:
+                log.error(
+                    "Could not place emergency protective stop on orphan %s %s: %s",
+                    position.get("direction"), asset, _orphan_prot_exc,
+                )
+            _orphan_placed = (_orphan_protection or {}).get("placed_order_id") if isinstance(_orphan_protection, dict) else None
+            _orphan_prot_status = (_orphan_protection or {}).get("status") if isinstance(_orphan_protection, dict) else None
+            if _orphan_placed:
+                resolved_actions.append({
+                    "type": "protection_restored",
+                    "asset": asset,
+                    "trade_id": None,
+                    "action": "placed_emergency_stop_on_untracked_orphan",
+                    "stop_order_id": _orphan_placed,
+                    "stop_source": (_orphan_protection or {}).get("stop_source"),
+                    "stop_price": (_orphan_protection or {}).get("stop_price"),
+                })
             discrepancies.append({
                 "type": "missing_in_sqlite",
-                "details": f"Exchange has {position['direction']} {asset} size={position['size']} but no matching SQLite trade",
+                "details": (
+                    f"Exchange has {position['direction']} {asset} size={position['size']} but no matching "
+                    f"SQLite trade — emergency protective stop "
+                    f"{'placed' if _orphan_placed else (_orphan_prot_status or 'attempted')} (not adopted)"
+                ),
             })
 
     if ghost_trades:
@@ -2814,29 +2853,63 @@ def _update_equity_locked(account_equity: float, source: str) -> dict:
         state["daily_loss_halt_date"] = None
 
     prev_source = state.get("equity_source", "paper")
+
+    # DAEMON-EQUITY-FEED-RISK-STATE-1: in a LIVE session, a transient PAPER-source
+    # fallback (exchange briefly unreachable, daemon falls back to a paper equity)
+    # must NOT mutate the live risk state. Otherwise the subsequent paper->live
+    # "recovery" transition below re-baselines the HWM and CLEARS an already-fired
+    # daily-loss halt — silently lifting a halt the operator believes is in force.
+    # Ignore the sample entirely when the execution MODE is live but the sample is
+    # paper-sourced (a genuine paper-mode session keeps processing paper samples).
+    try:
+        from forven.config import get_execution_mode as _get_execution_mode
+        _exec_mode = str(_get_execution_mode() or "paper").strip().lower()
+    except Exception:
+        _exec_mode = "paper"
+    if source == "paper" and prev_source != "paper" and _exec_mode != "paper":
+        log.warning(
+            "Ignoring transient paper-source equity sample during a live session "
+            "(would flap the source basis and re-baseline/clear the kill-switch); risk state unchanged."
+        )
+        log_activity(
+            "warning", "risk",
+            "Ignored a transient paper-source equity reading during a live session; "
+            "kill-switch / daily-halt / high-water mark unchanged.",
+        )
+        _save_risk_state(state, best_effort=True)
+        return _rejected_equity_result(state, "transient paper sample in live session")
+
     state["equity_source"] = source
     hwm = state.get("high_water_mark", 0.0)
 
-    # PNL-1: re-baseline on ANY paper -> non-paper transition, not just the
-    # literal "exchange" source. The direction-books work introduced a new
-    # live source string ("books_aggregate"); a hardcoded == "exchange" check
-    # silently missed it, leaving the paper HWM (~$10k) in place against a live
-    # books equity (~$675) and arming a false kill-switch/daily-halt for the
-    # whole soak. Any real (non-paper) source must rebaseline.
-    if prev_source == "paper" and source != "paper" and hwm > 0:
+    # Re-baseline the HWM (and the daily-loss denominator) on ANY change of the real
+    # equity-source BASIS:
+    #   * PNL-1: paper -> non-paper (live just connected) — a hardcoded == "exchange"
+    #     check missed the "books_aggregate" source, leaving the ~$10k paper HWM
+    #     against ~$675 live equity and arming a false kill-switch.
+    #   * RISK-STATE-2: live <-> live basis change (e.g. books_aggregate <-> exchange
+    #     when books are toggled) sums a DIFFERENT set of accounts, so a stale HWM
+    #     from the other basis computes a phantom ~100% drawdown that force-flattens
+    #     live positions. Re-baseline the denominator.
+    # The daily-loss HALT is cleared ONLY on the initial paper->live connect; a
+    # live<->live basis flip must NOT lift an already-fired halt (RISK-STATE-1).
+    _initial_live_connect = (prev_source == "paper" and source != "paper")
+    _live_basis_changed = (source != prev_source and source != "paper" and prev_source != "paper")
+    if (_initial_live_connect or _live_basis_changed) and hwm > 0:
         log.info(
-            "Equity source changed: paper -> %s. "
-            "Re-baselining HWM ($%.2f -> $%.2f) and daily tracking.",
-            source, hwm, account_equity,
+            "Equity source basis changed: %s -> %s. Re-baselining HWM ($%.2f -> $%.2f) and daily tracking%s.",
+            prev_source, source, hwm, account_equity,
+            " (initial live connect — clearing any paper halt)" if _initial_live_connect else " (halt preserved)",
         )
         log_activity("info", "risk", (
-            f"Live equity connected ({source}) - source changed from paper. "
+            f"Equity source changed {prev_source} -> {source}. "
             f"HWM re-baselined: ${hwm:,.2f} -> ${account_equity:,.2f}."
         ))
         hwm = account_equity
         state["high_water_mark"] = hwm
-        state["daily_loss_halt"] = False
-        state["daily_loss_halt_date"] = None
+        if _initial_live_connect:
+            state["daily_loss_halt"] = False
+            state["daily_loss_halt_date"] = None
         kv_set_best_effort(
             sim_kv_key("daily_risk"),
             {"date": today, "start_equity": account_equity},

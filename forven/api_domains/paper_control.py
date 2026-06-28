@@ -559,6 +559,16 @@ def _live_open(
     if not allowed:
         raise HTTPException(status_code=409, detail=f"Blocked by risk gate: {reason}")
 
+    # RISK-3: a real live position MUST carry a protective stop. The automated
+    # engine refuses a stopless open (_execute_direct raises "refusing to open
+    # without a protective stop"); a hand-opened naked live position is an
+    # unbounded-loss hole, so refuse it here too instead of placing a bare
+    # market_order with stop_loss_price=None. (Checked after the risk gate so the
+    # kill-switch / long-only / halt blocks still take precedence.)
+    _parsed_stop = _coerce_optional_float(stop_loss_price)
+    if _parsed_stop is None or _parsed_stop <= 0:
+        raise HTTPException(status_code=400, detail="A live position requires a protective stop_loss_price.")
+
     testnet = _live_testnet()
     from forven.exchange.hyperliquid import get_account_value, market_order
 
@@ -580,6 +590,13 @@ def _live_open(
         )
     if resolved_size is None or resolved_size <= 0:
         raise HTTPException(status_code=400, detail="Computed position size is zero.")
+
+    # H8 (RISK-3): re-assert the trading halt at EXECUTION time. can_open checked it
+    # above, but the kill-switch / daily-loss halt may have fired in the window
+    # since — the automated _execute_direct path does the same re-assert.
+    _halt_ok, _halt_reason = risk_mod.is_trading_allowed()
+    if not _halt_ok:
+        raise HTTPException(status_code=409, detail=f"Trading halted — {_halt_reason}")
 
     side = "buy" if direction == "long" else "sell"
     try:

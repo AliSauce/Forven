@@ -1199,6 +1199,18 @@ def _check_paper_duration(strategy_id: str) -> tuple[bool, str]:
         return False, "Could not parse stage timestamp"
 
 
+# PROMOTION-GATE-PARITY-2/3: the paper→live gate compounds per-trade pnl as an
+# equity-fraction (compute_live_metrics: equity *= 1+pnl). Only KERNEL-managed
+# faithful closes write pnl_pct as a net equity-fraction (flagged
+# pnl_is_equity_fraction); legacy/manual/converge closes write a leverage-MARGIN
+# return (~1/size_fraction larger) and are explicitly flagged non-parity ("must not
+# be promoted on these numbers"). Counting ONLY equity-fraction parity rows stops the
+# gate from compounding mixed units or promoting on non-parity legacy fills. Requires
+# a paper re-baseline (reset + re-open) so books are kernel-managed; on a non-rebased
+# book this fails CLOSED (too few parity rows -> no promotion), the safe direction.
+_PARITY_PNL_FILTER = " AND json_extract(signal_data, '$.pnl_is_equity_fraction') = 1"
+
+
 def _check_paper_trades(strategy_id: str) -> tuple[bool, str]:
     """Check if strategy has enough closed paper trades."""
     config = load_pipeline_config()
@@ -1219,6 +1231,7 @@ def _check_paper_trades(strategy_id: str) -> tuple[bool, str]:
             "WHERE COALESCE(strategy_id, strategy) = ? "
             "AND status = 'CLOSED' AND pnl_pct IS NOT NULL "
             "AND LOWER(COALESCE(execution_type, '')) LIKE 'paper%'"
+            + _PARITY_PNL_FILTER
             + where_since,
             tuple(params),
         ).fetchone()
@@ -1245,6 +1258,7 @@ def _check_paper_return(strategy_id: str) -> tuple[bool, str]:
             "WHERE COALESCE(strategy_id, strategy) = ? "
             "AND status = 'CLOSED' AND pnl_pct IS NOT NULL "
             "AND LOWER(COALESCE(execution_type, '')) LIKE 'paper%'"
+            + _PARITY_PNL_FILTER
             + where_since,
             tuple(params),
         ).fetchall()
@@ -1276,6 +1290,7 @@ def _check_paper_drawdown(strategy_id: str) -> tuple[bool, str]:
             "WHERE COALESCE(strategy_id, strategy) = ? "
             "AND status = 'CLOSED' AND pnl_pct IS NOT NULL "
             "AND LOWER(COALESCE(execution_type, '')) LIKE 'paper%'"
+            + _PARITY_PNL_FILTER
             + where_since,
             tuple(params),
         ).fetchall()
@@ -3716,6 +3731,7 @@ def _evaluate_paper_gate(strategy_id: str, config: dict) -> tuple[bool, str]:
             "AND status = 'CLOSED' "
             "AND pnl_pct IS NOT NULL "
             "AND LOWER(COALESCE(execution_type, '')) LIKE 'paper%'"
+            + _PARITY_PNL_FILTER
             + where_since,
             tuple(params),
         ).fetchall()

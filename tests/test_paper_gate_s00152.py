@@ -4,7 +4,7 @@ import json
 from datetime import datetime, timezone, timedelta
 
 from forven.db import get_db
-from forven.policy import _evaluate_paper_gate, DEFAULT_PIPELINE_CONFIG
+from forven.policy import _evaluate_paper_gate, _check_paper_trades, _check_paper_return, DEFAULT_PIPELINE_CONFIG
 
 
 def _insert_strategy(conn, sid, *, metrics=None, stage_changed_at=None):
@@ -20,16 +20,59 @@ def _insert_strategy(conn, sid, *, metrics=None, stage_changed_at=None):
 
 
 def _insert_paper_trades(conn, sid, pnls, *, stage_changed_at=None):
-    """Insert closed paper trades for a strategy."""
+    """Insert closed paper trades for a strategy.
+
+    Rows carry pnl_is_equity_fraction=true (the kernel-managed parity marker the
+    promotion gate now requires) so these represent valid equity-fraction paper
+    trades — see PROMOTION-GATE-PARITY-2/3 / policy._PARITY_PNL_FILTER.
+    """
     base = datetime.now(timezone.utc) - timedelta(days=20)
     for i, pnl in enumerate(pnls):
         closed_at = (base + timedelta(hours=i)).isoformat()
         conn.execute(
             "INSERT INTO trades (id, strategy_id, strategy, asset, direction, status, pnl_pct, "
-            "execution_type, closed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (f"t-{sid}-{i}", sid, sid, "BTC/USDT", "long", "CLOSED", pnl, "paper", closed_at),
+            "execution_type, closed_at, signal_data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (f"t-{sid}-{i}", sid, sid, "BTC/USDT", "long", "CLOSED", pnl, "paper", closed_at,
+             '{"pnl_is_equity_fraction": true}'),
         )
     conn.commit()
+
+
+def _insert_legacy_margin_trades(conn, sid, pnls, *, flag=None):
+    """Insert closed paper rows WITHOUT the equity-fraction parity flag (legacy /
+    margin-scale / converge artifacts the gate must exclude)."""
+    base = datetime.now(timezone.utc) - timedelta(days=19)
+    sd = json.dumps(flag) if flag else None
+    for i, pnl in enumerate(pnls):
+        conn.execute(
+            "INSERT INTO trades (id, strategy_id, strategy, asset, direction, status, pnl_pct, "
+            "execution_type, closed_at, signal_data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (f"legacy-{sid}-{i}", sid, sid, "BTC/USDT", "long", "CLOSED", pnl, "paper",
+             (base + timedelta(hours=i)).isoformat(), sd),
+        )
+    conn.commit()
+
+
+def test_gate_excludes_non_equity_fraction_rows(forven_db):
+    """PROMOTION-GATE-PARITY-2/3: only kernel equity-fraction paper rows (flagged
+    pnl_is_equity_fraction) count toward the promotion gate. Legacy/margin-scale rows
+    must NOT pad the sample or compound as (much larger) equity returns."""
+    with get_db() as conn:
+        _insert_strategy(conn, "s-mixed", metrics={"profit_factor": 3.0})
+        _insert_paper_trades(conn, "s-mixed", [0.01] * 12)  # 12 valid equity-fraction rows
+        # 5 legacy margin-scale rows + a converge artifact — none flagged.
+        _insert_legacy_margin_trades(conn, "s-mixed", [0.30] * 5, flag={"non_vectorizable_legacy": True})
+
+    # Sample counts ONLY the 12 flagged rows (not 17).
+    _, msg = _check_paper_trades("s-mixed")
+    assert "12/" in msg, msg
+
+    # And the excluded +30% margin rows can't inflate the compounded paper return.
+    passed, ret_msg = _check_paper_return("s-mixed")
+    assert passed  # the 12 small positive equity-fraction trades are net positive
+    # 12 * +1% compounded ≈ +12.7%, NOT the ~3700% five +30% margin rows would add.
+    pct = float(ret_msg.split(":")[1].strip().rstrip("%"))
+    assert pct < 50.0, ret_msg
 
 
 # ---------------------------------------------------------------------------
