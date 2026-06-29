@@ -177,15 +177,20 @@
 		}
 	}
 
-	function compareResults(a: ResultWithExtras, b: ResultWithExtras): number {
-		if (sortBy === 'strategy' || sortBy === 'symbol' || sortBy === 'timeframe' || sortBy === 'type') {
-			const compared = stringSortValue(a, sortBy).localeCompare(stringSortValue(b, sortBy));
-			return sortDirection === 'asc' ? compared : -compared;
+	function compareResults(
+		a: ResultWithExtras,
+		b: ResultWithExtras,
+		field: SortField,
+		direction: SortDirection
+	): number {
+		if (field === 'strategy' || field === 'symbol' || field === 'timeframe' || field === 'type') {
+			const compared = stringSortValue(a, field).localeCompare(stringSortValue(b, field));
+			return direction === 'asc' ? compared : -compared;
 		}
-		const av = numericSortValue(a, sortBy);
-		const bv = numericSortValue(b, sortBy);
-		if (av < bv) return sortDirection === 'asc' ? -1 : 1;
-		if (av > bv) return sortDirection === 'asc' ? 1 : -1;
+		const av = numericSortValue(a, field);
+		const bv = numericSortValue(b, field);
+		if (av < bv) return direction === 'asc' ? -1 : 1;
+		if (av > bv) return direction === 'asc' ? 1 : -1;
 		return Date.parse(b.created_at) - Date.parse(a.created_at);
 	}
 
@@ -196,7 +201,10 @@
 		.filter((result) => symbolFilter === 'all' || String(result.symbol || '') === symbolFilter)
 		.filter((result) => typeFilter === 'all' || resultType(result) === typeFilter)
 		.filter((result) => !normalizedSearch || resultHaystack(result).includes(normalizedSearch));
-	$: sortedResults = [...filteredResults].sort(compareResults);
+	// Reference sortBy/sortDirection directly so Svelte tracks them as dependencies
+	// of this reactive sort — they are read inside compareResults, which the compiler
+	// does not trace into, so the table would otherwise never re-sort on header click.
+	$: sortedResults = [...filteredResults].sort((a, b) => compareResults(a, b, sortBy, sortDirection));
 	$: loadedSummary = loading ? 'Loading...' : `${sortedResults.length} of ${results.length} loaded`;
 </script>
 
