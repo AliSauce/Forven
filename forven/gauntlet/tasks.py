@@ -1437,6 +1437,39 @@ def run_paper_promotion_gate(workflow: dict[str, Any], step: dict[str, Any]) -> 
             "transition": transition,
             "gauntlet_status": status,
         }
+    _blocked_text = str(
+        transition.get("blocked_reason") or transition.get("reason") or transition.get("message") or ""
+    ).lower()
+    if (
+        reason_code in {"stale_validation", "artifacts_pending"}
+        or "ordering violation" in _blocked_text
+        or "re-run after optimization" in _blocked_text
+        or "stale validation" in _blocked_text
+    ):
+        # PENDING RE-VALIDATION, not a merit failure. The gauntlet gate's artifact-
+        # ordering / freshness check fails when a validation (walk_forward) is older
+        # than the latest optimization — i.e. it ran in the transient window after
+        # optimization completed but before walk_forward re-ran on the new params. It
+        # self-resolves the moment the validation re-runs, so RETRY on a later tick;
+        # NEVER drain to a terminal failed_gate (which would auto-archive a genuinely-
+        # passing strategy via demote_failed_gate_strategies — the S03523 case, where
+        # the gate burned its retries in the ~20-min gap before walk_forward re-ran).
+        # reason_code is in engine._NO_DRAIN_REASON_CODES so requeue retries it on the
+        # bounded cadence; the 2-day un-promotable hygiene backstop catches any genuine
+        # deadlock where the validation truly never re-runs.
+        return {
+            "status": "blocked_runtime",
+            "message": str(
+                transition.get("blocked_reason")
+                or transition.get("reason")
+                or transition.get("message")
+                or "validation pending re-run after optimization"
+            ),
+            "retryable": True,
+            "reason_code": reason_code or "stale_validation",
+            "transition": transition,
+            "gauntlet_status": status,
+        }
     return {
         "status": "failed_gate",
         "message": str(transition.get("reason") or transition.get("blocked_reason") or transition.get("message") or "paper promotion did not complete"),

@@ -41,7 +41,17 @@ _GATE_CONTENTION_BACKOFF_MINUTES = 10.0
 #     ingested; an async backfill is in flight (dataeng.coverage.ensure_coverage).
 #     Draining here would archive a strategy for a transient DATA gap, not a quality
 #     verdict. It self-resolves once the data lands (ensure_coverage returns "ready").
-_NO_DRAIN_REASON_CODES = {"gate_contention", "awaiting_data_backfill"}
+#   * ``stale_validation`` / ``artifacts_pending`` — the gauntlet gate's artifact-
+#     ordering / freshness check fails when a validation (walk_forward) is older than
+#     the latest optimization, i.e. it just needs to RE-RUN. This self-resolves once
+#     the validation re-runs; draining here archived a passing strategy mid-re-
+#     validation (the S03523 walk_forward-before-optimization case).
+_NO_DRAIN_REASON_CODES = {
+    "gate_contention",
+    "awaiting_data_backfill",
+    "stale_validation",
+    "artifacts_pending",
+}
 
 # --- Quality-aware visitation -------------------------------------------------
 # When there are MORE active workflows than a tick's visit budget (the common
