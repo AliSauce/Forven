@@ -1494,8 +1494,27 @@ async def _run_risk_cycle() -> dict:
 
 
 async def _run_tick(state: dict, prices: dict[str, float], source: str, last_reconcile: list[float]) -> None:
-    """One daemon tick: publish prices, enforce risk, reconcile periodically."""
+    """One daemon tick: publish prices FIRST (fresh), then enforce risk, reconcile periodically."""
     now = time.time()
+
+    # PRICE-FRESHNESS: publish the snapshot IMMEDIATELY, before the (possibly slow) risk cycle and
+    # liquidation reads. publish_price_snapshot stamps updated_at at PUBLISH time, so doing it at
+    # the END of a slow tick stamped a now-stale price as fresh — the consumers' 120s age gate is
+    # blind to that (a ~6-min-old mark read as ~3s old, which filled a paper short ~$80 off the
+    # candle). Publishing first keeps the value contemporaneous with its timestamp, and if a tick
+    # DOES stall the timestamp simply ages (so the gate can finally see the staleness).
+    snapshot = await _to_thread_with_timeout(
+        "daemon.publish_price_snapshot",
+        PRICE_SNAPSHOT_TIMEOUT_SECONDS,
+        publish_price_snapshot,
+        prices,
+        source,
+    )
+    if not isinstance(snapshot, dict):
+        snapshot = {"prices": prices}
+    state["last_prices"] = dict(snapshot.get("prices") or prices)
+    state["last_price_source"] = source
+    state["last_tick_ts"] = now
 
     risk_snapshot = await _run_risk_cycle()
 
@@ -1526,19 +1545,7 @@ async def _run_tick(state: dict, prices: dict[str, float], source: str, last_rec
     # Backward compatibility with legacy UI that still reads scan_count.
     state["scan_count"] = state["tick_count"]
     state["last_scan"] = _iso_now()
-    state["last_price_source"] = source
-    state["last_tick_ts"] = now
 
-    snapshot = await _to_thread_with_timeout(
-        "daemon.publish_price_snapshot",
-        PRICE_SNAPSHOT_TIMEOUT_SECONDS,
-        publish_price_snapshot,
-        prices,
-        source,
-    )
-    if not isinstance(snapshot, dict):
-        snapshot = {"prices": prices}
-    state["last_prices"] = dict(snapshot.get("prices") or prices)
     if isinstance(risk_snapshot, dict):
         equity = risk_snapshot.get("equity")
         if isinstance(equity, (int, float)) and float(equity) > 0:
