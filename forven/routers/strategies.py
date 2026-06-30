@@ -405,6 +405,16 @@ def batch_transition_strategies(body: BatchTransitionBody):
     """
     from forven.brain import transition_stage
 
+    # An operator batch may force past the dethrone-approval / WIP / backtest-verification
+    # gates for ARCHIVE / reject / demote / lateral moves — the click is the approval. But a
+    # PROMOTION to a capital stage must STILL pass evaluate_promotion: transition_stage only
+    # runs the gate when force is False (brain.py), so a blanket force=True here would let any
+    # caller bulk-promote unvetted strategies straight to paper/live, bypassing the gate.
+    # Never force a promotion to a capital stage; those go through the gate and surface in
+    # ``failed`` with a blocked_reason if they don't qualify.
+    _CAPITAL_STAGES = {"paper", "paper_trading", "deployed", "live_graduated"}
+    _force = str(body.stage or "").strip().lower() not in _CAPITAL_STAGES
+
     succeeded: list[str] = []
     failed: list[dict] = []
     for sid in body.ids:
@@ -414,7 +424,7 @@ def batch_transition_strategies(body: BatchTransitionBody):
                 target_stage=body.stage,
                 reason=body.reason,
                 actor="ui",
-                force=True,
+                force=_force,
             )
             # transition_stage never raises for a *blocked* move (WIP cap,
             # approval-required, gate failure, …); it returns a dict whose
