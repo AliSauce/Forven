@@ -2196,6 +2196,7 @@ def _log_data_action_safe(action: str, message: str, **detail) -> None:
 
 _universe_lock = threading.Lock()
 _universe_cancel = threading.Event()
+_UNIVERSE_STATE_KV_KEY = "data:universe_seed_state"
 _universe_state: dict = {
     "running": False,
     "last_started_at": None,
@@ -2203,6 +2204,47 @@ _universe_state: dict = {
     "last_error": None,
     "progress": None,
 }
+_universe_state_loaded = False
+
+
+def _load_universe_state_locked() -> None:
+    """Seed last_started/result/error from KV once per process. A seed that was
+    RUNNING when the process died is surfaced as failed ('backend restarted')
+    instead of silently blanking — the seed is resumable, so restarting it is
+    always safe. Caller holds _universe_lock."""
+    global _universe_state_loaded
+    if _universe_state_loaded:
+        return
+    _universe_state_loaded = True
+    try:
+        from forven.db import kv_get
+
+        saved = kv_get(_UNIVERSE_STATE_KV_KEY, None)
+        if isinstance(saved, dict):
+            for key in ("last_started_at", "last_result", "last_error"):
+                if _universe_state.get(key) is None:
+                    _universe_state[key] = saved.get(key)
+            if saved.get("running") and not _universe_state.get("last_error"):
+                _universe_state["last_error"] = "backend restarted mid-seed — restart the seed (it resumes)"
+    except Exception:
+        pass
+
+
+def _persist_universe_state_locked() -> None:
+    try:
+        from forven.db import kv_set_best_effort
+
+        kv_set_best_effort(
+            _UNIVERSE_STATE_KV_KEY,
+            {
+                "running": bool(_universe_state.get("running")),
+                "last_started_at": _universe_state.get("last_started_at"),
+                "last_result": _universe_state.get("last_result"),
+                "last_error": _universe_state.get("last_error"),
+            },
+        )
+    except Exception:
+        pass
 
 
 def get_data_universe() -> dict:
@@ -2221,6 +2263,7 @@ def get_data_universe() -> dict:
         log.warning("get_data_universe plan failed: %s", exc)
         plan = []
     with _universe_lock:
+        _load_universe_state_locked()
         seed_state = dict(_universe_state)
     return {
         "registry_count": len(registry),
@@ -2244,10 +2287,12 @@ def post_seed_research_universe() -> dict:
     with _universe_lock:
         if _universe_state["running"]:
             raise HTTPException(status_code=409, detail="Universe seed already running")
+        _load_universe_state_locked()
         _universe_cancel.clear()
         _universe_state.update(
             {"running": True, "last_started_at": _now(), "last_result": None, "last_error": None, "progress": None}
         )
+        _persist_universe_state_locked()
 
     def _on_progress(done: int, total: int, symbol: str) -> None:
         with _universe_lock:
@@ -2260,10 +2305,12 @@ def post_seed_research_universe() -> dict:
             result = seed_research_universe(progress_cb=_on_progress, cancel_event=_universe_cancel)
             with _universe_lock:
                 _universe_state.update({"running": False, "last_result": result, "progress": None})
+                _persist_universe_state_locked()
         except Exception as exc:
             log.warning("Research universe seed failed: %s", exc)
             with _universe_lock:
                 _universe_state.update({"running": False, "last_error": str(exc), "progress": None})
+                _persist_universe_state_locked()
 
     threading.Thread(target=_run, daemon=True, name="universe-seed").start()
     return {"status": "started"}
