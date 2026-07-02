@@ -1815,6 +1815,27 @@ def _run_testing_step_impl(code_first: bool = True) -> dict:
 
         strat_id = candidate["id"]
         stage_name = _strategy_stage(candidate)
+
+        # V3-workflow-managed strategies are OFF LIMITS here. The workflow runs the
+        # full sweep-before-gate sequence (optimization -> confirmation -> re-validated
+        # WFA/MC/jitter -> paper_promotion_gate) and performs its own stage
+        # transitions; the fast-path/readiness promotion below judges whatever
+        # PRE-optimization evidence happens to exist, and a premature promotion then
+        # CANCELS the in-flight workflow via cancel_param_locked_workflows (S05427:
+        # promoted to paper off a boundary WFA while param_jitter was mid-run, real
+        # gauntlet never finished). Defer until the workflow reaches a terminal state.
+        try:
+            from forven.gauntlet.store import has_active_workflow_for_strategy
+
+            if has_active_workflow_for_strategy(strat_id):
+                deferred_ids = list(outcome.get("workflow_deferred_ids") or [])
+                deferred_ids.append(strat_id)
+                outcome["workflow_deferred_ids"] = deferred_ids
+                log.debug("Evolution: %s deferred to active gauntlet workflow", strat_id)
+                continue
+        except Exception as exc:
+            log.warning("Evolution: workflow-deferral check failed for %s: %s", strat_id, exc)
+
         strat_type = candidate.get("type", "")
         params = candidate.get("params", {})
         if isinstance(params, str):

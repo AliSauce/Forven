@@ -1125,6 +1125,73 @@ def _check_engine_artifact_freshness(strategy_id: str, required_types: list[str]
     return True, "All validation artifacts match the current engine version"
 
 
+_INFLIGHT_RESULT_STATUSES = {"pending", "queued", "running", "started", "submitted"}
+
+
+def _check_validation_in_flight(strategy_id: str, config: dict | None = None) -> tuple[bool, str]:
+    """Block promotion while any robustness test's NEWEST row is still running.
+
+    The verdict extractor rightly skips pending/running rows (they carry no
+    verdict), but that made an in-flight test indistinguishable from a test
+    that never ran — and absent tests are not enforced. S05427 passed the
+    ->paper gate at 21:19:04 while its param_jitter was mid-run; the FAIL
+    (pass_rate 0.0) landed at 21:19:24 and nothing re-checks after promotion.
+    A verdict that is seconds away is pending evidence, not absence — wait
+    for it. Checks ALL validation types (not just required_tests) because
+    ran-but-failed safety checks fire regardless of required membership.
+
+    Age-capped so an orphaned 'running' row (worker crash between the startup
+    cleanups in routers.robustness) cannot deadlock the gate forever.
+    """
+    gate = (config or {}).get("gauntlet", {}) if isinstance(config, dict) else {}
+    try:
+        max_age_minutes = float(gate.get("validation_inflight_max_age_minutes", 60) or 60)
+    except (TypeError, ValueError):
+        max_age_minutes = 60.0
+
+    in_flight: list[str] = []
+    now = datetime.now(timezone.utc)
+    with get_db() as conn:
+        for vt in _GAUNTLET_VALIDATION_TYPES:
+            row = conn.execute(
+                """SELECT metrics_json, config_json, created_at FROM backtest_results
+                   WHERE strategy_id = ?
+                     AND LOWER(TRIM(COALESCE(result_type, 'backtest'))) = ?
+                     AND (deleted_at IS NULL OR TRIM(COALESCE(deleted_at, '')) = '')
+                   ORDER BY datetime(created_at) DESC LIMIT 1""",
+                (strategy_id, vt),
+            ).fetchone()
+            if not row:
+                continue
+            metrics_blob = _parse_json_blob(row["metrics_json"], {})
+            config_blob = _parse_json_blob(row["config_json"], {})
+            if not isinstance(metrics_blob, dict):
+                metrics_blob = {}
+            if not isinstance(config_blob, dict):
+                config_blob = {}
+            status = str(metrics_blob.get("status") or config_blob.get("status") or "").strip().lower()
+            if status not in _INFLIGHT_RESULT_STATUSES:
+                continue
+            created: datetime | None = None
+            try:
+                created = datetime.fromisoformat(str(row["created_at"] or "").strip().replace("Z", "+00:00"))
+                if created.tzinfo is None:
+                    created = created.replace(tzinfo=timezone.utc)
+            except (TypeError, ValueError):
+                created = None
+            if created is not None and (now - created) > timedelta(minutes=max_age_minutes):
+                continue  # orphaned placeholder — treat as absent, like before
+            in_flight.append(vt)
+
+    if in_flight:
+        return (
+            False,
+            f"Validation in flight: {', '.join(in_flight)} still running — "
+            f"promotion deferred until the verdict lands",
+        )
+    return True, "No validation tests in flight"
+
+
 def _check_artifact_rows_exist(strategy_id: str, required_types: list[str]) -> tuple[bool, str]:
     """Verify each required validation has a persisted, passing verdict payload."""
     required = {_canonicalize_gauntlet_verdict_test(rt) for rt in required_types if str(rt or "").strip()}
@@ -2300,6 +2367,11 @@ def _extract_reason_code(reason_text: str) -> str:
     # before the quality-failure matches so they get their own (counter-exempt) codes.
     if "persisted optimization or walk-forward run" in text:
         return "artifacts_pending"
+    # A validation test is mid-run: its verdict is pending, not absent. Blocks
+    # the gate until the result lands (self-resolving within minutes) — never a
+    # merit failure, never feeds the repeated-failure archive counter.
+    if "validation in flight" in text:
+        return "validation_in_flight"
     # Engine-version staleness: the artifacts were produced by a DIFFERENT
     # backtest engine (stats-affecting change bumped BACKTEST_ENGINE_VERSION).
     # They are awaiting automatic re-validation — absence of current evidence,
@@ -2445,6 +2517,8 @@ _REPEATED_FAILURE_THRESHOLD = 5
 _EVIDENCE_ABSENCE_REASON_CODES = {
     "no_metrics_error",
     "artifacts_pending",
+    # A validation test still mid-run at gate time — verdict pending (S05427 race).
+    "validation_in_flight",
     "stale_validation",
     # Artifacts from a previous BACKTEST_ENGINE_VERSION awaiting automatic
     # re-validation (engine_provenance) — says nothing about edge quality.
@@ -3499,6 +3573,9 @@ def _evaluate_gauntlet_gate(strategy_id: str, config: dict) -> tuple[bool, str]:
             False,
             "Gauntlet requires at least one persisted optimization or walk-forward run before promotion to paper",
         )
+    inflight_ok, inflight_msg = _check_validation_in_flight(strategy_id, config)
+    if not inflight_ok:
+        return False, inflight_msg
     ordering_ok, ordering_msg = _check_artifact_ordering(strategy_id, list(required_tests) if required_tests else None)
     if not ordering_ok:
         return False, ordering_msg
@@ -3836,6 +3913,13 @@ def _evaluate_paper_gate(strategy_id: str, config: dict) -> tuple[bool, str]:
     row = _load_strategy_row_for_gate(strategy_id)
     if not row:
         return False, "Strategy not found"
+
+    # A robustness re-validation mid-run is pending evidence, not absence — its
+    # verdict may be seconds away and would be enforced by the strict battery
+    # below. Never grade the live-money gate on a partial evidence set.
+    inflight_ok, inflight_msg = _check_validation_in_flight(strategy_id, config)
+    if not inflight_ok:
+        return False, inflight_msg
 
     # STRICT-LIVE robustness battery: the criteria the lean paper gate demoted to
     # advisory (WFA degradation / absolute OOS Sharpe / OOS trade count, Monte-Carlo

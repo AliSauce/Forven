@@ -262,6 +262,27 @@ def get_latest_workflow_for_strategy(strategy_id: str) -> dict[str, Any] | None:
     return _row_to_dict(row)
 
 
+# Kept in sync with engine._TERMINAL_WORKFLOW_STATUSES (workflow-level, distinct
+# from the step-level sets in models.py).
+WORKFLOW_TERMINAL_STATUSES = frozenset({"passed", "failed_gate", "cancelled"})
+
+
+def has_active_workflow_for_strategy(strategy_id: str) -> bool:
+    """True when the strategy's latest gauntlet workflow is still non-terminal.
+
+    Used by drivers OUTSIDE the workflow engine (e.g. the evolution testing
+    step) to defer to an in-flight workflow instead of racing it: the workflow
+    owns the strategy's promotion gates end-to-end (sweep-before-gate), and a
+    parallel promotion both judges pre-optimization evidence and cancels the
+    workflow mid-run via cancel_param_locked_workflows.
+    """
+    workflow = get_latest_workflow_for_strategy(strategy_id)
+    if not workflow:
+        return False
+    status = str(workflow.get("status") or "").strip().lower()
+    return status not in WORKFLOW_TERMINAL_STATUSES
+
+
 def _rescrub_json_text(text: Any) -> Any:
     """Re-serialize stored JSON text whose payload predates the non-finite
     sanitizer (``Infinity``/``NaN`` literals are invalid JSON — JS JSON.parse

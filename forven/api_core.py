@@ -7327,39 +7327,12 @@ def _normalize_history_metrics(raw_metrics: object) -> dict:
     return normalized
 
 
-def _best_backtest_rank_key(metrics: dict, created_at: str) -> tuple[float, float, float, float, int, float]:
-    sharpe = _coerce_optional_float(metrics.get("sharpe_ratio"))
-    if sharpe is None:
-        sharpe = _coerce_optional_float(metrics.get("sharpe"))
-    total_return = _normalize_ratio_metric(
-        metrics.get("total_return_pct")
-        if metrics.get("total_return_pct") is not None
-        else metrics.get("total_return")
-    )
-    max_drawdown = _normalize_drawdown_metric(
-        metrics.get("max_drawdown_pct")
-        if metrics.get("max_drawdown_pct") is not None
-        else metrics.get("max_drawdown")
-    )
-    win_rate = _normalize_win_rate_metric(
-        metrics.get("win_rate")
-        if metrics.get("win_rate") is not None
-        else metrics.get("winRate")
-    )
-    total_trades = _coerce_optional_float(
-        metrics.get("total_trades")
-        if metrics.get("total_trades") is not None
-        else metrics.get("trades")
-    )
-    created_ts = _parse_timestamp(created_at)
-    return (
-        float(sharpe if sharpe is not None else float("-inf")),
-        float(total_return if total_return is not None else float("-inf")),
-        float(-(max_drawdown if max_drawdown is not None else float("inf"))),
-        float(win_rate if win_rate is not None else float("-inf")),
-        int(total_trades or 0),
-        float(created_ts.timestamp()) if created_ts else 0.0,
-    )
+def _best_backtest_rank_key(metrics: dict, created_at: str) -> tuple[int, float, float, float, float, int, float]:
+    # Single source of truth (incl. the degenerate-slice trade floor) lives in
+    # strategy_lifecycle; this module's enrichment is a legacy duplicate.
+    from forven.strategy_lifecycle import _best_backtest_rank_key as _lifecycle_rank_key
+
+    return _lifecycle_rank_key(metrics, created_at)
 
 
 def _enrich_strategy_rows_with_best_backtest(rows: list[dict]) -> list[dict]:
@@ -7371,6 +7344,17 @@ def _enrich_strategy_rows_with_best_backtest(rows: list[dict]) -> list[dict]:
     if not strategy_ids:
         return rows
 
+    from forven.strategy_lifecycle import _symbol_base_asset
+
+    market_by_strategy: dict[str, tuple[str, str]] = {
+        sid: (
+            _symbol_base_asset(row.get("symbol")),
+            str(row.get("timeframe") or "").strip().lower(),
+        )
+        for row in rows
+        if (sid := str(row.get("id") or "").strip())
+    }
+
     best_by_strategy: dict[str, dict] = {}
     with get_db() as conn:
         chunk_size = 500
@@ -7378,7 +7362,7 @@ def _enrich_strategy_rows_with_best_backtest(rows: list[dict]) -> list[dict]:
             chunk = strategy_ids[index:index + chunk_size]
             placeholders = ",".join(["?"] * len(chunk))
             sql = (
-                "SELECT strategy_id, result_id, metrics_json, created_at "
+                "SELECT strategy_id, result_id, symbol, timeframe, config_json, metrics_json, created_at "
                 "FROM backtest_results "
                 f"WHERE strategy_id IN ({placeholders}) "
                 "AND LOWER(TRIM(COALESCE(result_type, ''))) = 'backtest' "
@@ -7391,6 +7375,24 @@ def _enrich_strategy_rows_with_best_backtest(rows: list[dict]) -> list[dict]:
                     continue
                 metrics = _normalize_best_backtest_metrics(result_row["metrics_json"])
                 if not metrics:
+                    continue
+                # Scope "best" to the strategy's own market (see strategy_lifecycle —
+                # a cross-asset/timeframe screen run must not define the card).
+                from forven.strategy_lifecycle import (
+                    _extract_symbol_timeframe_from_config,
+                    _result_matches_strategy_market,
+                )
+
+                result_symbol = str(result_row["symbol"] or "").strip()
+                result_timeframe = str(result_row["timeframe"] or "").strip()
+                if not result_symbol or not result_timeframe:
+                    cfg_symbol, cfg_timeframe = _extract_symbol_timeframe_from_config(result_row["config_json"])
+                    result_symbol = result_symbol or (cfg_symbol or "")
+                    result_timeframe = result_timeframe or (cfg_timeframe or "")
+                strategy_market = market_by_strategy.get(sid, ("", ""))
+                if not _result_matches_strategy_market(
+                    strategy_market[0], strategy_market[1], result_symbol, result_timeframe
+                ):
                     continue
                 created_at = str(result_row["created_at"] or "")
                 rank_key = _best_backtest_rank_key(metrics, created_at)

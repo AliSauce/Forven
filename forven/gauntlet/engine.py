@@ -6,12 +6,17 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 from forven.gauntlet.models import RETRYABLE_STEP_STATUSES, STEP_TERMINAL_STATUSES
-from forven.gauntlet.store import init_gauntlet_schema, json_default, sanitize_non_finite
+from forven.gauntlet.store import (
+    WORKFLOW_TERMINAL_STATUSES,
+    init_gauntlet_schema,
+    json_default,
+    sanitize_non_finite,
+)
 
 log = logging.getLogger("forven.gauntlet.engine")
 
 # Workflow statuses that should NOT be advanced by the periodic tick.
-_TERMINAL_WORKFLOW_STATUSES = {"passed", "failed_gate", "cancelled"}
+_TERMINAL_WORKFLOW_STATUSES = WORKFLOW_TERMINAL_STATUSES
 
 # --- Transient-block retry economics ------------------------------------------------
 # The step loop ticks every ~2 minutes and ``claim_next_step`` increments
@@ -56,6 +61,9 @@ _NO_DRAIN_REASON_CODES = {
     "awaiting_data_backfill",
     "stale_validation",
     "artifacts_pending",
+    # A robustness test was still mid-run when the gate looked — the verdict
+    # lands within minutes, so retry on the bounded cadence, never drain.
+    "validation_in_flight",
     "stale_engine_artifacts",
 }
 

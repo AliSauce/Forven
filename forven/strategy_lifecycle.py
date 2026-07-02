@@ -638,7 +638,40 @@ def _normalize_history_metrics(raw_metrics: object) -> dict:
     return normalized
 
 
-def _best_backtest_rank_key(metrics: dict, created_at: str) -> tuple[float, float, float, float, int, float]:
+# A "best" run below this many trades is a degenerate slice, not evidence: a
+# 2-trade 100%-win window posts a capped Sharpe that outranks every honest
+# full-window run (S05427's card showed a 2-trade SOL/1d slice on an ETH/1h
+# strategy). Runs at/above the floor always outrank runs below it; below-floor
+# runs still rank among themselves so sparse strategies keep a display row.
+_BEST_BACKTEST_TRADE_FLOOR = 5
+
+
+def _symbol_base_asset(value: object) -> str:
+    """'ETH/USDT' / 'ETH/USDT:USDT' / 'eth' -> 'ETH'; GENERIC/empty -> ''."""
+    text = str(value or "").strip().upper()
+    if not text or text == "GENERIC":
+        return ""
+    return text.split(":", 1)[0].split("/", 1)[0].strip()
+
+
+def _result_matches_strategy_market(
+    strategy_base: str, strategy_timeframe: str, result_symbol: str, result_timeframe: str
+) -> bool:
+    """True when a backtest row belongs to the strategy's own market.
+
+    The best-backtest ranking compares runs across everything the strategy was
+    ever screened on; without this scope a cross-asset/cross-timeframe run
+    defines the card of a strategy that trades a different market entirely.
+    Blank sides are permissive (legacy rows without symbol/timeframe stamps).
+    """
+    if strategy_base and result_symbol and _symbol_base_asset(result_symbol) != strategy_base:
+        return False
+    if strategy_timeframe and result_timeframe and result_timeframe.strip().lower() != strategy_timeframe:
+        return False
+    return True
+
+
+def _best_backtest_rank_key(metrics: dict, created_at: str) -> tuple[int, float, float, float, float, int, float]:
     sharpe = _coerce_optional_float(metrics.get("sharpe_ratio"))
     if sharpe is None:
         sharpe = _coerce_optional_float(metrics.get("sharpe"))
@@ -664,6 +697,7 @@ def _best_backtest_rank_key(metrics: dict, created_at: str) -> tuple[float, floa
     )
     created_ts = _parse_timestamp(created_at)
     return (
+        1 if int(total_trades or 0) >= _BEST_BACKTEST_TRADE_FLOOR else 0,
         float(sharpe if sharpe is not None else float("-inf")),
         float(total_return if total_return is not None else float("-inf")),
         float(-(max_drawdown if max_drawdown is not None else float("inf"))),
@@ -721,6 +755,16 @@ def _enrich_strategy_rows_with_best_backtest(rows: list[dict]) -> list[dict]:
     best_by_strategy: dict[str, dict] = {}
     latest_by_strategy: dict[str, dict] = {}
     pinned_by_strategy: dict[str, dict] = {}
+    # (base_asset, timeframe) each strategy actually trades — scopes the "best"
+    # ranking to its own market. Blank components disable that constraint.
+    market_by_strategy: dict[str, tuple[str, str]] = {
+        sid: (
+            _symbol_base_asset(row.get("symbol")),
+            str(row.get("timeframe") or "").strip().lower(),
+        )
+        for row in rows
+        if (sid := str(row.get("id") or "").strip())
+    }
     # Newest backtest per terminal strategy with created_at <= its terminal event.
     # Precomputed here to avoid a per-row fallback SELECT in the enrichment loop.
     terminal_snapshot_by_strategy: dict[str, dict] = {}
@@ -766,7 +810,7 @@ def _enrich_strategy_rows_with_best_backtest(rows: list[dict]) -> list[dict]:
             chunk = strategy_ids[index:index + chunk_size]
             placeholders = ",".join(["?"] * len(chunk))
             sql = (
-                "SELECT strategy_id, result_id, result_type, start_date, end_date, config_json, metrics_json, created_at "
+                "SELECT strategy_id, result_id, result_type, symbol, timeframe, start_date, end_date, config_json, metrics_json, created_at "
                 "FROM backtest_results "
                 f"WHERE strategy_id IN ({placeholders}) "
                 "AND LOWER(TRIM(COALESCE(result_type, ''))) = 'backtest' "
@@ -821,15 +865,29 @@ def _enrich_strategy_rows_with_best_backtest(rows: list[dict]) -> list[dict]:
                         "created_ts": created_ts,
                         "metrics": metrics,
                     }
-                rank_key = _best_backtest_rank_key(metrics, created_at)
-                existing = best_by_strategy.get(sid)
-                if existing is None or rank_key > existing["rank_key"]:
-                    best_by_strategy[sid] = {
-                        "result_id": str(result_row["result_id"] or "").strip() or None,
-                        "created_at": created_at or None,
-                        "metrics": metrics,
-                        "rank_key": rank_key,
-                    }
+                # "Best" is scoped to the strategy's OWN market: a run on another
+                # asset/timeframe (multi-asset screens, timeframe sweeps) must not
+                # define the headline card. Latest/pinned/terminal snapshots stay
+                # unscoped — they are factual "what ran" pointers, not a ranking.
+                result_symbol = str(result_row["symbol"] or "").strip()
+                result_timeframe = str(result_row["timeframe"] or "").strip()
+                if not result_symbol or not result_timeframe:
+                    cfg_symbol, cfg_timeframe = _extract_symbol_timeframe_from_config(result_row["config_json"])
+                    result_symbol = result_symbol or (cfg_symbol or "")
+                    result_timeframe = result_timeframe or (cfg_timeframe or "")
+                strategy_market = market_by_strategy.get(sid, ("", ""))
+                if _result_matches_strategy_market(
+                    strategy_market[0], strategy_market[1], result_symbol, result_timeframe
+                ):
+                    rank_key = _best_backtest_rank_key(metrics, created_at)
+                    existing = best_by_strategy.get(sid)
+                    if existing is None or rank_key > existing["rank_key"]:
+                        best_by_strategy[sid] = {
+                            "result_id": str(result_row["result_id"] or "").strip() or None,
+                            "created_at": created_at or None,
+                            "metrics": metrics,
+                            "rank_key": rank_key,
+                        }
                 pinned_id = pinned_id_by_strategy.get(sid)
                 result_id_str = str(result_row["result_id"] or "").strip()
                 if pinned_id and result_id_str == pinned_id:

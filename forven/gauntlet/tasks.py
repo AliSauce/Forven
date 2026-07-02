@@ -1541,11 +1541,12 @@ def run_paper_promotion_gate(workflow: dict[str, Any], step: dict[str, Any]) -> 
         transition.get("blocked_reason") or transition.get("reason") or transition.get("message") or ""
     ).lower()
     if (
-        reason_code in {"stale_validation", "artifacts_pending", "stale_engine_artifacts"}
+        reason_code in {"stale_validation", "artifacts_pending", "stale_engine_artifacts", "validation_in_flight"}
         or "ordering violation" in _blocked_text
         or "re-run after optimization" in _blocked_text
         or "stale validation" in _blocked_text
         or "engine version" in _blocked_text
+        or "validation in flight" in _blocked_text
     ):
         # PENDING RE-VALIDATION, not a merit failure. The gauntlet gate's artifact-
         # ordering / freshness check fails when a validation (walk_forward) is older
@@ -1558,6 +1559,17 @@ def run_paper_promotion_gate(workflow: dict[str, Any], step: dict[str, Any]) -> 
         # reason_code is in engine._NO_DRAIN_REASON_CODES so requeue retries it on the
         # bounded cadence; the 2-day un-promotable hygiene backstop catches any genuine
         # deadlock where the validation truly never re-runs.
+        # Persist the TAXONOMY code (counter-exempt in engine._NO_DRAIN_REASON_CODES),
+        # not the transition's generic 'gate_failure' motion: the requeue sweep reads
+        # this top-level code to decide attempt-budget exemption, and 'gate_failure'
+        # would burn the budget on a self-resolving block and drain to failed_gate.
+        if reason_code not in {"stale_validation", "artifacts_pending", "stale_engine_artifacts", "validation_in_flight"}:
+            if "validation in flight" in _blocked_text:
+                reason_code = "validation_in_flight"
+            elif "engine version" in _blocked_text:
+                reason_code = "stale_engine_artifacts"
+            else:
+                reason_code = "stale_validation"
         return {
             "status": "blocked_runtime",
             "message": str(
@@ -1567,7 +1579,7 @@ def run_paper_promotion_gate(workflow: dict[str, Any], step: dict[str, Any]) -> 
                 or "validation pending re-run after optimization"
             ),
             "retryable": True,
-            "reason_code": reason_code or "stale_validation",
+            "reason_code": reason_code,
             "transition": transition,
             "gauntlet_status": status,
         }
