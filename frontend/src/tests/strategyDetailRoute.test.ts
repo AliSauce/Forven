@@ -465,35 +465,20 @@ function clickByTestId(target: HTMLDivElement, testId: string): void {
 }
 
 async function openBacktestHistory(target: HTMLDivElement): Promise<void> {
-	await waitForCondition(() =>
-		Array.from(target.querySelectorAll('button')).some((candidate) =>
-			(candidate.textContent ?? '').includes('Gauntlet History'),
-		),
-	);
-	clickButtonByText(target, 'Gauntlet History');
+	await waitForCondition(() => target.querySelector('[data-testid="strategy-tab-backtests"]') !== null);
+	clickByTestId(target, 'strategy-tab-backtests');
 	await waitForCondition(() => target.querySelector('[data-testid^="backtest-row-"]') !== null);
 }
 
 async function openOptimizationTab(target: HTMLDivElement): Promise<void> {
-	await waitForCondition(() =>
-		Array.from(target.querySelectorAll('button')).some((candidate) =>
-			(candidate.textContent ?? '').includes('Optimization'),
-		),
-	);
-	clickButtonByText(target, 'Optimization');
+	await waitForCondition(() => target.querySelector('[data-testid="strategy-tab-optimizations"]') !== null);
+	clickByTestId(target, 'strategy-tab-optimizations');
 	await waitForCondition(() => target.textContent?.includes('Run Optimization') ?? false);
 }
 
 async function openRobustnessTab(target: HTMLDivElement): Promise<void> {
-	await waitForCondition(() =>
-		Array.from(target.querySelectorAll('button')).some((candidate) =>
-			(candidate.textContent ?? '').trim() === 'Robustness',
-		),
-	);
-	const tab = Array.from(target.querySelectorAll('button')).find(
-		(candidate) => (candidate.textContent ?? '').trim() === 'Robustness',
-	);
-	click(tab ?? null);
+	await waitForCondition(() => target.querySelector('[data-testid="strategy-tab-robustness"]') !== null);
+	clickByTestId(target, 'strategy-tab-robustness');
 	await waitForCondition(() => target.textContent?.includes('Robustness Runners') ?? false);
 }
 
@@ -502,14 +487,10 @@ async function openOptimizationHistory(target: HTMLDivElement): Promise<void> {
 	await waitForCondition(() => target.querySelector('[data-testid^="optimization-row-"]') !== null);
 }
 
-async function openConfigurationTab(target: HTMLDivElement): Promise<void> {
-	await waitForCondition(() =>
-		Array.from(target.querySelectorAll('button')).some((candidate) =>
-			(candidate.textContent ?? '').includes('Configuration'),
-		),
-	);
-	clickButtonByText(target, 'Configuration');
-	await waitForCondition(() => target.textContent?.includes('Default Parameters') ?? false);
+async function openGauntletParamsPanel(target: HTMLDivElement): Promise<void> {
+	await waitForCondition(() => target.querySelector('[data-testid="strategy-tab-backtests"]') !== null);
+	clickByTestId(target, 'strategy-tab-backtests');
+	await waitForCondition(() => target.textContent?.includes('Gauntlet Parameters') ?? false);
 }
 
 async function waitForAddParamMetadata(target: HTMLDivElement): Promise<void> {
@@ -1314,9 +1295,9 @@ describe('/lab/strategy/[id] backtest history', () => {
 		expect(panel?.querySelector('summary')?.textContent).toContain('Active');
 	});
 
-	it('shows execution settings on the Default Parameters card (Configuration tab)', async () => {
-		// The Configuration tab is the default tab. Its Default Parameters card must now
-		// render the shared execution-settings form seeded from the saved execution_profile.
+	it('shows execution settings inside the Gauntlet Parameters panel', async () => {
+		// The Gauntlet Parameters panel must render the shared execution-settings form
+		// seeded from the saved execution_profile.
 		const container = buildContainer(['B1001'], {
 			params: {
 				fast: 12,
@@ -1326,8 +1307,8 @@ describe('/lab/strategy/[id] backtest history', () => {
 		apiMocks.getStrategyContainer.mockResolvedValue(container);
 
 		app = mount(StrategyDetailPage, { target });
-		await openConfigurationTab(target);
-		await waitForCondition(() => target.textContent?.includes('Default Parameters') ?? false);
+		await openGauntletParamsPanel(target);
+		await waitForCondition(() => target.textContent?.includes('Gauntlet Parameters') ?? false);
 		await waitForCondition(() => target.textContent?.includes('Execution Settings') ?? false);
 
 		expect(target.textContent).toContain('Sizing Mode');
@@ -1353,10 +1334,8 @@ describe('/lab/strategy/[id] backtest history', () => {
 		app = mount(StrategyDetailPage, { target });
 		// Open the Gauntlet section (no history rows needed) and reach the params pane
 		// on its DEFAULT view — the exact state the user reported as stuck "Unsaved".
-		await waitForCondition(() =>
-			Array.from(target.querySelectorAll('button')).some((b) => (b.textContent ?? '').includes('Gauntlet History')),
-		);
-		clickButtonByText(target, 'Gauntlet History');
+		await waitForCondition(() => target.querySelector('[data-testid="strategy-tab-backtests"]') !== null);
+		clickByTestId(target, 'strategy-tab-backtests');
 		await waitForCondition(() => target.querySelector('[data-testid="backtest-params-save"]') !== null);
 
 		const save = target.querySelector('[data-testid="backtest-params-save"]') as HTMLButtonElement | null;
@@ -1462,7 +1441,7 @@ describe('/lab/strategy/[id] backtest history', () => {
 			);
 
 			app = mount(StrategyDetailPage, { target });
-			await openConfigurationTab(target);
+			await openGauntletParamsPanel(target);
 			await waitForCondition(() => target.querySelector('[data-testid="add-param-select"]') !== null);
 			await waitForCondition(() => target.textContent?.includes('available from ETH-RSI_MOMENTUM-S7762062.') ?? false);
 
@@ -1483,7 +1462,7 @@ describe('/lab/strategy/[id] backtest history', () => {
 			);
 
 			app = mount(StrategyDetailPage, { target });
-			await openConfigurationTab(target);
+			await openGauntletParamsPanel(target);
 			await waitForCondition(() => target.querySelector('[data-testid="add-param-select"]') !== null);
 			await waitForAddParamMetadata(target);
 
@@ -1506,7 +1485,7 @@ describe('/lab/strategy/[id] backtest history', () => {
 			);
 
 			app = mount(StrategyDetailPage, { target });
-			await openConfigurationTab(target);
+			await openGauntletParamsPanel(target);
 			await waitForCondition(() => target.querySelector('[data-testid="add-param-select"]') !== null);
 			await waitForAddParamMetadata(target);
 
@@ -1538,7 +1517,7 @@ describe('/lab/strategy/[id] backtest history', () => {
 			});
 
 			app = mount(StrategyDetailPage, { target });
-			await openConfigurationTab(target);
+			await openGauntletParamsPanel(target);
 			await waitForCondition(() => target.querySelector('[data-testid="add-param-select"]') !== null);
 			await waitForAddParamMetadata(target);
 
@@ -1572,7 +1551,7 @@ describe('/lab/strategy/[id] backtest history', () => {
 			);
 
 			app = mount(StrategyDetailPage, { target });
-			await openConfigurationTab(target);
+			await openGauntletParamsPanel(target);
 			await waitForCondition(() => target.textContent?.includes('All supported params from') ?? false);
 
 			const addParamSelect = target.querySelector<HTMLSelectElement>('[data-testid="add-param-select"]');
@@ -1592,7 +1571,7 @@ describe('/lab/strategy/[id] backtest history', () => {
 			);
 
 			app = mount(StrategyDetailPage, { target });
-			await openConfigurationTab(target);
+			await openGauntletParamsPanel(target);
 			await waitForCondition(() => target.querySelector('[data-testid="add-param-select"]') !== null);
 
 			const addParamSelect = target.querySelector<HTMLSelectElement>('[data-testid="add-param-select"]');
@@ -1615,10 +1594,10 @@ describe('/lab/strategy/[id] backtest history', () => {
 			);
 
 			app = mount(StrategyDetailPage, { target });
-			await openConfigurationTab(target);
-			await waitForCondition(() => target.textContent?.includes('Default Parameters') ?? false);
+			await openGauntletParamsPanel(target);
+			await waitForCondition(() => target.textContent?.includes('Gauntlet Parameters') ?? false);
 
-			expect(target.textContent).toContain('Default Parameters');
+			expect(target.textContent).toContain('Gauntlet Parameters');
 			expect(target.textContent).not.toContain('Loading container...');
 			const addParamSelect = target.querySelector('[data-testid="add-param-select"]') as HTMLSelectElement | null;
 			expect(addParamSelect).not.toBeNull();
@@ -1652,8 +1631,8 @@ describe('/lab/strategy/[id] backtest history', () => {
 			});
 
 			app = mount(StrategyDetailPage, { target });
-			await openConfigurationTab(target);
-			await waitForCondition(() => target.textContent?.includes('Default Parameters') ?? false);
+			await openGauntletParamsPanel(target);
+			await waitForCondition(() => target.textContent?.includes('Gauntlet Parameters') ?? false);
 
 			const fastInput = target.querySelector<HTMLInputElement>('input[type="number"]');
 			setInputValue(fastInput, '13');

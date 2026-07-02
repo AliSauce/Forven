@@ -1,10 +1,9 @@
 <script lang="ts">
 	import type { ExecutionProfileDraft } from '$lib/types/executionProfile';
 
-	// The shared execution-settings form. Bound to the parent's executionDraft so the
-	// SAME state drives the Gauntlet Parameters card (Gauntlet History tab) and the
-	// Default Parameters card (Configuration tab) — editing in either place updates the
-	// one draft that `saveParameterDraft` persists.
+	// The shared execution-settings form. Bound to the parent's executionDraft — the
+	// one draft that `saveParameterDraft` persists (rendered in the Gauntlet Parameters
+	// panel on the Gauntlet tab).
 	export let draft: ExecutionProfileDraft;
 	export let error = '';
 	export let disabled = false;

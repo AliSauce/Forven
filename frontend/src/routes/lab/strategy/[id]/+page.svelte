@@ -159,12 +159,12 @@
 
 	// TabKey identifiers predate the current UI labels. Mapping (code -> visible label):
 	//   'overview'       -> "Overview" (stage pipeline, readiness, gauntlet status, active run)
-	//   'backtests'      -> "Gauntlet History" (the "Run the Gauntlet" button submits a backtest)
+	//   'backtests'      -> "Gauntlet" (params + run form + history; "Run the Gauntlet" submits a backtest)
 	//   'optimizations'  -> "Optimization"
 	//   'robustness'     -> "Robustness" (the five validation runners)
 	// PromotionReadiness on:action maps: 'run_confirmation_backtest' -> 'backtests';
 	//   'run_optimization'/'apply_best_params' -> 'optimizations'; '*_validation_suite' -> 'robustness'.
-	type TabKey = 'overview' | 'configuration' | 'backtests' | 'optimizations' | 'robustness' | 'execution';
+	type TabKey = 'overview' | 'backtests' | 'optimizations' | 'robustness' | 'execution';
 	type SubmitStatus = 'idle' | 'submitting' | 'running' | 'completed' | 'failed';
 	type RobustnessRunnerTestKey = 'walk_forward' | 'monte_carlo' | 'param_jitter' | 'cost_stress' | 'regime_split';
 	type RobustnessRunnerCompleteEvent = {
@@ -1063,7 +1063,14 @@
 		return Number.isFinite(parsed) ? String(parsed) : fallback;
 	}
 
-	function optionalNumber(value: string): number | undefined {
+	// Execution-draft fields are string-typed, but Svelte's bind:value on
+	// type="number" inputs writes back NUMBERS (or '' when cleared). Normalize
+	// before any string ops — a direct `.trim()` on an edited field throws.
+	function draftText(value: unknown): string {
+		return value == null ? '' : String(value);
+	}
+
+	function optionalNumber(value: string | number): number | undefined {
 		const text = String(value ?? '').trim();
 		if (!text) return undefined;
 		const parsed = Number(text);
@@ -1125,7 +1132,7 @@
 		// Make Fraction risk runnable in one click: seed a stop loss only when the operator
 		// has set neither a stop loss nor a trailing stop, so an existing trailing stop is
 		// never overridden.
-		if (mode === 'fraction' && !next.stop_loss_pct.trim() && !next.trailing_stop_pct.trim()) {
+		if (mode === 'fraction' && !draftText(next.stop_loss_pct).trim() && !draftText(next.trailing_stop_pct).trim()) {
 			next.stop_loss_pct = FRACTION_DEFAULT_STOP_LOSS_PCT;
 			changed = true;
 		}
@@ -2354,18 +2361,18 @@
 
 	function validateExecutionDraft(draft: ExecutionProfileDraft): string | null {
 		const initialCapital = optionalNumber(draft.initial_capital);
-		if (draft.initial_capital.trim() && (initialCapital === undefined || initialCapital <= 0)) return 'Initial capital must be greater than 0.';
+		if (draftText(draft.initial_capital).trim() && (initialCapital === undefined || initialCapital <= 0)) return 'Initial capital must be greater than 0.';
 		const fee = optionalNumber(draft.fee_bps);
-		if (draft.fee_bps.trim() && (fee === undefined || fee < 0)) return 'Fee bps cannot be negative.';
+		if (draftText(draft.fee_bps).trim() && (fee === undefined || fee < 0)) return 'Fee bps cannot be negative.';
 		const slippage = optionalNumber(draft.slippage_bps);
-		if (draft.slippage_bps.trim() && (slippage === undefined || slippage < 0)) return 'Slippage bps cannot be negative.';
+		if (draftText(draft.slippage_bps).trim() && (slippage === undefined || slippage < 0)) return 'Slippage bps cannot be negative.';
 		const leverage = optionalNumber(draft.leverage);
-		if (draft.leverage.trim() && (leverage === undefined || leverage <= 0 || leverage > 125)) return 'Leverage must be greater than 0 and no more than 125.';
+		if (draftText(draft.leverage).trim() && (leverage === undefined || leverage <= 0 || leverage > 125)) return 'Leverage must be greater than 0 and no more than 125.';
 		if (draft.sizing_mode === 'fraction' || draft.sizing_mode === 'atr') {
 			const risk = optionalNumber(draft.risk_per_trade);
 			if (risk === undefined || risk <= 0 || risk > 1) return 'Risk per trade must be between 0 and 1.';
 		}
-		if (draft.sizing_mode === 'fraction' && !draft.stop_loss_pct.trim() && !draft.trailing_stop_pct.trim()) {
+		if (draft.sizing_mode === 'fraction' && !draftText(draft.stop_loss_pct).trim() && !draftText(draft.trailing_stop_pct).trim()) {
 			return 'Fraction sizing needs a stop loss or trailing stop.';
 		}
 		if (draft.sizing_mode === 'fixed') {
@@ -2388,10 +2395,10 @@
 			['trailing_stop_pct', 'Trailing stop %', 100],
 		] as const) {
 			const value = optionalNumber(draft[key]);
-			if (draft[key].trim() && (value === undefined || value <= 0 || value > max)) return `${label} must be greater than 0 and no more than ${max}.`;
+			if (draftText(draft[key]).trim() && (value === undefined || value <= 0 || value > max)) return `${label} must be greater than 0 and no more than ${max}.`;
 		}
 		const timeStop = optionalNumber(draft.time_stop_bars);
-		if (draft.time_stop_bars.trim() && (timeStop === undefined || timeStop < 1 || !Number.isInteger(timeStop))) return 'Time stop must be a positive whole number of bars.';
+		if (draftText(draft.time_stop_bars).trim() && (timeStop === undefined || timeStop < 1 || !Number.isInteger(timeStop))) return 'Time stop must be a positive whole number of bars.';
 		return null;
 	}
 
@@ -3711,14 +3718,14 @@
 			<div role="group" aria-label="Strategy detail sections" class="flex gap-6 text-xs uppercase tracking-wide">
 				{#each [
 					{ key: 'overview', label: 'Overview' },
-					{ key: 'configuration', label: 'Configuration' },
-					{ key: 'backtests', label: 'Gauntlet History' },
+					{ key: 'backtests', label: 'Gauntlet' },
 					{ key: 'optimizations', label: 'Optimization' },
 					{ key: 'robustness', label: 'Robustness' },
 					{ key: 'execution', label: 'Execution' },
 				] as tab (tab.key)}
 					<button
 						type="button"
+						data-testid={`strategy-tab-${tab.key}`}
 						aria-pressed={activeTab === tab.key}
 						class="border-b-2 py-2 transition-colors {activeTab === tab.key ? 'border-white text-white' : 'border-transparent text-gray-500 hover:text-gray-300'}"
 						on:click={() => (activeTab = tab.key as TabKey)}
@@ -3756,6 +3763,23 @@
 			{/if}
 
 			{#if activeTab === 'overview'}
+				<!-- Identity strip — carries the strategy facts the removed Configuration tab used to show. -->
+				<div class="mb-3 flex flex-wrap items-center gap-1.5 text-[11px]" data-testid="overview-identity-strip">
+					<span class="rounded border border-[#2b2b2b] bg-black px-1.5 py-0.5 text-gray-300" title="Strategy type">{String(container.configuration.type ?? '-')}</span>
+					<span class="rounded border border-[#2b2b2b] bg-black px-1.5 py-0.5 text-gray-300" title="Owner">{String(container.configuration.owner ?? '-')}</span>
+					<span class="rounded border border-[#2b2b2b] bg-black px-1.5 py-0.5 font-mono text-white" title="Configured market">{String(container.configuration.symbol ?? '-')}</span>
+					<span class="rounded border border-[#2b2b2b] bg-black px-1.5 py-0.5 font-mono text-white" title="Configured timeframe">{String(container.configuration.timeframe ?? '-')}</span>
+					<span class="rounded border border-[#2b2b2b] bg-black px-1.5 py-0.5 text-gray-400" title="Created">{fmtDate(container.strategy.created_at)}</span>
+					<span class="ml-auto"></span>
+					<button
+						type="button"
+						data-testid="deepdive-toggle-overview"
+						class="rounded border border-violet-700/50 bg-violet-950/30 px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.16em] text-violet-200 transition hover:bg-violet-900/40"
+						on:click={launchDeepdive}
+					>
+						🔍 Deepdive
+					</button>
+				</div>
 				<div class="grid grid-cols-1 gap-3 xl:grid-cols-[0.95fr_1.05fr]">
 					<div class="space-y-3">
 						<div class="rounded-lg border border-[#1d1d1d] bg-[#090909] p-3">
@@ -3874,7 +3898,7 @@
 							</div>
 							{#if !activeRunItem}
 								<div class="mt-3 rounded border border-[#1f1f1f] bg-[#070707] px-4 py-6 text-sm text-gray-500">
-									No Gauntlet runs yet — run one from the Gauntlet History tab to see how this strategy performs.
+									No Gauntlet runs yet — run one from the Gauntlet tab to see how this strategy performs.
 								</div>
 							{:else}
 								<div class="mt-2 flex flex-wrap items-center gap-2 text-[11px] text-gray-500">
@@ -3962,131 +3986,6 @@
 				</div>
 			{/if}
 
-			{#if activeTab === 'configuration'}
-				<div>
-					<div>
-						<div class="mb-3 flex justify-end">
-							<button
-								type="button"
-								data-testid="deepdive-toggle-configuration"
-								class="rounded border border-violet-700/50 bg-violet-950/30 px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.16em] text-violet-200 transition hover:bg-violet-900/40"
-								on:click={launchDeepdive}
-							>
-								🔍 Deepdive
-							</button>
-						</div>
-				<div class="grid grid-cols-1 gap-3 xl:grid-cols-[0.85fr_1.15fr]">
-					<div class="rounded-lg border border-[#1d1d1d] bg-[#090909] p-3">
-						<div class="flex items-start justify-between gap-2">
-							<div>
-								<h3 class="text-sm font-semibold text-white">{container.strategy.name}</h3>
-								<div class="mt-1 flex flex-wrap items-center gap-1.5 text-[11px]">
-									<span class="rounded border border-[#2b2b2b] bg-black px-1.5 py-0.5 font-mono text-cyan-300">{container.strategy.id}</span>
-									<span class="rounded border border-[#2b2b2b] bg-black px-1.5 py-0.5 text-gray-300">{String(container.configuration.type ?? '-')}</span>
-									<span class="rounded border border-[#2b2b2b] bg-black px-1.5 py-0.5 text-gray-300">{String(container.configuration.owner ?? '-')}</span>
-								</div>
-							</div>
-							<span class="shrink-0 rounded border border-[#2b2b2b] bg-black px-2 py-0.5 text-[11px] font-mono text-gray-300">{String(container.strategy.state ?? '-')}</span>
-						</div>
-						<div class="mt-2 grid gap-2 sm:grid-cols-3 text-xs">
-							<div class="rounded border border-[#1f1f1f] bg-black px-2 py-1.5">
-								<span class="text-[10px] uppercase tracking-wide text-gray-500">Market</span>
-								<div class="font-mono text-sm text-white">{String(container.configuration.symbol ?? '-')}</div>
-							</div>
-							<div class="rounded border border-[#1f1f1f] bg-black px-2 py-1.5">
-								<span class="text-[10px] uppercase tracking-wide text-gray-500">Timeframe</span>
-								<div class="font-mono text-sm text-white">{String(container.configuration.timeframe ?? '-')}</div>
-							</div>
-							<div class="rounded border border-[#1f1f1f] bg-black px-2 py-1.5">
-								<span class="text-[10px] uppercase tracking-wide text-gray-500">Created</span>
-								<div class="text-sm text-gray-400">{fmtDate(container.strategy.created_at)}</div>
-							</div>
-						</div>
-					</div>
-					<div class="rounded-lg border border-[#1d1d1d] bg-[#090909] p-3">
-						<div class="flex items-center justify-between gap-2">
-							<div class="flex items-center gap-2">
-								<div class="text-[10px] uppercase tracking-[0.2em] text-gray-500">Default Parameters</div>
-								<span class={`rounded border px-1.5 py-0.5 text-[10px] ${gauntletDraftDirty ? 'border-amber-900/70 bg-amber-950/20 text-amber-200' : 'border-[#2b2b2b] text-gray-500'}`}>
-									{gauntletDraftDirty ? 'Unsaved' : 'Synced'}
-								</span>
-							</div>
-							<div class="flex items-center gap-1.5">
-								<button
-									type="button"
-									class="rounded border border-[#2b2b2b] bg-black px-2 py-1 text-[10px] uppercase tracking-wide text-gray-400 transition hover:text-white disabled:opacity-40"
-									on:click={resetParameterDraft}
-									disabled={!gauntletDraftDirty || settingDefaultParams}
-								>Reset</button>
-								<button
-									type="button"
-									class="rounded border border-emerald-700 bg-emerald-950/30 px-2 py-1 text-[10px] uppercase tracking-wide text-emerald-200 transition hover:bg-emerald-900/40 disabled:opacity-40"
-									on:click={saveParameterDraft}
-									disabled={!gauntletDraftDirty || settingDefaultParams || paramsHasErrors || Boolean(executionDraftError)}
-								>{settingDefaultParams ? 'Saving…' : 'Save'}</button>
-							</div>
-						</div>
-						{#if parameterSaveMessage}
-							<div class="mt-2 rounded border border-emerald-900/40 bg-emerald-950/10 px-2 py-1 text-[11px] text-emerald-200">{parameterSaveMessage}</div>
-						{/if}
-						{#if parameterSaveError}
-							<div class="mt-2 rounded border border-red-900/40 bg-red-950/20 px-2 py-1 text-[11px] text-red-300">{parameterSaveError}</div>
-						{/if}
-						{#if !loading}
-							<div class="mt-2 rounded border border-[#1f1f1f] bg-black p-2">
-								<div class="flex flex-wrap items-end gap-2">
-									<label class="flex min-w-[220px] flex-1 flex-col gap-1 text-[10px] uppercase tracking-wide text-gray-500">
-										<span>Add Param</span>
-										<select
-											class="rounded border border-[#2b2b2b] bg-[#090909] px-2 py-1.5 text-sm text-gray-200 disabled:opacity-40"
-											bind:value={selectedAddParamKey}
-											data-testid="add-param-select"
-											disabled={settingDefaultParams || availableAddParamKeys.length === 0}
-										>
-											<option value="">Select a supported param</option>
-											{#each availableAddParamKeys as key}
-												<option value={key}>{key}</option>
-											{/each}
-										</select>
-									</label>
-									<button
-										type="button"
-										class="rounded border border-cyan-700 bg-cyan-950/30 px-3 py-1.5 text-[10px] uppercase tracking-wide text-cyan-200 transition hover:bg-cyan-900/40 disabled:opacity-40"
-										on:click={addSelectedParamToDraft}
-										data-testid="add-param-button"
-										disabled={settingDefaultParams || availableAddParamKeys.length === 0}
-									>
-										Add Param
-									</button>
-								</div>
-								{#if addParamHelperText}
-									<div class="mt-2 text-[11px] text-gray-500">{addParamHelperText}</div>
-								{/if}
-							</div>
-						{/if}
-						<div class="mt-2">
-							<ParameterEditor bind:params={paramsDraft} bind:hasErrors={paramsHasErrors} saving={settingDefaultParams} />
-						</div>
-						<div class="mt-3 border-t border-[#1a1a1a] pt-3">
-							<div class="mb-2 text-[10px] uppercase tracking-[0.2em] text-gray-500">Execution Settings</div>
-							<ExecutionSettingsFields
-								bind:draft={executionDraft}
-								error={executionDraftError}
-								disabled={settingDefaultParams}
-								onSizingModeChange={() => applySizingModeDefaults(executionDraft.sizing_mode)}
-							/>
-						</div>
-						<details class="mt-2 rounded border border-[#1f1f1f] bg-black">
-							<summary class="cursor-pointer px-2 py-1.5 text-[10px] uppercase tracking-wide text-gray-500">Raw JSON</summary>
-							<pre class="max-h-[200px] overflow-auto border-t border-[#1a1a1a] p-2 text-[11px] text-gray-300">{stableStringify(paramsDraft)}</pre>
-						</details>
-					</div>
-				</div>
-
-					</div>
-				</div>
-			{/if}
-
 			{#if activeTab === 'backtests'}
 				<div>
 					<div>
@@ -4149,13 +4048,59 @@
 						</div>
 					</summary>
 					<div class="border-t border-[#1a1a1a] p-3" data-testid="backtest-parameter-editor">
+						{#if parameterSaveMessage}
+							<div class="mb-2 rounded border border-emerald-900/40 bg-emerald-950/10 px-2 py-1 text-[11px] text-emerald-200">{parameterSaveMessage}</div>
+						{/if}
+						{#if parameterSaveError}
+							<div class="mb-2 rounded border border-red-900/40 bg-red-950/20 px-2 py-1 text-[11px] text-red-300">{parameterSaveError}</div>
+						{/if}
+						<div class="mb-2 text-[10px] uppercase tracking-[0.2em] text-gray-500">Execution Settings</div>
 						<ExecutionSettingsFields
 							bind:draft={executionDraft}
 							error={executionDraftError}
 							disabled={settingDefaultParams}
 							onSizingModeChange={() => applySizingModeDefaults(executionDraft.sizing_mode)}
 						/>
-						<ParameterEditor bind:params={paramsDraft} bind:hasErrors={paramsHasErrors} saving={settingDefaultParams} />
+						<div class="mt-3 border-t border-[#1a1a1a] pt-3">
+							<div class="mb-2 text-[10px] uppercase tracking-[0.2em] text-gray-500">Strategy Parameters</div>
+							{#if !loading}
+								<div class="mb-2 rounded border border-[#1f1f1f] bg-black p-2">
+									<div class="flex flex-wrap items-end gap-2">
+										<label class="flex min-w-[220px] flex-1 flex-col gap-1 text-[10px] uppercase tracking-wide text-gray-500">
+											<span>Add Param</span>
+											<select
+												class="rounded border border-[#2b2b2b] bg-[#090909] px-2 py-1.5 text-sm text-gray-200 disabled:opacity-40"
+												bind:value={selectedAddParamKey}
+												data-testid="add-param-select"
+												disabled={settingDefaultParams || availableAddParamKeys.length === 0}
+											>
+												<option value="">Select a supported param</option>
+												{#each availableAddParamKeys as key}
+													<option value={key}>{key}</option>
+												{/each}
+											</select>
+										</label>
+										<button
+											type="button"
+											class="rounded border border-cyan-700 bg-cyan-950/30 px-3 py-1.5 text-[10px] uppercase tracking-wide text-cyan-200 transition hover:bg-cyan-900/40 disabled:opacity-40"
+											on:click={addSelectedParamToDraft}
+											data-testid="add-param-button"
+											disabled={settingDefaultParams || availableAddParamKeys.length === 0}
+										>
+											Add Param
+										</button>
+									</div>
+									{#if addParamHelperText}
+										<div class="mt-2 text-[11px] text-gray-500">{addParamHelperText}</div>
+									{/if}
+								</div>
+							{/if}
+							<ParameterEditor bind:params={paramsDraft} bind:hasErrors={paramsHasErrors} saving={settingDefaultParams} />
+						</div>
+						<details class="mt-2 rounded border border-[#1f1f1f] bg-black">
+							<summary class="cursor-pointer px-2 py-1.5 text-[10px] uppercase tracking-wide text-gray-500">Raw JSON</summary>
+							<pre class="max-h-[200px] overflow-auto border-t border-[#1a1a1a] p-2 text-[11px] text-gray-300">{stableStringify(paramsDraft)}</pre>
+						</details>
 					</div>
 				</details>
 
