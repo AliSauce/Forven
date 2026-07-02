@@ -87,6 +87,12 @@ vi.mock('$app/stores', () => ({
 		},
 	},
 }));
+// lightweight-charts needs a real canvas 2D context, which jsdom lacks — stub the
+// chart component so Overview cards that render it (e.g. Strategy Growth) mount.
+vi.mock('$lib/components/EquityChart.svelte', async () => {
+	const module = await import('./stubs/EquityChartStub.svelte');
+	return { default: module.default };
+});
 
 import StrategyDetailPage from '../routes/lab/strategy/[id]/+page.svelte';
 
@@ -1906,6 +1912,76 @@ describe('/lab/strategy/[id] backtest history', () => {
 
 		expect(target.querySelector('[data-testid="gauntlet-test-verdict-walk_forward"]')?.textContent).toContain('FAIL');
 		expect(target.textContent).toContain('1 / 5 completed');
+	});
+
+	it('renders the strategy growth curve from closed execution trades on the Overview', async () => {
+		const container = buildContainer(['B1001']);
+		(container.execution as Record<string, unknown>).trades = [
+			{
+				id: 'T1',
+				asset: 'BTC',
+				direction: 'long',
+				status: 'CLOSED',
+				execution_type: 'paper_challenger',
+				entry_price: 100,
+				pnl: 120,
+				pnl_usd: 120,
+				pnl_pct: 1.2,
+				opened_at: '2026-03-01T00:00:00Z',
+				closed_at: '2026-03-02T00:00:00Z',
+			},
+			{
+				id: 'T2',
+				asset: 'BTC',
+				direction: 'short',
+				status: 'CLOSED',
+				execution_type: 'paper_challenger',
+				entry_price: 110,
+				pnl: -45,
+				pnl_usd: -45,
+				pnl_pct: -0.4,
+				opened_at: '2026-03-03T00:00:00Z',
+				closed_at: '2026-03-04T00:00:00Z',
+			},
+			{
+				id: 'T3',
+				asset: 'BTC',
+				direction: 'long',
+				status: 'OPEN',
+				execution_type: 'paper_challenger',
+				entry_price: 111,
+				pnl: null,
+				opened_at: '2026-03-05T00:00:00Z',
+				closed_at: null,
+			},
+		];
+		apiMocks.getStrategyContainer.mockResolvedValue(container);
+
+		app = mount(StrategyDetailPage, { target });
+		await waitForCondition(() => target.querySelector('[data-testid="overview-growth-card"]') !== null);
+
+		const card = target.querySelector('[data-testid="overview-growth-card"]');
+		// The open trade is excluded; total = +120 - 45 = +$75.00 across 2 closed trades.
+		expect(card?.textContent).toContain('2 closed trades');
+		expect(card?.textContent).toContain('+$75.00');
+		// All closed trades are paper -> the curve is the $10k paper book equity.
+		expect(card?.textContent).toContain('Paper book equity');
+		const chartStub = card?.querySelector('[data-testid="equity-chart-stub"]');
+		expect(chartStub).not.toBeNull();
+		// Anchor point at the earliest open + one point per closed trade.
+		expect(chartStub?.getAttribute('data-points')).toBe('3');
+		expect(chartStub?.getAttribute('data-drawdown')).toBe('yes');
+	});
+
+	it('shows the growth empty state when the strategy has no closed trades', async () => {
+		apiMocks.getStrategyContainer.mockResolvedValue(buildContainer(['B1001']));
+
+		app = mount(StrategyDetailPage, { target });
+		await waitForCondition(() => target.querySelector('[data-testid="overview-growth-card"]') !== null);
+
+		expect(target.querySelector('[data-testid="overview-growth-card"]')?.textContent).toContain(
+			'No closed paper/live trades yet',
+		);
 	});
 
 	it('links back to the parent hypothesis when one is attached', async () => {

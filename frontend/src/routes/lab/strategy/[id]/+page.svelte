@@ -431,6 +431,73 @@
 	});
 	$: executionTrades = container?.execution.trades ?? [];
 	$: executionPositions = container?.execution.positions ?? [];
+	$: executionGrowth = buildExecutionGrowth(executionTrades);
+
+	// ── Overview: realized growth from actual paper/live trading ────────────────
+	// The paper engine trades an isolated book of $10k + realized PnL, so for a
+	// pure-paper strategy `$10k + cumsum(pnl)` IS the real book equity. Live trades
+	// are sized off the real wallet, so with any live fills the curve degrades to
+	// cumulative realized PnL (anchored at 0) rather than implying a fake book.
+	const PAPER_START_EQUITY = 10000;
+
+	type ExecutionGrowth = {
+		points: EquityPoint[];
+		mode: 'paper' | 'pnl';
+		tradeCount: number;
+		totalPnl: number;
+	};
+
+	function buildExecutionGrowth(trades: Record<string, unknown>[]): ExecutionGrowth | null {
+		const closed = trades
+			.map((row) => {
+				const closedAt = typeof row.closed_at === 'string' && row.closed_at.trim() ? row.closed_at : null;
+				const status = String(row.status ?? '').trim().toUpperCase();
+				if (!closedAt || status === 'OPEN') return null;
+				const closedTs = Date.parse(closedAt);
+				if (!Number.isFinite(closedTs)) return null;
+				const pnl = [row.pnl_usd, row.pnl]
+					.map((value) => Number(value))
+					.find((value) => Number.isFinite(value));
+				if (pnl === undefined) return null;
+				const openedAt = typeof row.opened_at === 'string' && row.opened_at.trim() ? row.opened_at : null;
+				const openedTs = openedAt ? Date.parse(openedAt) : Number.NaN;
+				return {
+					closedAt,
+					closedTs,
+					openedAt: Number.isFinite(openedTs) ? openedAt : null,
+					openedTs: Number.isFinite(openedTs) ? openedTs : null,
+					pnl,
+					executionType: String(row.execution_type ?? '').trim().toLowerCase(),
+				};
+			})
+			.filter((trade): trade is NonNullable<typeof trade> => trade !== null)
+			.sort((left, right) => left.closedTs - right.closedTs);
+		if (closed.length === 0) return null;
+
+		const allPaper = closed.every((trade) => trade.executionType.includes('paper'));
+		const base = allPaper ? PAPER_START_EQUITY : 0;
+		const points: EquityPoint[] = [];
+		// Anchor the curve at the earliest open so a single closed trade still draws a
+		// segment and the start of trading is visible.
+		const anchor = closed.reduce<{ ts: number; at: string } | null>((best, trade) => {
+			if (trade.openedTs === null || trade.openedAt === null) return best;
+			return !best || trade.openedTs < best.ts ? { ts: trade.openedTs, at: trade.openedAt } : best;
+		}, null);
+		if (anchor && anchor.ts < closed[0].closedTs) {
+			points.push({ timestamp: anchor.at, equity: base });
+		}
+		let equity = base;
+		for (const trade of closed) {
+			equity += trade.pnl;
+			points.push({ timestamp: trade.closedAt, equity });
+		}
+		return {
+			points,
+			mode: allPaper ? 'paper' : 'pnl',
+			tradeCount: closed.length,
+			totalPnl: equity - base,
+		};
+	}
 	// execution_profile is persisted INSIDE params (the canonical home the
 	// optimizer/gauntlet read) but is NOT an alpha param. Strip it everywhere the
 	// alpha-param draft is built so (a) it never shows in the ParameterEditor and
@@ -3954,6 +4021,40 @@
 										{/key}
 									</div>
 								{/if}
+							{/if}
+						</div>
+
+						<div class="rounded-lg border border-[#1d1d1d] bg-[#090909] p-3" data-testid="overview-growth-card">
+							<div class="flex flex-wrap items-center justify-between gap-2">
+								<div class="text-[10px] uppercase tracking-[0.2em] text-gray-500">Strategy Growth</div>
+								{#if executionGrowth}
+									<div class="flex items-center gap-2 text-[11px]">
+										<span class={`rounded border px-1.5 py-0.5 font-mono ${executionGrowth.totalPnl >= 0 ? 'border-emerald-900/50 bg-emerald-950/15 text-emerald-300' : 'border-red-900/50 bg-red-950/15 text-red-300'}`}>
+											{formatSignedCurrency(executionGrowth.totalPnl)}
+										</span>
+										<span class="text-gray-500">{executionGrowth.tradeCount} closed trade{executionGrowth.tradeCount === 1 ? '' : 's'}</span>
+									</div>
+								{/if}
+							</div>
+							{#if executionGrowth}
+								<div class="mt-1 text-xs text-gray-500">
+									{#if executionGrowth.mode === 'paper'}
+										Paper book equity — the strategy's isolated ${PAPER_START_EQUITY.toLocaleString()} book plus realized PnL from each closed paper trade.
+									{:else}
+										Cumulative realized PnL from closed paper/live trades.
+									{/if}
+								</div>
+								<div class="mt-3">
+									<EquityChart
+										data={executionGrowth.points}
+										showDrawdown={executionGrowth.mode === 'paper'}
+										height={220}
+									/>
+								</div>
+							{:else}
+								<div class="mt-3 rounded border border-[#1f1f1f] bg-[#070707] px-4 py-6 text-sm text-gray-500">
+									No closed paper/live trades yet — real trading growth appears here once the strategy starts closing trades.
+								</div>
 							{/if}
 						</div>
 
