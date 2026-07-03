@@ -21,6 +21,8 @@
 
 	const SESSION_STORAGE_KEY = 'forven:ai-dropzone:active-session-id';
 	const REFRESH_MS = 5000;
+	// Keep in sync with tests/test_mcp_server.py EXPECTED_TOOL_NAMES.
+	const MCP_TOOL_COUNT = 20;
 
 	// ── State ────────────────────────────────────────────────────────────
 	let context: AiDropzoneContext | null = null;
@@ -606,7 +608,11 @@
 		{ method: 'POST', path: '/api/strategies/intake/register-file', purpose: 'register a .py' },
 		{ method: 'POST', path: '/api/backtesting/run', purpose: 'backtest (IS + OOS)' },
 		{ method: 'POST', path: '/api/backtesting/optimize', purpose: 'parameter search' },
-		{ method: 'POST', path: '/api/backtesting/verdict/run', purpose: 'robustness tests' },
+		{ method: 'POST', path: '/api/robustness/walk-forward/submit', purpose: 'persisted walk-forward (paper-gate evidence)' },
+		{ method: 'POST', path: '/api/robustness/cost-stress/submit', purpose: 'persisted cost stress' },
+		{ method: 'POST', path: '/api/robustness/param-jitter/submit', purpose: 'persisted param jitter' },
+		{ method: 'GET', path: '/api/robustness/results/{id}', purpose: 'poll a robustness run' },
+		{ method: 'GET', path: '/api/lifecycle/strategies/{id}/readiness', purpose: 'promotion checklist' },
 		{ method: 'POST', path: '/api/strategies/{id}/promote', purpose: 'advance lifecycle stage' },
 	];
 
@@ -628,6 +634,18 @@
 		} catch {
 			return iso;
 		}
+	}
+
+	function fmtAgo(iso?: string | null): string {
+		if (!iso) return '';
+		const ms = Date.now() - new Date(iso).getTime();
+		if (!isFinite(ms) || ms < 0) return '';
+		const m = Math.floor(ms / 60000);
+		if (m < 1) return 'just now';
+		if (m < 60) return `${m}m ago`;
+		const h = Math.floor(m / 60);
+		if (h < 48) return `${h}h ago`;
+		return `${Math.floor(h / 24)}d ago`;
 	}
 
 	function fmtMetric(row: BacktestingRunSummary): string {
@@ -660,6 +678,7 @@
 					<div class="text-[10px] text-gray-500">
 						<span class="text-gray-400">{openSessions.length}</span> open /
 						<span class="text-gray-400">{sessions.length}</span> total
+						<span class="help-tip">?<span class="help-text">Sessions auto-open when an MCP client starts work, tag everything it does, and close on disconnect — or after ~6h idle (server sweep). Open = genuinely in use.</span></span>
 					</div>
 				</div>
 			</div>
@@ -753,7 +772,7 @@
 				<div class="flex items-center gap-3">
 					<div class="w-1.5 h-1.5 rounded-full {backendOk ? 'bg-emerald-400' : 'bg-gray-600'}"></div>
 					<span class="text-xs uppercase tracking-widest text-gray-300">Connect an MCP client</span>
-					<span class="text-[10px] text-gray-600">11 MCP tools available · works with any MCP-capable assistant</span>
+					<span class="text-[10px] text-gray-600">{MCP_TOOL_COUNT} MCP tools · the full loop: register → backtest → optimize → robustness → promote</span>
 				</div>
 				<span class="text-gray-600 text-xs">{showMcpConfig ? '▼' : '▶'}</span>
 			</button>
@@ -894,7 +913,7 @@
 						<div class="border border-[#1a1a1a] rounded bg-[#050505] overflow-hidden">
 							{#each HTTP_ENDPOINTS as ep}
 								<div class="flex items-center gap-3 px-3 py-1.5 border-b border-[#141414] last:border-b-0 text-[11px]">
-									<span class="w-12 shrink-0 font-semibold {ep.method === 'GET' ? 'text-sky-400' : 'text-amber-400'}">{ep.method}</span>
+									<span class="w-12 shrink-0 font-semibold {ep.method === 'GET' ? 'text-emerald-400' : 'text-yellow-400'}">{ep.method}</span>
 									<code class="text-gray-300">{ep.path}</code>
 									<span class="ml-auto text-[10px] text-gray-600">{ep.purpose}</span>
 								</div>
@@ -924,6 +943,7 @@
 						{#if activeDetail}
 							<p class="text-[10px] text-gray-500 mt-0.5">
 								{activeDetail.id} · {activeDetail.label || 'unlabeled'} · {activeDetail.status}
+								{#if activeDetail.last_activity_at}· <span class="text-gray-600">last activity {fmtAgo(activeDetail.last_activity_at)}</span>{/if}
 								{#if activeDetail.objective}· <span class="text-gray-600">{activeDetail.objective}</span>{/if}
 							</p>
 						{:else}
@@ -940,7 +960,8 @@
 
 				{#if !activeDetail}
 					<div class="p-6 text-center text-xs text-gray-600">
-						No session selected. Tell your assistant: <em class="text-gray-400">"Open a Forven session for X"</em>
+						No session selected. Sessions open automatically when an MCP client starts working —
+						pick one above, or tell your assistant: <em class="text-gray-400">"Open a Forven session for X"</em>
 					</div>
 				{:else}
 					<!-- Strategies -->
@@ -1056,7 +1077,7 @@
 							title="Static AST scan — checks for forbidden imports and dangerous calls"
 						>{scanBusy ? '…' : 'Scan'}</button>
 						<button
-							class="text-[10px] uppercase tracking-widest px-3 py-1.5 bg-gray-800 hover:bg-gray-700 text-gray-200 rounded disabled:opacity-40"
+							class="terminal-button text-[10px] tracking-widest disabled:opacity-40"
 							on:click={submitRegister}
 							disabled={registerBusy || !registerFilePath.trim() || !scanClean || scanStale}
 							title={!scanReport
@@ -1122,7 +1143,7 @@
 							bind:value={backtestDatasetId}
 						/>
 						<button
-							class="text-[10px] uppercase tracking-widest px-3 py-1.5 bg-gray-800 hover:bg-gray-700 text-gray-200 rounded disabled:opacity-40"
+							class="terminal-button text-[10px] tracking-widest disabled:opacity-40"
 							on:click={submitBacktest}
 							disabled={backtestBusy || !backtestStrategyId.trim() || !backtestDatasetId.trim()}
 						>{backtestBusy ? '…' : 'Run'}</button>

@@ -63,6 +63,12 @@ FUNDING_DIR = _BASE_DIR / "funding"
 OI_DIR = _BASE_DIR / "oi"
 DERIVATIVES_DIR = _BASE_DIR / "derivatives"
 MACRO_DIR = _BASE_DIR / "macro"
+# Crypto-native, strategy-path-eligible streams (edge-data-expansion Run 3):
+# basis (per-symbol premium index) and implied volatility (market-wide DVOL).
+# NOT under macro/ — macro is research-only-gated; these are 24/7 series that
+# join the strategy path with the standard bucket-close causality shift.
+BASIS_DIR = _BASE_DIR / "basis"
+VOL_DIR = _BASE_DIR / "volatility"
 
 
 def assert_data_root_consistent() -> bool:
@@ -367,7 +373,9 @@ def _save_stream_parquet(df: pd.DataFrame, path: Path, stream: str, symbol: str)
                 os.close(fd)
         except OSError:
             pass
-        os.replace(str(tmp), str(path))
+        from forven.data import _replace_with_retry
+
+        _replace_with_retry(tmp, path)
     except Exception:
         # Ensure the .tmp doesn't leak on any error in the write path.
         try:
@@ -398,6 +406,25 @@ def _load_stream_parquet(path: Path) -> pd.DataFrame | None:
 _parquet_cache_lock = threading.Lock()
 _parquet_cache: dict[str, tuple[tuple[float, int], pd.DataFrame]] = {}
 _PARQUET_CACHE_MAX = 256
+
+# Enrichment joins are fully graceful (a missing stream file returns the frame
+# unchanged, no column added) — but SILENTLY so. Surface each absent stream
+# file once per process so "this strategy never got its order-flow columns"
+# is visible in the logs instead of only in a debugger.
+_missing_stream_logged_lock = threading.Lock()
+_missing_stream_logged: set[str] = set()
+
+
+def _log_missing_stream_once(path: Path) -> None:
+    key = str(path)
+    with _missing_stream_logged_lock:
+        if key in _missing_stream_logged:
+            return
+        _missing_stream_logged.add(key)
+    log.warning(
+        "Enrichment stream file absent or empty: %s — the corresponding column(s) "
+        "will not be joined until it is collected", path,
+    )
 
 
 def _parquet_read_cache(path: Path) -> pd.DataFrame | None:
@@ -465,6 +492,7 @@ def _merge_asof_parquet(
     """
     src = _parquet_read_cache(path)
     if src is None or src.empty:
+        _log_missing_stream_once(path)
         return df
     if not all(c in src.columns for c in cols):
         return df
@@ -628,7 +656,7 @@ class OHLCVCollector:
             last_ms = dataset_last_timestamp_ms(symbol, timeframe)
 
             # A present-but-unreadable lake file must NOT be treated as first-time:
-            # dataset_last_timestamp_ms returns None for BOTH a missing file and a
+            # dataset_last_timestamp_ms returns None for BOTH a missing series and a
             # corrupt/unreadable one, and a None cursor refetches from scratch and
             # overwrites the file with a short window — silently dropping history.
             # The old load_parquet path raised on a corrupt file; preserve that.
@@ -957,6 +985,118 @@ class TakerVolumeCollector(_RestCollector):
 
 
 # ---------------------------------------------------------------------------
+# BasisCollector — Binance USD-M premium index (perp basis vs index)
+# ---------------------------------------------------------------------------
+
+class BasisCollector:
+    """Collects the Binance USD-M premium index (1h klines) — the perp's basis
+    vs the underlying index, a funding predictor and crowding/regime signal.
+    Stored as the kline CLOSE per hour (dimensionless fraction, e.g. 0.0004)."""
+
+    _ENDPOINT = "https://fapi.binance.com/fapi/v1/premiumIndexKlines"
+
+    def collect(self, symbol: str) -> int:
+        from forven.data import symbol_to_fs
+        fs_symbol = symbol_to_fs(symbol)
+        path = BASIS_DIR / fs_symbol / "1h.parquet"
+        lock = _get_stream_lock(f"basis::{fs_symbol}")
+
+        with lock:
+            try:
+                existing = _load_stream_parquet(path)
+                last_ms = _last_timestamp(existing)
+                bare = fs_symbol.replace("-", "")
+                params: dict[str, Any] = {"symbol": bare, "interval": "1h", "limit": 500}
+                if last_ms is not None:
+                    params["startTime"] = last_ms + 1
+                resp = _http_session().get(self._ENDPOINT, params=params, timeout=30)
+                resp.raise_for_status()
+                rows = resp.json()
+                if not rows:
+                    return 0
+                new_df = pd.DataFrame(
+                    [
+                        {
+                            "timestamp": pd.Timestamp(int(r[0]), unit="ms", tz="UTC"),
+                            "basis": float(r[4]),  # kline close of the premium index
+                        }
+                        for r in rows
+                        if isinstance(r, (list, tuple)) and len(r) >= 5
+                    ]
+                )
+                new_df, _ = _validate_stream_df(new_df, "basis", non_negative=[])
+                return _combine_and_save(existing, new_df, path, stream="basis", symbol=fs_symbol)
+            except Exception as exc:
+                log.warning("BasisCollector failed for %s: %s", symbol, exc)
+                raise
+
+
+# ---------------------------------------------------------------------------
+# ImpliedVolCollector — Deribit DVOL index (BTC/ETH), market-wide regime
+# ---------------------------------------------------------------------------
+
+class ImpliedVolCollector:
+    """Collects the Deribit DVOL implied-volatility index (crypto's VIX).
+
+    Market-wide (joined onto every symbol's frame as iv_btc/iv_eth), 24/7 and
+    crypto-native, so it is strategy-path eligible with the standard
+    bucket-close shift. Hourly resolution; the free public endpoint bounds
+    each request, so collection is incremental since the last stored row.
+    """
+
+    _ENDPOINT = "https://www.deribit.com/api/v2/public/get_volatility_index_data"
+    _CURRENCIES = ("BTC", "ETH")
+    _RESOLUTION_SECONDS = 3600
+
+    def collect(self) -> dict[str, int]:
+        summary: dict[str, int] = {}
+        for currency in self._CURRENCIES:
+            summary[currency.lower()] = self._collect_currency(currency)
+        return summary
+
+    def _collect_currency(self, currency: str) -> int:
+        path = VOL_DIR / f"dvol_{currency.lower()}_1h.parquet"
+        lock = _get_stream_lock(f"dvol::{currency}")
+        with lock:
+            try:
+                existing = _load_stream_parquet(path)
+                last_ms = _last_timestamp(existing)
+                end_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+                # Cold start: seed ~2y of hourly IV; incremental otherwise.
+                start_ms = (last_ms + 1) if last_ms is not None else end_ms - 730 * 24 * 3_600_000
+                resp = _http_session().get(
+                    self._ENDPOINT,
+                    params={
+                        "currency": currency,
+                        "start_timestamp": start_ms,
+                        "end_timestamp": end_ms,
+                        "resolution": self._RESOLUTION_SECONDS,
+                    },
+                    timeout=30,
+                )
+                resp.raise_for_status()
+                data = (resp.json().get("result") or {}).get("data") or []
+                if not data:
+                    return 0
+                col = f"iv_{currency.lower()}"
+                new_df = pd.DataFrame(
+                    [
+                        {
+                            "timestamp": pd.Timestamp(int(r[0]), unit="ms", tz="UTC"),
+                            col: float(r[4]),  # candle close of the vol index
+                        }
+                        for r in data
+                        if isinstance(r, (list, tuple)) and len(r) >= 5
+                    ]
+                )
+                new_df, _ = _validate_stream_df(new_df, f"dvol_{currency.lower()}", non_negative=[col])
+                return _combine_and_save(existing, new_df, path, stream="dvol", symbol=currency)
+            except Exception as exc:
+                log.warning("ImpliedVolCollector failed for %s: %s", currency, exc)
+                raise
+
+
+# ---------------------------------------------------------------------------
 # LiquidationCollector
 # ---------------------------------------------------------------------------
 
@@ -1234,6 +1374,8 @@ class DataManager:
         self._lsr = LongShortRatioCollector()
         self._taker = TakerVolumeCollector()
         self._liquidation = LiquidationCollector()
+        self._basis = BasisCollector()
+        self._iv = ImpliedVolCollector()
         self._fear_greed = FearGreedCollector()
         self._macro = MacroCollector()
         self._btc_dom = BtcDominanceCollector()
@@ -1242,6 +1384,29 @@ class DataManager:
         # repeat look-ups within one cycle hit the DB at most once.
         self._cycle_cache_active: bool = False
         self._cycle_cache_store: dict[Any, Any] = {}
+        # Delisted-symbol skip set from the symbol registry (survivorship
+        # work): a delisted perp has no new bars, so sweeping it every cycle
+        # is pure wasted API budget. TTL-cached; empty when no registry.
+        self._delisted_cache: tuple[float, set[str]] = (0.0, set())
+        # TTL cache for the (expensive) active-symbol discovery, keyed by the
+        # include_recent_backtests variant.
+        self._active_symbols_cache: dict[bool, tuple[float, set[str]]] = {}
+
+    _DELISTED_CACHE_TTL_SECONDS = 1800.0
+
+    def _delisted_symbols(self) -> set[str]:
+        now = datetime.now(timezone.utc).timestamp()
+        cached_at, cached = self._delisted_cache
+        if now - cached_at < self._DELISTED_CACHE_TTL_SECONDS:
+            return cached
+        try:
+            from forven.dataeng.universe import delisted_symbols
+
+            cached = delisted_symbols()
+        except Exception:
+            cached = set()
+        self._delisted_cache = (now, cached)
+        return cached
 
     @contextlib.contextmanager
     def _cycle_cache(self):
@@ -1287,6 +1452,8 @@ class DataManager:
         fs_symbol = symbol_to_fs(raw)
         parts = [part for part in fs_symbol.split("-") if part]
         if len(parts) == 2 and parts[1] in _KEEPALIVE_QUOTES:
+            if fs_symbol in self._delisted_symbols():
+                return None  # delisted: no new bars exist to collect
             if not require_dataset or (Path(DATA_DIR) / fs_symbol).exists():
                 return fs_symbol
             return None
@@ -1294,6 +1461,8 @@ class DataManager:
         if len(parts) == 1:
             for quote in _KEEPALIVE_QUOTES:
                 candidate = f"{fs_symbol}-{quote}"
+                if candidate in self._delisted_symbols():
+                    continue
                 if (Path(DATA_DIR) / candidate).exists():
                     return candidate
 
@@ -1341,21 +1510,37 @@ class DataManager:
             log.warning("get_active_symbols failed: %s", exc)
         return symbols
 
+    # The active-set discovery costs ~1s (DISTINCT over backtest_results with
+    # no created_at index) and is hit by UI endpoints and every collector
+    # cycle. The set changes on strategy/promotion cadence, not per-second —
+    # a short TTL cache removes the repeated scan without staleness risk.
+    _ACTIVE_SYMBOLS_TTL_SECONDS = 60.0
+
     def get_active_symbols(self, *, include_recent_backtests: bool = True) -> set[str]:
         """Return symbols that should participate in background collection.
 
         Within a ``_cycle_cache()`` context, results are memoized per
         ``include_recent_backtests`` variant so repeat calls within one
-        collection cycle hit the DB at most once.
+        collection cycle hit the DB at most once; across cycles a 60s TTL
+        cache bounds the discovery cost for UI callers.
         """
         if self._cycle_cache_active:
             key = ("active_symbols", include_recent_backtests)
             if key in self._cycle_cache_store:
                 return self._cycle_cache_store[key]
-            val = self._fetch_active_symbols(include_recent_backtests=include_recent_backtests)
+            val = self._active_symbols_cached(include_recent_backtests)
             self._cycle_cache_store[key] = val
             return val
-        return self._fetch_active_symbols(include_recent_backtests=include_recent_backtests)
+        return self._active_symbols_cached(include_recent_backtests)
+
+    def _active_symbols_cached(self, include_recent_backtests: bool) -> set[str]:
+        now = datetime.now(timezone.utc).timestamp()
+        cached = self._active_symbols_cache.get(include_recent_backtests)
+        if cached is not None and now - cached[0] < self._ACTIVE_SYMBOLS_TTL_SECONDS:
+            return cached[1]
+        val = self._fetch_active_symbols(include_recent_backtests=include_recent_backtests)
+        self._active_symbols_cache[include_recent_backtests] = (now, val)
+        return val
 
     def _fetch_active_timeframes(self, symbol: str) -> set[str]:
         """Underlying DB fetch for ``get_active_timeframes``. Bypasses the cycle cache.
@@ -1432,14 +1617,20 @@ class DataManager:
         """
         if not (max_pairs_per_run and max_pairs_per_run > 0) or len(pairs) <= max_pairs_per_run:
             return list(pairs)
-        from forven.data import parquet_path
+        from forven.data import parquet_path, tail_path
 
         def _last_refresh(pair: tuple[str, str]) -> float:
             symbol, timeframe = pair
-            try:
-                return parquet_path(symbol, timeframe).stat().st_mtime
-            except OSError:
-                return 0.0  # never written -> treat as most stale
+            # Appends land in the tail sidecar, so freshness is the NEWEST of
+            # cold/tail mtime — cold alone would rank freshly-appended pairs
+            # as stale forever.
+            newest = 0.0
+            for candidate in (parquet_path(symbol, timeframe), tail_path(symbol, timeframe)):
+                try:
+                    newest = max(newest, candidate.stat().st_mtime)
+                except OSError:
+                    continue
+            return newest  # 0.0 = never written -> treat as most stale
 
         def _rank(pair: tuple[str, str]) -> tuple[float, float]:
             return (self._keepalive_last_checked.get(pair, 0.0), _last_refresh(pair))
@@ -1624,6 +1815,44 @@ class DataManager:
             _record_collection("liquidations", None, 0, False)
             raise
 
+    def collect_basis(self) -> dict[str, Any]:
+        """Collect the premium-index basis series for active crypto symbols."""
+        try:
+            with self._cycle_cache():
+                symbols = self.get_active_symbols()
+                summary: dict[str, int] = {}
+                tally = _PerSymbolTally()
+                for symbol in symbols:
+                    summary[symbol] = tally.run(symbol, lambda s=symbol: self._basis.collect(s))
+                total = sum(summary.values())
+                log.info(
+                    "Basis collect: %d symbols, %d rows added, %d failed",
+                    len(symbols), total, tally.failed,
+                )
+                tally.record("basis", total)
+                return {"symbols": summary, "total_rows": total}
+        except Exception:
+            _record_collection("basis", None, 0, False)
+            raise
+
+    def collect_iv(self) -> dict[str, Any]:
+        """Collect the Deribit DVOL implied-volatility index (BTC/ETH)."""
+        try:
+            with self._cycle_cache():
+                tally = _PerSymbolTally()
+                summary: dict[str, int] = {}
+                for currency in ImpliedVolCollector._CURRENCIES:
+                    summary[currency.lower()] = tally.run(
+                        currency, lambda c=currency: self._iv._collect_currency(c)
+                    )
+                total = sum(summary.values())
+                log.info("DVOL collect: %d rows added, %d failed", total, tally.failed)
+                tally.record("dvol", total)
+                return {"currencies": summary, "total_rows": total}
+        except Exception:
+            _record_collection("dvol", None, 0, False)
+            raise
+
     def collect_fear_greed(self) -> dict[str, Any]:
         """Collect Fear & Greed Index (global)."""
         try:
@@ -1730,6 +1959,57 @@ class DataManager:
             out["funding_error"] = str(exc)
         return out
 
+    def _backfill_metrics(self, fs_sym: str, bv_symbol: str, *, days_bound: int | None = None) -> dict:
+        """Deep-backfill OI + long/short ratio + taker ratio from BV daily
+        metrics files in ONE pass (each daily zip carries all three; the legacy
+        _backfill_oi re-downloaded it per timeframe and discarded the ratios)."""
+        out: dict = {}
+        try:
+            timeframes = sorted(self.get_active_timeframes(fs_sym) or {"1h", "4h"})
+            added = bv_client.backfill_metrics(
+                fs_sym,
+                timeframes,
+                oi_paths={tf: OI_DIR / fs_sym / f"{tf}.parquet" for tf in timeframes},
+                lsr_path=DERIVATIVES_DIR / fs_sym / "long_short_ratio_1h.parquet",
+                taker_path=DERIVATIVES_DIR / fs_sym / "taker_volume_1h.parquet",
+                save_fn=_save_stream_parquet,
+                load_fn=_load_stream_parquet,
+                days_bound=days_bound,
+            )
+            for stream_name, rows in (added or {}).items():
+                out[f"metrics:{stream_name}"] = rows
+                if rows:
+                    log.info("BV metrics backfill %s %s: +%d rows", fs_sym, stream_name, rows)
+        except Exception as exc:
+            log.warning("BV metrics backfill failed for %s: %s", fs_sym, exc)
+            out["metrics_error"] = str(exc)
+        return out
+
+    def _backfill_basis(self, fs_sym: str, bv_symbol: str) -> dict:
+        """Deep-backfill the premium-index basis series from BV archives."""
+        out: dict = {}
+        try:
+            path = BASIS_DIR / fs_sym / "1h.parquet"
+            existing_df = _load_stream_parquet(path)
+            oldest = (
+                pd.to_datetime(existing_df["timestamp"].iloc[0], utc=True)
+                if existing_df is not None and not existing_df.empty
+                else None
+            )
+            added = bv_client.backfill_premium_index(
+                fs_sym, oldest,
+                save_fn=_save_stream_parquet,
+                load_fn=_load_stream_parquet,
+                path=path,
+            )
+            if added:
+                out["basis"] = added
+                log.info("BV backfill basis %s: +%d rows", fs_sym, added)
+        except Exception as exc:
+            log.warning("BV basis backfill failed for %s: %s", fs_sym, exc)
+            out["basis_error"] = str(exc)
+        return out
+
     def _backfill_oi(self, fs_sym: str, bv_symbol: str) -> dict:
         out: dict = {}
         timeframes_oi = self.get_active_timeframes(fs_sym) or {"1h", "4h"}
@@ -1761,12 +2041,18 @@ class DataManager:
         self,
         symbol: str | None = None,
         streams: tuple = ("ohlcv", "funding", "oi"),
+        *,
+        progress_cb=None,
+        cancel_event=None,
     ) -> dict:
         """Bulk-backfill historical data from Binance Vision.
 
         If symbol is None, backfills all symbols discovered from the data/ohlcv/ directory.
         streams controls which stream types are backfilled.
-        Returns a summary dict.
+        ``progress_cb(done, total, current_symbol)`` is invoked before each
+        symbol; ``cancel_event`` (threading.Event) is checked between symbols
+        for a cooperative stop. Returns a summary dict (with ``cancelled``
+        set when stopped early).
         """
         from forven.data import DATA_DIR, symbol_to_fs
 
@@ -1780,15 +2066,27 @@ class DataManager:
             )
 
         summary: dict = {}
-        for fs_sym in fs_symbols:
+        total = len(fs_symbols)
+        for idx, fs_sym in enumerate(fs_symbols):
+            if cancel_event is not None and cancel_event.is_set():
+                summary["cancelled"] = True
+                log.info("BV backfill cancelled after %d/%d symbols", idx, total)
+                break
+            if progress_cb is not None:
+                try:
+                    progress_cb(idx, total, fs_sym)
+                except Exception:
+                    pass
             bv_symbol = bv_client.fs_to_bv(fs_sym)
             summary[fs_sym] = {}
             if "ohlcv" in streams:
                 summary[fs_sym].update(self._backfill_ohlcv(fs_sym, bv_symbol))
             if "funding" in streams:
                 summary[fs_sym].update(self._backfill_funding(fs_sym, bv_symbol))
-            if "oi" in streams:
-                summary[fs_sym].update(self._backfill_oi(fs_sym, bv_symbol))
+            if "oi" in streams or "metrics" in streams:
+                summary[fs_sym].update(self._backfill_metrics(fs_sym, bv_symbol))
+            if "basis" in streams:
+                summary[fs_sym].update(self._backfill_basis(fs_sym, bv_symbol))
         return summary
 
     def _check_and_backfill(self) -> None:
@@ -1853,9 +2151,21 @@ class DataManager:
             if _data_engine_read_enabled():
                 from forven.dataeng.hub import get_data_hub
 
-                return get_data_hub().enrich(df, symbol, timeframe)
+                # exclude_streams MUST be forwarded: the backtest path excludes
+                # funding/OI (its source of truth is the Hyperliquid hourly join)
+                # and dropping the exclusion here re-joins Binance per-8h funding
+                # over it — ~8x funding mischarge.
+                return get_data_hub().enrich(
+                    df,
+                    symbol,
+                    timeframe,
+                    include_macro=include_macro,
+                    exclude_streams=tuple(excluded),
+                )
         except Exception as exc:
-            log.debug("DataHub enrichment failed for %s/%s; falling back to legacy enrich: %s", symbol, timeframe, exc)
+            # Loud: a persistent DataHub failure means the engine-on and legacy
+            # paths can silently diverge on enrichment values.
+            log.warning("DataHub enrichment failed for %s/%s; falling back to legacy enrich: %s", symbol, timeframe, exc)
 
         result = df.copy()
 
@@ -1890,6 +2200,20 @@ class DataManager:
                 result = self._enrich_liquidations(result, symbol)
             except Exception as exc:
                 log.warning("Liquidation enrichment skipped for %s: %s", symbol, exc)
+
+        # Run 3 crypto-native streams: per-symbol basis + market-wide implied
+        # vol. Both are bar-aggregate series → bucket-close shifted.
+        if "basis" not in excluded:
+            try:
+                result = self._enrich_basis(result, symbol)
+            except Exception as exc:
+                log.warning("Basis enrichment skipped for %s: %s", symbol, exc)
+
+        if "iv" not in excluded:
+            try:
+                result = self._enrich_iv(result)
+            except Exception as exc:
+                log.warning("IV enrichment skipped: %s", exc)
 
         # RESEARCH-ONLY daily macro / sentiment. These carry same-day-close
         # lookahead and weekend gaps, so they are NEVER joined on the strategy/
@@ -1975,6 +2299,28 @@ class DataManager:
             fill={"long_liq_usd": 0.0, "short_liq_usd": 0.0, "liq_imbalance": 0.0},
             shift_to_bucket_close=True,
         )
+
+    def _enrich_basis(self, df: pd.DataFrame, symbol: str) -> pd.DataFrame:
+        from forven.data import symbol_to_fs
+        return _merge_asof_parquet(
+            df,
+            BASIS_DIR / symbol_to_fs(symbol) / "1h.parquet",
+            cols=["basis"],
+            fill={},  # NaN before coverage — basis=0 is a real market state
+            shift_to_bucket_close=True,
+        )
+
+    def _enrich_iv(self, df: pd.DataFrame) -> pd.DataFrame:
+        result = df
+        for currency in ("btc", "eth"):
+            result = _merge_asof_parquet(
+                result,
+                VOL_DIR / f"dvol_{currency}_1h.parquet",
+                cols=[f"iv_{currency}"],
+                fill={},  # NaN before coverage — a fake IV level is a signal
+                shift_to_bucket_close=True,
+            )
+        return result
 
     def _enrich_fear_greed(self, df: pd.DataFrame) -> pd.DataFrame:
         return _merge_asof_parquet(

@@ -73,8 +73,13 @@ def _build_isolated_env(bot_config: dict) -> dict[str, str]:
     }
 
     # ISO-4: the subprocess does NOT inherit the parent's os.environ, so it
-    # would miss the in-process ChromaDB segfault guard. Forward it (and related
-    # flags) so bot memory honors the same guard on affected hosts.
+    # would miss the in-process ChromaDB segfault guard for BotMemory's own
+    # chroma store (FORVEN_HOME/chroma/bots — separate from the removed main
+    # vector layer). The API process no longer sets the guard globally, so
+    # default it ON for spawned bots on Windows, where the ONNX crash lives;
+    # an operator can export FORVEN_DISABLE_CHROMA_IN_PROCESS=0 to override.
+    if sys.platform.startswith("win"):
+        env.setdefault("FORVEN_DISABLE_CHROMA_IN_PROCESS", "1")
     for guard_var in (
         "FORVEN_DISABLE_CHROMA_IN_PROCESS",
         "FORVEN_DISABLE_CHROMA",
@@ -118,6 +123,23 @@ def _build_isolated_env(bot_config: dict) -> dict[str, str]:
         openai_key = os.environ.get("OPENAI_API_KEY")
         if openai_key:
             env["OPENAI_API_KEY"] = openai_key
+
+    # A LIVE-armed bot places real exchange orders from its subprocess through
+    # the sanctioned live stack (bot_factory.live_exec). Hyperliquid credentials
+    # normally come from the encrypted KV settings store (reachable via
+    # FORVEN_HOME, already forwarded); when the operator supplies them via
+    # environment instead, forward exactly those vars — and ONLY for live bots,
+    # keeping paper bots exchange-credential-free.
+    if str(bot_config.get("execution_mode") or "paper").strip().lower() == "live":
+        for var in (
+            "FORVEN_HL_API_SECRET", "HL_API_SECRET",
+            "FORVEN_HL_API_KEY", "HL_API_KEY",
+            "FORVEN_HL_WALLET_ADDRESS", "HL_WALLET_ADDRESS",
+            "FORVEN_HL_USE_TESTNET", "USE_TESTNET",
+        ):
+            val = os.environ.get(var)
+            if val:
+                env[var] = val
 
     return env
 
@@ -171,6 +193,43 @@ class BotManager:
         if not bot:
             raise ValueError(f"Bot {bot_id} not found")
 
+        # Fail closed on a live-armed bot whose arming state has decayed since
+        # go-live: the protective stop config and the per-bot notional ceiling
+        # are both load-bearing for live opens.
+        if str(bot.get("execution_mode") or "paper").strip().lower() == "live":
+            if bot.get("stop_loss_pct") is None:
+                raise ValueError(
+                    "Live bot has no stop_loss_pct — set one (or switch to paper) before starting."
+                )
+            try:
+                from forven.exchange.risk import get_live_notional_ceilings
+
+                if not get_live_notional_ceilings().get(f"bot:{bot_id}"):
+                    raise ValueError(
+                        "Live bot has no go-live notional ceiling recorded — re-arm via go-live."
+                    )
+            except ValueError:
+                raise
+            except Exception as exc:
+                raise ValueError(
+                    f"Cannot verify the live notional ceiling ({exc}) — refusing to start a live bot."
+                )
+            wallet_label = str(bot.get("live_wallet") or "").strip().lower()
+            if wallet_label:
+                try:
+                    from forven.exchange import books
+
+                    registered = wallet_label in books.named_wallets()
+                except Exception as exc:
+                    raise ValueError(
+                        f"Cannot verify wallet '{wallet_label}' ({exc}) — refusing to start a live bot."
+                    )
+                if not registered:
+                    raise ValueError(
+                        f"Live bot routes to wallet '{wallet_label}' which is no longer "
+                        "registered — re-arm via go-live (or restore the wallet)."
+                    )
+
         status = bot.get("runtime_status") or bot.get("status", "stopped")
         if status == "running":
             # LIFE-7: a hard crash can leave a stale 'running' label. If the
@@ -201,9 +260,14 @@ class BotManager:
         }
 
         if os.name == "nt":
+            # CREATE_NO_WINDOW only — never combine with DETACHED_PROCESS:
+            # Windows ignores CREATE_NO_WINDOW when DETACHED_PROCESS is set, so
+            # the child runs console-less and the venv launcher's re-spawned
+            # base interpreter allocates a fresh VISIBLE console (terminal
+            # window pops up on every bot start). With CREATE_NO_WINDOW alone
+            # the child owns a hidden console the grandchild inherits.
             creationflags = (
-                getattr(subprocess, "DETACHED_PROCESS", 0)
-                | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
                 | getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
             )
             popen_kwargs["creationflags"] = creationflags
@@ -291,12 +355,51 @@ class BotManager:
         set_bot_status(bot_id, "stopped")
 
         bot = get_bot(bot_id)
+        # LIVE-STOP-1: a stopped bot no longer manages its positions, so leaving
+        # a REAL exchange position open (unmanaged) is unsafe and surprising.
+        # Flatten the bot's live positions now — the subprocess is already dead,
+        # so it can't race the reduce-only closes. Paper bots have no live rows,
+        # so this is a no-op for them.
+        flattened = self._flatten_live_positions_on_stop(bot, reason="bot_stopped")
+
+        summary = f"Bot '{(bot or {}).get('name', bot_id)}' stopped"
+        if flattened:
+            closed = sum(1 for r in flattened if r.get("state") == "closed")
+            pending = sum(1 for r in flattened if r.get("state") == "pending")
+            parts = []
+            if closed:
+                parts.append(f"{closed} live position(s) closed")
+            if pending:
+                parts.append(f"{pending} close(s) pending exchange reconcile")
+            if parts:
+                summary += " — " + ", ".join(parts)
         log_activity(
-            "info", "bot_factory",
-            f"Bot '{(bot or {}).get('name', bot_id)}' stopped",
-            {"bot_id": bot_id},
+            "info", "bot_factory", summary,
+            {"bot_id": bot_id, "flattened": flattened},
         )
-        return {"status": "stopped"}
+        return {"status": "stopped", "flattened": flattened}
+
+    def _flatten_live_positions_on_stop(self, bot: dict | None, *, reason: str) -> list[dict]:
+        """Reduce-only close every OPEN live position the bot holds. Best-effort:
+        a single failed close never blocks the stop, and the resting exchange
+        stop still protects a position whose close is pending reconcile."""
+        if not bot or str(bot.get("execution_mode") or "paper").strip().lower() != "live":
+            return []
+        try:
+            from forven.bot_factory.live_exec import flatten_live_positions
+
+            results = flatten_live_positions(bot, reason=reason)
+            if results:
+                logger.warning(
+                    "Bot %s stop flattened live positions: %s", bot.get("id"), results,
+                )
+            return results
+        except Exception as exc:
+            logger.error(
+                "Bot %s stop: live-position flatten FAILED: %s", (bot or {}).get("id"), exc,
+                exc_info=True,
+            )
+            return [{"state": "failed", "message": str(exc)}]
 
     def kill_all(self) -> dict:
         """Stop all running bots immediately."""

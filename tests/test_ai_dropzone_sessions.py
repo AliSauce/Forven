@@ -196,3 +196,86 @@ def test_get_session_detail_surfaces_runs_via_config_json(forven_db):
     detail = get_session_detail(sess["id"])
     assert detail is not None
     assert any(r["result_id"] == "R-1" for r in detail["runs"])
+
+
+def test_touch_session_updates_last_activity(forven_db):
+    from forven.ai_dropzone_sessions import touch_session
+
+    sess = create_session(label="touch-me")
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE ai_dropzone_sessions SET last_activity_at = '2026-01-01T00:00:00+00:00' WHERE id = ?",
+            (sess["id"],),
+        )
+    touch_session(sess["id"])
+    refreshed = get_session(sess["id"])
+    assert refreshed["last_activity_at"] > "2026-01-01T00:00:00+00:00"
+
+
+def test_idle_sweep_closes_stale_active_sessions(forven_db):
+    from forven.ai_dropzone_sessions import close_idle_sessions
+
+    stale = create_session(label="stale")
+    fresh = create_session(label="fresh")
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE ai_dropzone_sessions SET last_activity_at = '2026-01-01T00:00:00+00:00' WHERE id = ?",
+            (stale["id"],),
+        )
+
+    closed = close_idle_sessions(idle_hours=6.0)
+    assert closed == 1
+
+    stale_row = get_session(stale["id"])
+    assert stale_row["status"] == "closed"
+    assert stale_row["ended_at"]
+    assert stale_row["metadata"].get("auto_closed") == "idle"
+
+    fresh_row = get_session(fresh["id"])
+    assert fresh_row["status"] == "active"
+
+
+def test_idle_sweep_spares_recently_touched_sessions(forven_db):
+    from forven.ai_dropzone_sessions import close_idle_sessions, touch_session
+
+    sess = create_session(label="active-work")
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE ai_dropzone_sessions SET started_at = '2026-01-01T00:00:00+00:00' WHERE id = ?",
+            (sess["id"],),
+        )
+    # Old start, but recent tagged activity — the sweep must not close it.
+    touch_session(sess["id"])
+    assert close_idle_sessions(idle_hours=6.0) == 0
+    assert get_session(sess["id"])["status"] == "active"
+
+
+def test_list_sessions_runs_idle_sweep(forven_db):
+    stale = create_session(label="stale-via-list")
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE ai_dropzone_sessions SET last_activity_at = '2026-01-01T00:00:00+00:00' WHERE id = ?",
+            (stale["id"],),
+        )
+    rows = list_sessions(limit=10)
+    by_id = {r["id"]: r for r in rows}
+    assert by_id[stale["id"]]["status"] == "closed"
+
+
+def test_record_strategy_in_session_touches_activity(forven_db):
+    sess = create_session(label="tag-touch")
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE ai_dropzone_sessions SET last_activity_at = '2026-01-01T00:00:00+00:00' WHERE id = ?",
+            (sess["id"],),
+        )
+        conn.execute(
+            "INSERT INTO strategies (id, name, type, symbol, timeframe, status, stage, source)"
+            " VALUES ('S-TT1','TagTouch','t','BTC','1h','active','quick_screen','ai_dropzone')"
+        )
+        from forven.ai_dropzone_sessions import record_strategy_in_session
+
+        record_strategy_in_session(conn, session_id=sess["id"], strategy_id="S-TT1")
+
+    refreshed = get_session(sess["id"])
+    assert refreshed["last_activity_at"] > "2026-01-01T00:00:00+00:00"

@@ -6,6 +6,7 @@
 		getTaskAudit,
 		type TaskContainer,
 		type TaskAuditEvent,
+		type TaskTranscriptMessage,
 	} from '$lib/api';
 	import type { PageData } from './$types';
 
@@ -14,11 +15,13 @@
 	let task: TaskContainer | null = data.task;
 	let auditLog: TaskAuditEvent[] = data.auditLog;
 	let toolCalls: Array<Record<string, unknown>> = data.toolCalls;
+	let transcript: TaskTranscriptMessage[] = data.transcript;
 	let loading = false;
 	let error: string | null = data.loadError;
 
 	const TABS = [
 		{ id: 'overview', label: 'Overview' },
+		{ id: 'transcript', label: 'Transcript' },
 		{ id: 'audit', label: 'Audit Log' },
 		{ id: 'tools', label: 'Tool Calls' },
 		{ id: 'data', label: 'Task Data' },
@@ -27,7 +30,7 @@
 	let activeTab: string = 'overview';
 
 	$: taskId = $page.params.id ?? '';
-	$: returnTo = $page.url.searchParams.get('returnTo') || '/tasks';
+	$: returnTo = $page.url.searchParams.get('returnTo') || '/agents?tab=tasks';
 
 	// Re-sync local state when the load function reruns (e.g. navigating between
 	// task ids, where SvelteKit reuses this component instance).
@@ -37,6 +40,7 @@
 		task = data.task;
 		auditLog = data.auditLog;
 		toolCalls = data.toolCalls;
+		transcript = data.transcript;
 		error = data.loadError;
 		loading = false;
 	}
@@ -48,18 +52,18 @@
 	function statusClass(status: string): string {
 		switch (status) {
 			case 'running':
-				return 'text-cyan-300 border-cyan-700 bg-cyan-900/20';
+				return 'text-emerald-400 border-emerald-900 bg-emerald-500/10';
 			case 'done':
 			case 'reviewed':
-				return 'text-green-300 border-green-700 bg-green-900/20';
+				return 'text-[#888] border-[#333]';
 			case 'failed':
-				return 'text-red-300 border-red-700 bg-red-900/20';
+				return 'text-red-400 border-red-900 bg-red-500/10';
 			case 'blocked':
-				return 'text-yellow-300 border-yellow-700 bg-yellow-900/20';
+				return 'text-yellow-400 border-yellow-900 bg-yellow-500/10';
 			case 'rejected':
-				return 'text-orange-300 border-orange-700 bg-orange-900/20';
+				return 'text-red-400 border-red-900 bg-red-500/10';
 			default:
-				return 'text-gray-300 border-gray-700 bg-gray-900/20';
+				return 'text-[#888] border-[#333]';
 		}
 	}
 
@@ -138,6 +142,7 @@
 			task = details.task;
 			auditLog = Array.isArray(details.audit_log) ? details.audit_log : [];
 			toolCalls = Array.isArray(details.tool_calls) ? details.tool_calls : [];
+			transcript = Array.isArray(details.transcript) ? details.transcript : [];
 		} catch (e) {
 			if (!silent) {
 				error = e instanceof Error ? e.message : 'Failed to load task details';
@@ -350,14 +355,14 @@
 						<span class="font-mono">{fmtUsd(task.cost_usd)}</span>
 					</span>
 					<span
-						class="inline-flex items-center gap-1.5 text-[11px] border border-cyan-800 bg-cyan-950/20 text-cyan-200 px-2 py-1 rounded"
+						class="inline-flex items-center gap-1.5 text-[11px] border border-[#333] bg-[#0c0c0c] text-[#aaa] px-2 py-1"
 						title="Total tokens (input + output)"
 					>
-						<span class="text-cyan-400/80 uppercase tracking-wider text-[9px]">Tokens</span>
+						<span class="text-[#666] uppercase tracking-wider text-[9px]">Tokens</span>
 						<span class="font-mono">{fmtTokens(task.total_tokens)}</span>
 					</span>
 					<span
-						class="inline-flex items-center gap-1.5 text-[11px] border border-[#333] bg-[#0c0c0c] text-gray-300 px-2 py-1 rounded"
+						class="inline-flex items-center gap-1.5 text-[11px] border border-[#333] bg-[#0c0c0c] text-[#aaa] px-2 py-1"
 						title="Provider and model used"
 					>
 						<span class="text-gray-500 uppercase tracking-wider text-[9px]">Model</span>
@@ -386,7 +391,7 @@
 						<div class="space-y-2 text-xs">
 							<div>
 								<span class="text-gray-500">Display ID:</span>
-								<span class="text-cyan-300 font-mono ml-1"
+								<span class="text-[#aaa] font-mono ml-1"
 									>{task.display_id || '--'}</span
 								>
 							</div>
@@ -430,7 +435,7 @@
 								{#if task.strategy_id || task.strategy_display_id}
 									<button
 										type="button"
-										class="text-cyan-300 hover:text-cyan-200 font-mono ml-1"
+										class="text-[#aaa] hover:text-white font-mono ml-1"
 										on:click={() => task && goToStrategy(task)}
 									>
 										{strategyLabel(task)}
@@ -538,9 +543,9 @@
 						{#if task.started_at}
 							<div class="relative">
 								<div
-									class="absolute -left-[21px] top-1 w-2.5 h-2.5 rounded-full bg-cyan-500 border-2 border-[#0c0c0c]"
+									class="absolute -left-[21px] top-1 w-2.5 h-2.5 rounded-full bg-white border-2 border-[#0c0c0c]"
 								></div>
-								<div class="text-xs text-cyan-300">
+								<div class="text-xs text-[#aaa]">
 									Execution Started
 								</div>
 								<div class="text-[11px] text-gray-500">
@@ -612,6 +617,119 @@
 						</div>
 					</div>
 				{/if}
+			{:else if activeTab === 'transcript'}
+				{#if transcript.length === 0}
+					<div class="text-sm text-gray-600">
+						No transcript recorded for this task. Per-round transcripts are
+						captured for runs executed after the agent-overhaul upgrade.
+					</div>
+				{:else}
+					<div class="space-y-2">
+						{#each transcript as msg (msg.id)}
+							{#if msg.role === 'user'}
+								<div class="border border-[#222] rounded p-3 bg-[#0c0c0c]">
+									<div class="flex items-center justify-between gap-4">
+										<div class="text-[10px] uppercase tracking-wider text-[#888]">
+											Prompt
+										</div>
+										<div class="text-[11px] text-gray-600 whitespace-nowrap">
+											{fmtDate(msg.created_at)}
+										</div>
+									</div>
+									<pre
+										class="mt-1 max-h-[280px] overflow-auto text-xs text-gray-300 whitespace-pre-wrap break-words">{msg.content}</pre>
+								</div>
+							{:else if msg.role === 'assistant'}
+								<div class="border border-[#222] rounded p-3 bg-[#0c0c0c]">
+									<div class="flex items-center justify-between gap-4">
+										<div class="text-[10px] uppercase tracking-wider text-[#888]">
+											Assistant
+											{#if msg.tool_round != null}
+												<span class="text-gray-600 normal-case tracking-normal ml-1"
+													>round {msg.tool_round + 1}</span
+												>
+											{/if}
+										</div>
+										<div class="text-[11px] text-gray-600 whitespace-nowrap">
+											{#if msg.input_tokens || msg.output_tokens}
+												<span class="font-mono"
+													>{fmtTokens(msg.input_tokens)} in / {fmtTokens(
+														msg.output_tokens,
+													)} out</span
+												>
+												<span class="mx-1 text-gray-800">·</span>
+											{/if}
+											{#if msg.provider}
+												<span class="font-mono">{msg.provider}{msg.model_id ? `/${msg.model_id}` : ''}</span>
+												<span class="mx-1 text-gray-800">·</span>
+											{/if}
+											{fmtDate(msg.created_at)}
+										</div>
+									</div>
+									{#if msg.reasoning}
+										<details class="mt-2" open>
+											<summary
+												class="cursor-pointer text-[10px] uppercase tracking-wider text-amber-500/90 select-none"
+											>
+												Reasoning
+											</summary>
+											<pre
+												class="mt-1 max-h-[280px] overflow-auto bg-black/40 border border-amber-900/30 rounded p-2 text-[11px] text-amber-100/70 whitespace-pre-wrap break-words">{msg.reasoning}</pre>
+										</details>
+									{/if}
+									{#if msg.content}
+										<pre
+											class="mt-2 max-h-[320px] overflow-auto text-xs text-gray-200 whitespace-pre-wrap break-words">{msg.content}</pre>
+									{/if}
+								</div>
+							{:else if msg.role === 'tool'}
+								<div class="border border-[#222] rounded p-3 bg-[#0c0c0c] ml-5">
+									<div class="flex items-center justify-between gap-4">
+										<div class="text-sm">
+											<span class="text-[10px] uppercase tracking-wider text-purple-400"
+												>Tool</span
+											>
+											<span class="font-mono text-gray-200 ml-2"
+												>{msg.tool_name || 'tool'}</span
+											>
+										</div>
+										<div class="text-[11px] text-gray-600 whitespace-nowrap">
+											{fmtDate(msg.created_at)}
+										</div>
+									</div>
+									{#if msg.tool_args}
+										<details class="mt-2">
+											<summary
+												class="cursor-pointer text-[10px] uppercase tracking-wider text-gray-600 select-none"
+											>
+												Arguments
+											</summary>
+											<pre
+												class="mt-1 max-h-[200px] overflow-auto bg-black/40 border border-[#1b1b1b] rounded p-2 text-[11px] text-gray-300 whitespace-pre-wrap break-words">{formatValue(msg.tool_args)}</pre>
+										</details>
+									{/if}
+									{#if msg.tool_result}
+										<details class="mt-2">
+											<summary
+												class="cursor-pointer text-[10px] uppercase tracking-wider text-gray-600 select-none"
+											>
+												Result
+											</summary>
+											<pre
+												class="mt-1 max-h-[280px] overflow-auto bg-black/40 border border-[#1b1b1b] rounded p-2 text-[11px] text-gray-300 whitespace-pre-wrap break-words">{formatValue(msg.tool_result)}</pre>
+										</details>
+									{/if}
+								</div>
+							{:else}
+								<div
+									class="px-3 py-1.5 ml-5 text-[11px] text-gray-500 italic border-l-2 border-[#333]"
+								>
+									{msg.content || msg.role}
+								</div>
+							{/if}
+						{/each}
+					</div>
+				{/if}
 			{:else if activeTab === 'audit'}
 				{#if auditLog.length === 0}
 					<div class="text-sm text-gray-600">
@@ -628,7 +746,7 @@
 								>
 									<div class="min-w-0">
 										<div class="text-sm text-gray-200">
-											<span class="font-mono text-cyan-300"
+											<span class="font-mono text-[#aaa]"
 												>#{i + 1}</span
 											>
 											{String(
@@ -707,7 +825,7 @@
 								>
 									<div class="min-w-0">
 										<div class="text-sm text-gray-200">
-											<span class="font-mono text-cyan-300"
+											<span class="font-mono text-[#aaa]"
 												>#{i + 1}</span
 											>
 											<span class="font-mono ml-1"

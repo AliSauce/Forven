@@ -67,6 +67,8 @@ def test_get_datasets_stub_preserves_market_metadata(monkeypatch):
             "row_count": 240,
             "asset_class": "stock",
             "market_type": "equity",
+            # Venue stamp (forven_market): absent in this seeded row -> "unstamped"
+            "market": "unstamped",
         }
     ]
 

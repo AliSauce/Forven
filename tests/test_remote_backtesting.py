@@ -196,31 +196,6 @@ def test_monthly_return_sentinel_filtered(forven_db):
     assert result["backtest_months"] is None
 
 
-def test_vectordb_stores_sentinel_for_missing_monthly():
-    """Missing monthly → stored as -999.0, not 0.0."""
-    metrics = {
-        "sharpe": 1.0,
-        "total_return_pct": 0.5,
-        # monthly_return_pct intentionally absent
-        # annualized_return_pct intentionally absent
-        # backtest_months intentionally absent
-        "win_rate": 0.6,
-        "profit_factor": 1.3,
-        "max_drawdown_pct": 0.1,
-        "total_trades": 10,
-    }
-
-    with patch("forven.vectordb._upsert") as mock_upsert:
-        from forven.vectordb import store_backtest_result
-        store_backtest_result("strat-1", "BTC", "rsi", {"p": 14}, metrics, 75.0)
-
-    mock_upsert.assert_called_once()
-    stored_metadata = mock_upsert.call_args[0][3][0]
-    assert stored_metadata["monthly_return_pct"] == -999.0
-    assert stored_metadata["annualized_return_pct"] == -999.0
-    assert stored_metadata["backtest_months"] == -999.0
-
-
 def test_coerce_backtest_summary_filters_sentinel(forven_db):
     """_coerce_backtest_summary_payload filters -999.0 sentinels."""
     from forven.api_core import _coerce_backtest_summary_payload

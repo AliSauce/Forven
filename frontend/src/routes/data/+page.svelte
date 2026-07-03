@@ -24,6 +24,22 @@
 		type IngestionRun,
 		type ForvenSettings,
 	} from '$lib/api';
+	import {
+		getDataUniverse,
+		refreshUniverseRegistry,
+		seedUniverse,
+		cancelUniverseSeed,
+		getBackfillStatus,
+		triggerBackfill,
+		cancelBackfill,
+		getCollectionHealth,
+		getDataHealth,
+		updateUniverseConfig,
+		type DataUniverse,
+		type BackfillStatus,
+		type CollectionHealth,
+		type DataHealth,
+	} from '$lib/api/data';
 	import { dataFetchState, clearDataFetchTask } from '$lib/stores/dataFetch';
 	import { page } from '$app/stores';
 	import { goto } from '$app/navigation';
@@ -167,12 +183,22 @@
 
 	async function loadData(preferred?: { symbol: string; timeframe: string }): Promise<void> {
 		const failures: string[] = [];
-		const [settingsResult, datasetsResult, runsResult, dataEngineResult] = await Promise.allSettled([
+		const [settingsResult, datasetsResult, runsResult, dataEngineResult, healthResult, lakeResult, universeResult] = await Promise.allSettled([
 			getSettings(),
 			getDatasets(),
 			getIngestionRuns({ limit: 500 }),
 			getDataEngineStatus(),
+			getCollectionHealth(),
+			getDataHealth(),
+			getDataUniverse(),
 		]);
+
+		collectionHealth = healthResult.status === 'fulfilled' ? healthResult.value : null;
+		lakeHealth = lakeResult.status === 'fulfilled' ? lakeResult.value : null;
+		if (universeResult.status === 'fulfilled') {
+			universe = universeResult.value;
+			opsLoaded = true;
+		}
 
 		if (settingsResult.status === 'fulfilled') {
 			const settings = settingsResult.value as ForvenSettings;
@@ -366,6 +392,172 @@
 		? dataEnginePlan.tasks.filter((t) => t.stream === 'candles').length
 		: 0;
 
+	// --- Overview trust strip ---
+	let collectionHealth: CollectionHealth | null = null;
+	let lakeHealth: DataHealth | null = null;
+
+	function formatBytes(bytes: number | null | undefined): string {
+		const value = Number(bytes) || 0;
+		if (value >= 1024 ** 3) return `${(value / 1024 ** 3).toFixed(1)} GB`;
+		if (value >= 1024 ** 2) return `${(value / 1024 ** 2).toFixed(0)} MB`;
+		return `${(value / 1024).toFixed(0)} KB`;
+	}
+
+	function scoreClass(score: number): string {
+		if (score >= 90) return 'text-emerald-400';
+		if (score >= 70) return 'text-yellow-400';
+		return 'text-red-400';
+	}
+
+	// Venue split from the stamped market identity of each series.
+	$: venueSplit = datasets.reduce(
+		(acc, dataset) => {
+			const market = String(dataset.market || 'unstamped').toLowerCase();
+			if (market === 'perp') acc.perp += 1;
+			else if (market === 'spot') acc.spot += 1;
+			else acc.other += 1;
+			return acc;
+		},
+		{ perp: 0, spot: 0, other: 0 }
+	);
+
+	// --- Research universe + deep-history operations (maintenance tab) ---
+	let universe: DataUniverse | null = null;
+	let universeError: string | null = null;
+	let universeBusy = false;
+	let bvStatus: BackfillStatus | null = null;
+	let bvError: string | null = null;
+	let bvBusy = false;
+	let opsLoaded = false;
+
+	async function loadOpsPanels(): Promise<void> {
+		try {
+			universe = await getDataUniverse();
+			universeError = null;
+		} catch (err) {
+			universeError = err instanceof Error ? err.message : 'Failed to load universe';
+		}
+		try {
+			bvStatus = await getBackfillStatus();
+			bvError = null;
+		} catch (err) {
+			bvError = err instanceof Error ? err.message : 'Failed to load backfill status';
+		}
+		opsLoaded = true;
+	}
+
+	async function handleRefreshRegistry(): Promise<void> {
+		universeBusy = true;
+		try {
+			await refreshUniverseRegistry();
+			await loadOpsPanels();
+		} catch (err) {
+			universeError = err instanceof Error ? err.message : 'Registry refresh failed';
+		} finally {
+			universeBusy = false;
+		}
+	}
+
+	async function handleSeedUniverse(): Promise<void> {
+		universeBusy = true;
+		try {
+			await seedUniverse();
+			await loadOpsPanels();
+		} catch (err) {
+			universeError = err instanceof Error ? err.message : 'Universe seed failed to start';
+		} finally {
+			universeBusy = false;
+		}
+	}
+
+	async function handleCancelSeed(): Promise<void> {
+		try {
+			await cancelUniverseSeed();
+			await loadOpsPanels();
+		} catch (err) {
+			universeError = err instanceof Error ? err.message : 'Cancel failed';
+		}
+	}
+
+	async function handleTriggerBv(): Promise<void> {
+		bvBusy = true;
+		try {
+			await triggerBackfill();
+			await loadOpsPanels();
+		} catch (err) {
+			bvError = err instanceof Error ? err.message : 'Backfill failed to start';
+		} finally {
+			bvBusy = false;
+		}
+	}
+
+	async function handleCancelBv(): Promise<void> {
+		try {
+			await cancelBackfill();
+			await loadOpsPanels();
+		} catch (err) {
+			bvError = err instanceof Error ? err.message : 'Cancel failed';
+		}
+	}
+
+	function jobPct(progress: { done: number; total: number } | null | undefined): number {
+		if (!progress || !progress.total) return 0;
+		return Math.min(100, Math.round((progress.done / progress.total) * 100));
+	}
+
+	// First visit to the maintenance tab loads the operations panels once;
+	// the poll below keeps them fresh while a job runs.
+	$: if (activeTab === 'maintenance' && !opsLoaded) void loadOpsPanels();
+
+	$: universeSeedRunning = Boolean(universe?.seed?.running);
+	$: universeMinuteTier = (universe?.plan ?? []).filter((p) => p.timeframes.includes('1m')).length;
+
+	// Universe sizing: presets are premades — the number itself stays editable.
+	const UNIVERSE_PRESETS = [
+		{ label: 'Focused', size: 10 },
+		{ label: 'Standard', size: 25 },
+		{ label: 'Comprehensive', size: 50 },
+	];
+	let universeSizeInput: number | null = null;
+	let universeConfigBusy = false;
+
+	$: universeSize = universeSizeInput ?? universe?.config?.size ?? 50;
+
+	// Rough per-tier download footprint (zstd parquet, full perp history):
+	// base ladder (1h/4h/1d) ~10 MB, +intraday (15m/5m) ~50 MB, +1m ~120 MB.
+	$: universeEstimate = (() => {
+		const size = universeSize;
+		const intradayTop = Math.min(universe?.config?.intraday_top ?? 20, size);
+		const minuteTop = Math.min(universe?.config?.minute_top ?? 10, intradayTop);
+		const mb = size * 10 + intradayTop * 50 + minuteTop * 120;
+		return mb >= 1024 ? `~${(mb / 1024).toFixed(1)} GB` : `~${mb} MB`;
+	})();
+
+	async function applyUniverseSize(size: number): Promise<void> {
+		universeConfigBusy = true;
+		try {
+			await updateUniverseConfig({ size });
+			universeSizeInput = null;
+			await loadOpsPanels();
+		} catch (err) {
+			universeError = err instanceof Error ? err.message : 'Failed to update universe size';
+		} finally {
+			universeConfigBusy = false;
+		}
+	}
+
+	async function toggleUniverseEnabled(): Promise<void> {
+		universeConfigBusy = true;
+		try {
+			await updateUniverseConfig({ enabled: !(universe?.config?.enabled ?? true) });
+			await loadOpsPanels();
+		} catch (err) {
+			universeError = err instanceof Error ? err.message : 'Failed to toggle universe';
+		} finally {
+			universeConfigBusy = false;
+		}
+	}
+
 	async function handleFetched(event: CustomEvent<{ dataset: Dataset }>): Promise<void> {
 		const fetched = event.detail.dataset;
 		await refreshData({ symbol: fetched.symbol, timeframe: fetched.timeframe });
@@ -436,9 +628,17 @@
 				});
 		}, 3000);
 
+		// Keep the maintenance operations panels live while a long job runs
+		// (universe seed / deep-history backfill) — per-symbol progress updates.
+		const opsInterval = setInterval(() => {
+			if (isDestroyed || activeTab !== 'maintenance') return;
+			if (universe?.seed?.running || bvStatus?.running) void loadOpsPanels();
+		}, 4000);
+
 		return () => {
 			isDestroyed = true;
 			clearInterval(interval);
+			clearInterval(opsInterval);
 		};
 	});
 </script>
@@ -451,17 +651,17 @@
 	/>
 </svelte:head>
 
-<div class="h-full overflow-auto bg-[#050505] text-white p-4 space-y-4">
-	<header class="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+<div class="h-full overflow-auto text-white p-4 space-y-4">
+	<header class="flex flex-col gap-3 border-b border-[#222] pb-4 md:flex-row md:items-end md:justify-between">
 		<div>
-			<h1 class="text-xl font-bold tracking-tight">Data Manager</h1>
-			<p class="text-xs text-gray-400 mt-1">Download, inspect, and track historical datasets across crypto and stock-market feeds.</p>
+			<h1 class="text-lg font-bold uppercase tracking-widest text-white">Data Manager</h1>
+			<p class="mt-1 text-xs text-[#666]">Download, inspect, and track historical datasets across crypto and stock-market feeds.</p>
 		</div>
 		<div class="flex flex-col gap-2 sm:flex-row">
 			<button
 				type="button"
 				on:click={openDownload}
-				class="px-3 py-2 text-xs rounded border border-cyan-700 text-cyan-300 hover:text-white hover:border-cyan-400 transition-colors"
+				class="terminal-button-primary text-xs"
 			>
 				Download Data
 			</button>
@@ -474,40 +674,67 @@
 							: undefined
 					)}
 				disabled={refreshing}
-				class="px-3 py-2 text-xs rounded border border-[#2b2b2b] hover:border-white transition-colors disabled:opacity-50"
+				class="terminal-button text-xs"
 			>
 				{refreshing ? 'Refreshing...' : 'Refresh'}
 			</button>
 		</div>
 	</header>
 
-	<div class="flex w-fit bg-[#111] rounded border border-[#222] p-0.5">
+	<div class="flex gap-0 border-b border-[#222]">
 		{#each TABS as tab}
 			<button
 				type="button"
-				class="px-3 py-1 rounded-sm text-xs {activeTab === tab.id ? 'bg-[#333] text-white' : 'text-gray-400 hover:text-white'}"
+				class="border-b-2 px-4 py-2 text-[11px] font-bold uppercase tracking-widest transition-colors {activeTab === tab.id ? 'border-white text-white' : 'border-transparent text-[#555] hover:text-[#999]'}"
 				on:click={() => selectTab(tab.id)}
 			>{tab.label}</button>
 		{/each}
 	</div>
 
 	{#if activeTab === 'overview'}
-	<section class="grid grid-cols-1 md:grid-cols-4 gap-3">
+	<section class="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-6 gap-3">
+		<div class="border border-[#222] rounded bg-[#0a0a0a] p-3" title="Aggregate collection health across every stream (OHLCV, funding, OI, basis, IV, …)">
+			<div class="text-[10px] uppercase tracking-wider text-gray-500">Data Health</div>
+			{#if collectionHealth}
+				<div class="text-lg font-semibold mt-1 font-mono {scoreClass(collectionHealth.score)}">{collectionHealth.score}<span class="text-[11px] text-gray-600">/100</span></div>
+			{:else}
+				<div class="text-lg font-semibold mt-1 text-gray-600">--</div>
+			{/if}
+		</div>
 		<div class="border border-[#222] rounded bg-[#0a0a0a] p-3">
 			<div class="text-[10px] uppercase tracking-wider text-gray-500">Datasets</div>
 			<div class="text-lg font-semibold mt-1">{datasets.length}</div>
+			<div class="text-[10px] text-gray-500 mt-0.5">{totalBars.toLocaleString()} bars</div>
 		</div>
-		<div class="border border-[#222] rounded bg-[#0a0a0a] p-3">
-			<div class="text-[10px] uppercase tracking-wider text-gray-500">Total Rows</div>
-			<div class="text-lg font-semibold mt-1">{totalBars.toLocaleString()}</div>
+		<div class="border border-[#222] rounded bg-[#0a0a0a] p-3" title="Total parquet lake size on disk">
+			<div class="text-[10px] uppercase tracking-wider text-gray-500">Lake Size</div>
+			<div class="text-lg font-semibold mt-1">{lakeHealth ? formatBytes(lakeHealth.total_parquet_bytes) : '--'}</div>
+			<div class="text-[10px] text-gray-500 mt-0.5">{lakeHealth ? `${lakeHealth.total_parquet_files.toLocaleString()} files` : ''}</div>
+		</div>
+		<div class="border border-[#222] rounded bg-[#0a0a0a] p-3" title="Venue identity of stored series (perp = the venue semantics we execute on). Unstamped = legacy files; run the market reconcile.">
+			<div class="text-[10px] uppercase tracking-wider text-gray-500">Venue Split</div>
+			<div class="text-sm font-semibold mt-1">
+				<span class="text-cyan-300">{venueSplit.perp} perp</span>
+				<span class="text-gray-600"> · </span>
+				<span class="text-amber-300">{venueSplit.spot} spot</span>
+			</div>
+			{#if venueSplit.other > 0}
+				<div class="text-[10px] text-gray-500 mt-0.5">{venueSplit.other} unstamped / other</div>
+			{/if}
+		</div>
+		<div class="border border-[#222] rounded bg-[#0a0a0a] p-3" title="Symbol registry: perps listed on the venue vs the research universe planned for deep history">
+			<div class="text-[10px] uppercase tracking-wider text-gray-500">Universe</div>
+			{#if universe}
+				<div class="text-sm font-semibold mt-1">{universe.plan.length} planned<span class="text-gray-600"> / </span>{universe.active} listed</div>
+				<div class="text-[10px] text-gray-500 mt-0.5">{universe.delisted} delisted kept</div>
+			{:else}
+				<div class="text-lg font-semibold mt-1 text-gray-600">--</div>
+			{/if}
 		</div>
 		<div class="border border-[#222] rounded bg-[#0a0a0a] p-3">
 			<div class="text-[10px] uppercase tracking-wider text-gray-500">Latest Download</div>
 			<div class="text-sm font-semibold mt-1">{latestDatasetLabel}</div>
-		</div>
-		<div class="border border-[#222] rounded bg-[#0a0a0a] p-3">
-			<div class="text-[10px] uppercase tracking-wider text-gray-500">Markets</div>
-			<div class="text-sm font-semibold mt-1">{availableMarketLabel}</div>
+			<div class="text-[10px] text-gray-500 mt-0.5">{availableMarketLabel}</div>
 		</div>
 	</section>
 
@@ -521,6 +748,173 @@
 
 	{#if activeTab === 'maintenance'}
 	<StorageMaintenance />
+
+	<section class="border border-[#222] rounded bg-[#0a0a0a] overflow-hidden">
+		<div class="px-3 py-2 border-b border-[#1a1a1a]">
+			<div class="text-[11px] uppercase tracking-wider text-gray-400">Research Universe &amp; Deep History</div>
+			<div class="text-[11px] text-gray-500 mt-0.5">
+				Deep perp history for strategy discovery — more assets and more years means more evidence per hypothesis.
+			</div>
+		</div>
+		<div class="grid grid-cols-1 lg:grid-cols-2">
+			<div class="p-3 border-b lg:border-b-0 lg:border-r border-[#171717]">
+				<div class="flex items-center justify-between gap-2 mb-2">
+					<div class="text-[10px] uppercase tracking-wider text-gray-500">Research Universe</div>
+					<div class="flex gap-2">
+						<button
+							type="button"
+							on:click={handleRefreshRegistry}
+							disabled={universeBusy || universeSeedRunning}
+							class="px-2 py-1 text-[11px] rounded border border-[#2b2b2b] hover:border-cyan-500 hover:text-cyan-100 transition-colors disabled:opacity-50"
+						>Refresh Registry</button>
+						{#if universeSeedRunning}
+							<button
+								type="button"
+								on:click={handleCancelSeed}
+								class="px-2 py-1 text-[11px] rounded border border-red-900 text-red-300 hover:border-red-500 transition-colors"
+							>Cancel Seed</button>
+						{:else}
+							<button
+								type="button"
+								on:click={handleSeedUniverse}
+								disabled={universeBusy}
+								class="px-2 py-1 text-[11px] rounded border border-cyan-700 text-cyan-300 hover:text-white hover:border-cyan-400 transition-colors disabled:opacity-50"
+							>Seed Universe</button>
+						{/if}
+					</div>
+				</div>
+				{#if universeError}
+					<div class="text-[11px] text-red-300 mb-2">{universeError}</div>
+				{/if}
+				{#if universe}
+					<div class="grid grid-cols-3 gap-2 text-center mb-2">
+						<div class="rounded border border-[#1c1c1c] p-2">
+							<div class="text-sm font-semibold text-gray-100">{universe.active.toLocaleString()}</div>
+							<div class="text-[10px] text-gray-500 uppercase">active perps</div>
+						</div>
+						<div class="rounded border border-[#1c1c1c] p-2">
+							<div class="text-sm font-semibold text-gray-100">{universe.plan.length.toLocaleString()}</div>
+							<div class="text-[10px] text-gray-500 uppercase">in plan ({universeMinuteTier} w/ 1m)</div>
+						</div>
+						<div class="rounded border border-[#1c1c1c] p-2">
+							<div class="text-sm font-semibold text-gray-100">{universe.delisted.toLocaleString()}</div>
+							<div class="text-[10px] text-gray-500 uppercase">delisted kept</div>
+						</div>
+					</div>
+
+					<!-- Universe sizing: presets are premades, the number stays editable;
+					     seeding is always manual, so nothing downloads until Seed is clicked. -->
+					<div class="flex flex-wrap items-center gap-2 mb-2 text-[11px]">
+						<span class="text-gray-500 uppercase text-[10px] tracking-wider">Size</span>
+						{#each UNIVERSE_PRESETS as preset}
+							<button
+								type="button"
+								disabled={universeConfigBusy || universeSeedRunning}
+								on:click={() => void applyUniverseSize(preset.size)}
+								class="px-2 py-0.5 rounded border transition-colors disabled:opacity-50 {universeSize === preset.size
+									? 'border-cyan-600 text-cyan-200'
+									: 'border-[#2b2b2b] text-gray-400 hover:border-cyan-700 hover:text-gray-200'}"
+								title={`${preset.size} most liquid perps`}
+							>{preset.label} ({preset.size})</button>
+						{/each}
+						<input
+							type="number"
+							min="1"
+							max="500"
+							class="w-16 bg-[#111] border border-[#2b2b2b] rounded px-1.5 py-0.5 text-gray-200"
+							value={universeSize}
+							disabled={universeConfigBusy || universeSeedRunning}
+							on:change={(e) => {
+								const v = Number(e.currentTarget.value);
+								if (Number.isFinite(v) && v >= 1 && v <= 500) void applyUniverseSize(Math.round(v));
+							}}
+							title="Custom universe size (1-500 most liquid perps)"
+						/>
+						<span class="text-gray-500" title="Rough full-seed footprint at this size (perp history + derivatives)">
+							est. {universeEstimate}
+						</span>
+						<button
+							type="button"
+							disabled={universeConfigBusy || universeSeedRunning}
+							on:click={toggleUniverseEnabled}
+							class="ml-auto px-2 py-0.5 rounded border transition-colors disabled:opacity-50 {universe.config?.enabled === false
+								? 'border-[#2b2b2b] text-gray-500 hover:text-gray-300'
+								: 'border-green-900 text-green-300'}"
+							title="When off, the research universe is not planned or seeded — only your traded symbols keep collecting."
+						>{universe.config?.enabled === false ? 'Universe OFF' : 'Universe ON'}</button>
+					</div>
+					{#if universe.config?.enabled === false}
+						<div class="text-[11px] text-amber-200/80 mb-2">
+							Research universe disabled — no bulk downloads will be planned. Your traded symbols keep collecting normally.
+						</div>
+					{/if}
+					{#if universeSeedRunning && universe.seed.progress}
+						<div class="text-[11px] text-gray-300 mb-1">
+							Seeding {universe.seed.progress.current_symbol} — {universe.seed.progress.done}/{universe.seed.progress.total}
+						</div>
+						<div class="h-1.5 rounded bg-[#161616] overflow-hidden">
+							<div class="h-full bg-cyan-600 transition-all" style={`width:${jobPct(universe.seed.progress)}%`}></div>
+						</div>
+					{:else if universe.seed.last_error}
+						<div class="text-[11px] text-red-300">Last seed failed: {universe.seed.last_error}</div>
+					{:else if universe.seed.last_result}
+						<div class="text-[11px] text-green-400">
+							Last seed: {String((universe.seed.last_result as Record<string, unknown>).series_seeded ?? 0)} series seeded,
+							{String((universe.seed.last_result as Record<string, unknown>).series_current ?? 0)} already current
+						</div>
+					{:else}
+						<div class="text-[11px] text-gray-500">
+							Seed downloads full Binance-Vision perp history + a live tail for each planned series. Resumable and cancellable.
+						</div>
+					{/if}
+				{:else if !universeError}
+					<div class="text-xs text-gray-500">Loading…</div>
+				{/if}
+			</div>
+			<div class="p-3">
+				<div class="flex items-center justify-between gap-2 mb-2">
+					<div class="text-[10px] uppercase tracking-wider text-gray-500">Deep History Backfill (Binance Vision)</div>
+					<div class="flex gap-2">
+						{#if bvStatus?.running}
+							<button
+								type="button"
+								on:click={handleCancelBv}
+								class="px-2 py-1 text-[11px] rounded border border-red-900 text-red-300 hover:border-red-500 transition-colors"
+							>{bvStatus?.cancel_requested ? 'Cancelling…' : 'Cancel'}</button>
+						{:else}
+							<button
+								type="button"
+								on:click={handleTriggerBv}
+								disabled={bvBusy}
+								class="px-2 py-1 text-[11px] rounded border border-cyan-700 text-cyan-300 hover:text-white hover:border-cyan-400 transition-colors disabled:opacity-50"
+							>Backfill All</button>
+						{/if}
+					</div>
+				</div>
+				{#if bvError}
+					<div class="text-[11px] text-red-300 mb-2">{bvError}</div>
+				{/if}
+				{#if bvStatus?.running && bvStatus.progress}
+					<div class="text-[11px] text-gray-300 mb-1">
+						Backfilling {bvStatus.progress.current_symbol} — {bvStatus.progress.done}/{bvStatus.progress.total} symbols
+					</div>
+					<div class="h-1.5 rounded bg-[#161616] overflow-hidden">
+						<div class="h-full bg-cyan-600 transition-all" style={`width:${jobPct(bvStatus.progress)}%`}></div>
+					</div>
+				{:else if bvStatus?.running}
+					<div class="text-[11px] text-gray-300">Backfill running…</div>
+				{:else if bvStatus?.last_error}
+					<div class="text-[11px] text-red-300">Last backfill failed: {bvStatus.last_error}</div>
+				{:else if bvStatus?.last_started_at}
+					<div class="text-[11px] text-green-400">Last backfill: {formatTimestamp(bvStatus.last_started_at)} ✓</div>
+				{:else}
+					<div class="text-[11px] text-gray-500">
+						Fills pre-history (OHLCV / funding / OI / basis) for every stored symbol from Binance Vision archives. Survives restarts; cancellable between symbols.
+					</div>
+				{/if}
+			</div>
+		</div>
+	</section>
 	{/if}
 
 	{#if drillSeries}

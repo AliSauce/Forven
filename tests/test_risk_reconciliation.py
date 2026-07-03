@@ -50,6 +50,17 @@ def _insert_open_trade(
         )
 
 
+def _reconcile_with_confirmed_empty_read():
+    """RECONCILE-6: the FIRST zero-position read against open live trades is a
+    suspicious empty read (guarded — no ghost-close, fetch_unavailable error);
+    the SECOND consecutive one confirms a genuine flatten and proceeds. Run
+    twice, assert the guard fired, and return the confirmed pass's result."""
+    first = risk_mod.reconcile_exchange_positions()
+    assert first.get("error_kind") == "fetch_unavailable"
+    assert first.get("suspicious_empty_read_streak") == 1
+    return risk_mod.reconcile_exchange_positions()
+
+
 def test_reconcile_exchange_positions_closes_ghost_trade_with_price(forven_db, monkeypatch):
     _insert_open_trade(
         "t-risk-reconcile-1",
@@ -64,7 +75,7 @@ def test_reconcile_exchange_positions_closes_ghost_trade_with_price(forven_db, m
     monkeypatch.setattr("forven.exchange.hyperliquid.get_all_mids", lambda testnet=True: {"BTC": 110.0})
     monkeypatch.setattr(risk_mod, "log_activity", lambda *_args, **_kwargs: None)
 
-    result = risk_mod.reconcile_exchange_positions()
+    result = _reconcile_with_confirmed_empty_read()
 
     with get_db() as conn:
         trade = conn.execute(
@@ -102,7 +113,7 @@ def test_reconcile_exchange_positions_marks_incomplete_when_price_missing(forven
     monkeypatch.setattr("forven.exchange.hyperliquid.get_all_mids", lambda testnet=True: {})
     monkeypatch.setattr(risk_mod, "log_activity", lambda *_args, **_kwargs: None)
 
-    risk_mod.reconcile_exchange_positions()
+    _reconcile_with_confirmed_empty_read()
 
     with get_db() as conn:
         trade = conn.execute(
@@ -174,7 +185,7 @@ def test_reconcile_exchange_positions_confirms_pending_close_and_cancels_reduce_
     )
     monkeypatch.setattr(risk_mod, "log_activity", lambda *_args, **_kwargs: None)
 
-    result = risk_mod.reconcile_exchange_positions()
+    result = _reconcile_with_confirmed_empty_read()
 
     with get_db() as conn:
         trade = conn.execute(

@@ -1,6 +1,7 @@
 import os
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, UploadFile
+from starlette.concurrency import run_in_threadpool
 
 from forven.api_domains import data as data_domain
 from forven.api_security import require_operator_access
@@ -143,6 +144,27 @@ def get_quality_reports(limit: int = 100):
     this route the frontend 404s here and fans out ~100 concurrent per-series
     quality scans, which starves the event loop and drops the live websocket."""
     return data_domain.get_quality_reports(limit=limit)
+
+
+@router.get("/api/data/quality/reports/{symbol}/{timeframe}")
+def get_quality_report(symbol: str, timeframe: str):
+    """Single-series quality report. The frontend has always called this route;
+    it never existed server-side, so every call 404'd into a client-side
+    recompute fallback."""
+    return data_domain.get_quality_report(symbol=symbol, timeframe=timeframe)
+
+
+@router.get("/api/data/quality-gate")
+def get_quality_gate(symbol: str, timeframe: str, window_days: int | None = None):
+    """The gauntlet data-gate verdict for a series (fit to score / blocked + reasons)."""
+    return data_domain.get_quality_gate(symbol=symbol, timeframe=timeframe, window_days=window_days)
+
+
+@router.get("/api/data/versions")
+def get_dataset_versions(symbol: str | None = None, timeframe: str | None = None, limit: int = 50):
+    """Dataset version history backed by the point-in-time revision log. The
+    frontend has always called this route; it never existed server-side."""
+    return data_domain.get_dataset_versions(symbol=symbol, timeframe=timeframe, limit=limit)
 
 
 @router.get("/api/data/health")
@@ -294,7 +316,10 @@ def download_symbol(symbol: str, format: str = "csv"):
 @router.post("/api/upload/csv/preview")
 async def preview_csv_upload(file: UploadFile = File(...)):
     content = await _read_upload_bounded(file)
-    return data_domain.post_upload_csv_preview(content)
+    # These handlers are async (for the streaming bounded read), so the
+    # CPU-heavy pandas parse must be offloaded — parsing up to 50 MiB inline
+    # would block the event loop (and the live WebSocket) for the duration.
+    return await run_in_threadpool(data_domain.post_upload_csv_preview, content)
 
 
 @router.post("/api/upload/csv")
@@ -306,7 +331,8 @@ async def upload_csv(
     date_format: str | None = Form(None),
 ):
     content = await _read_upload_bounded(file)
-    return data_domain.post_upload_csv(
+    return await run_in_threadpool(
+        data_domain.post_upload_csv,
         content=content,
         filename=file.filename or "upload.csv",
         symbol=symbol,
@@ -371,6 +397,53 @@ def trigger_backfill(symbol: str | None = None):
 @router.get("/api/data/backfill/status")
 def get_backfill_status():
     return data_domain.get_backfill_status()
+
+
+@router.post("/api/data/backfill/cancel")
+def cancel_backfill():
+    """Cooperatively stop the running Binance Vision backfill (between symbols)."""
+    return data_domain.post_cancel_backfill()
+
+
+@router.get("/api/data/universe")
+def get_data_universe():
+    """Symbol registry (inception/delist/liquidity) + research-universe plan + seed state."""
+    return data_domain.get_data_universe()
+
+
+@router.post("/api/data/universe/refresh")
+def refresh_universe_registry():
+    """Refresh the symbol registry from the venue (active perps, delistings)."""
+    return data_domain.post_refresh_universe_registry()
+
+
+@router.post("/api/data/universe/seed")
+def seed_research_universe():
+    """Deep-seed the research universe (BV full history + REST tail); resumable."""
+    return data_domain.post_seed_research_universe()
+
+
+@router.post("/api/data/universe/seed/cancel")
+def cancel_universe_seed():
+    return data_domain.post_cancel_universe_seed()
+
+
+@router.post("/api/data/universe/config")
+def update_universe_config(payload: dict):
+    """Update research-universe sizing (size/tiers/enabled). Seeding stays manual."""
+    return data_domain.post_universe_config(payload)
+
+
+@router.get("/api/data/depth-calibration/{symbol}")
+def get_depth_calibration(symbol: str):
+    """Stored empirical depth profile (BV bookDepth) for a symbol."""
+    return data_domain.get_depth_calibration(symbol)
+
+
+@router.post("/api/data/depth-calibration/{symbol}")
+def compute_depth_calibration(symbol: str, days: int = 30):
+    """Compute + persist the empirical depth profile from BV bookDepth archives."""
+    return data_domain.post_compute_depth_calibration(symbol, days=days)
 
 
 @router.get("/api/data/coverage")

@@ -58,33 +58,6 @@ def _extract_baseline_sharpe(metrics_raw) -> float | None:
     return _to_float(baseline)
 
 
-def _lookup_chroma_baseline_sharpe(strategy_id: str) -> float | None:
-    """Fallback baseline Sharpe from Chroma backtest metadata."""
-    try:
-        from forven.vectordb import get_collection
-
-        col = get_collection("backtest_results")
-        if col.count() == 0:
-            return None
-        data = col.get(where={"strategy_id": strategy_id}, include=["metadatas"])
-        metadatas = data.get("metadatas") or []
-        if not metadatas:
-            return None
-
-        sharpes = []
-        for meta in metadatas:
-            if not meta:
-                continue
-            sharpe = _to_float(meta.get("sharpe"))
-            if sharpe is not None and sharpe > 0:
-                sharpes.append(sharpe)
-        if sharpes:
-            return max(sharpes)
-    except Exception:
-        return None
-    return None
-
-
 def _annualized_sharpe(pnls: list[float], window_hours: int) -> float:
     if len(pnls) < 2:
         return 0.0
@@ -159,9 +132,6 @@ def run_decay_tracker(
                 skipped.append({"strategy_id": strategy_id, "reason": "unsupported_decay_stage"})
                 continue
             baseline_sharpe = _extract_baseline_sharpe(strategy.get("metrics"))
-            if baseline_sharpe is None or baseline_sharpe <= 0:
-                baseline_sharpe = _lookup_chroma_baseline_sharpe(strategy_id)
-
             if baseline_sharpe is None or baseline_sharpe <= 0:
                 skipped.append({"strategy_id": strategy_id, "reason": "missing_or_nonpositive_baseline_sharpe"})
                 continue
@@ -303,7 +273,7 @@ def run_decay_tracker(
                         f"- Closed trades in window: {event['trade_count_72h']}\n\n"
                         "Tasks:\n"
                         "1. Re-run backtests and walk-forward validation with current data.\n"
-                        "2. Search execution_slippage in ChromaDB and incorporate realistic slippage.\n"
+                        "2. Review trade_slippage_audit for this strategy and incorporate realistic slippage.\n"
                         "3. Propose parameter updates or a replacement strategy.\n"
                         "4. Store results in backtest_results and summarize recommendations."
                     ),
@@ -428,8 +398,6 @@ def run_decay_kill_switch() -> dict:
             strategy_id = strategy["id"]
 
             baseline_sharpe = _extract_baseline_sharpe(strategy.get("metrics"))
-            if baseline_sharpe is None or baseline_sharpe <= 0:
-                baseline_sharpe = _lookup_chroma_baseline_sharpe(strategy_id)
             if baseline_sharpe is None or baseline_sharpe <= 0:
                 continue
 
@@ -573,7 +541,7 @@ def run_slippage_monitor(
     lookback_hours: int = 168,
     max_trades: int = 2000,
 ) -> dict:
-    """Compute signal vs fill slippage and store audits + Chroma samples."""
+    """Compute signal vs fill slippage and store audit rows."""
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=lookback_hours)).isoformat()
     analyzed_at = _now_iso()
 
@@ -697,26 +665,6 @@ def run_slippage_monitor(
             (cutoff,),
         ).fetchall()
 
-    # Push changed samples to ChromaDB (trade-level semantic store).
-    if changed_samples:
-        try:
-            from forven.vectordb import store_slippage_sample
-
-            for sample in changed_samples:
-                store_slippage_sample(
-                    trade_id=sample["trade_id"],
-                    strategy=sample["strategy"],
-                    asset=sample["asset"],
-                    direction=sample["direction"],
-                    leg=sample["leg"],
-                    signal_price=sample["signal_price"],
-                    fill_price=sample["fill_price"],
-                    slippage_bps=sample["slippage_bps"],
-                    abs_slippage_bps=sample["abs_slippage_bps"],
-                )
-        except Exception as e:
-            log.warning("ChromaDB slippage store failed: %s", e)
-
     penalties: dict[str, dict] = {}
     grouped: dict[str, list[float]] = {}
     for row in penalty_rows:
@@ -751,6 +699,133 @@ def run_slippage_monitor(
             f"{len(changed_samples)} changed, {len(penalties)} strategies"
         ),
         {"changed_samples": len(changed_samples), "lookback_hours": lookback_hours},
+    )
+    return summary
+
+
+# ── Execution-quality watchdog: realized fill skew vs the modeled cost budget ──
+
+def run_execution_quality_watchdog(lookback_days: int = 30, min_trades: int = 5) -> dict:
+    """Nightly expected-vs-actual execution check.
+
+    Every kernel paper/live fill records the backtest-EXPECTED price
+    (signal_entry/exit_price, the kernel's next-bar-open) next to the actual
+    fill (fill_entry/exit_price); entry/exit_slippage_bps is the signed
+    adverse gap per leg and entry/exit_lag_bps its decision-lag component
+    (the remainder is venue slippage — paper fills at the mark, so its gap is
+    pure lag). Fees are already modeled in the trade's net PnL, so the skew
+    measured here is cost the backtest did NOT model.
+
+    This job aggregates that skew per strategy (paper and live buckets
+    separately) and flags any whose MEAN realized round-trip skew exceeds the
+    strategy's modeled round-trip cost budget 2*(fee_bps + slippage_bps):
+    execution then eats at least twice the modeled costs, so paper/live
+    results no longer predict the backtest.
+    """
+    from forven.scanner import _resolve_trade_assumptions
+
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).isoformat()
+    ran_at = _now_iso()
+
+    groups: dict[tuple[str, str], list[dict]] = {}
+    params_by_sid: dict[str, dict] = {}
+    with get_db() as conn:
+        rows = conn.execute(
+            """SELECT COALESCE(strategy_id, strategy) AS sid, execution_type,
+                      entry_slippage_bps, exit_slippage_bps, entry_lag_bps, exit_lag_bps
+                 FROM trades
+                WHERE status = 'CLOSED'
+                  AND datetime(COALESCE(closed_at, opened_at)) >= datetime(?)
+                  AND execution_type IN ('paper', 'paper_challenger', 'live')
+                  AND (entry_slippage_bps IS NOT NULL OR exit_slippage_bps IS NOT NULL)""",
+            (cutoff,),
+        ).fetchall()
+        for row in rows:
+            sid = str(row["sid"] or "unknown")
+            bucket = "live" if str(row["execution_type"] or "").strip().lower() == "live" else "paper"
+            groups.setdefault((sid, bucket), []).append(dict(row))
+        for sid, _bucket in list(groups):
+            if sid in params_by_sid:
+                continue
+            p_row = conn.execute("SELECT params FROM strategies WHERE id = ?", (sid,)).fetchone()
+            params_by_sid[sid] = _parse_json_obj(p_row["params"]) if p_row else {}
+
+    checked: list[dict] = []
+    flagged: list[dict] = []
+    for (sid, bucket), trades in sorted(groups.items()):
+        n = len(trades)
+        round_trip = [
+            (_to_float(t.get("entry_slippage_bps"), 0.0) or 0.0)
+            + (_to_float(t.get("exit_slippage_bps"), 0.0) or 0.0)
+            for t in trades
+        ]
+        lag = [
+            (_to_float(t.get("entry_lag_bps"), 0.0) or 0.0)
+            + (_to_float(t.get("exit_lag_bps"), 0.0) or 0.0)
+            for t in trades
+        ]
+        mean_skew = mean(round_trip)
+        mean_lag = mean(lag)
+        _, fee_bps, slip_bps = _resolve_trade_assumptions(params_by_sid.get(sid) or {})
+        budget_bps = 2.0 * (fee_bps + slip_bps)
+        stat = {
+            "strategy_id": sid,
+            "bucket": bucket,
+            "trades": n,
+            "mean_round_trip_skew_bps": round(mean_skew, 4),
+            "mean_lag_bps": round(mean_lag, 4),
+            "mean_venue_slippage_bps": round(mean_skew - mean_lag, 4),
+            "budget_round_trip_bps": round(budget_bps, 4),
+            "over_budget": bool(n >= min_trades and mean_skew > budget_bps),
+        }
+        checked.append(stat)
+        if not stat["over_budget"]:
+            continue
+        flagged.append(stat)
+        try:
+            from forven.notifications import emit_notification
+
+            emit_notification(
+                "execution_quality",
+                severity="warning",
+                source="watchdog",
+                title=f"Execution skew over cost budget: {sid} ({bucket})",
+                summary=(
+                    f"Mean round-trip fill skew {mean_skew:.1f} bps exceeds the modeled cost budget "
+                    f"{budget_bps:.1f} bps over {n} {bucket} trades in the last {lookback_days}d "
+                    f"(lag {mean_lag:.1f} bps + venue slippage {mean_skew - mean_lag:.1f} bps)."
+                ),
+                body=(
+                    f"{sid} ({bucket}): realized fills are drifting from backtest assumptions by more "
+                    f"than the entire modeled round-trip cost budget (2 x (fee {fee_bps:.1f} + slippage "
+                    f"{slip_bps:.1f}) = {budget_bps:.1f} bps). This skew is on TOP of modeled costs, so "
+                    f"paper/live results for this strategy no longer predict its backtest. Decomposition: "
+                    f"decision lag {mean_lag:.1f} bps, venue slippage {mean_skew - mean_lag:.1f} bps."
+                ),
+                metadata=stat,
+                dedupe_key=f"exec_quality:{sid}:{bucket}",
+            )
+        except Exception as exc:
+            log.warning("execution-quality notification failed for %s: %s", sid, exc)
+
+    summary = {
+        "ran_at": ran_at,
+        "lookback_days": lookback_days,
+        "min_trades": min_trades,
+        "groups_checked": len(checked),
+        "flagged_count": len(flagged),
+        "flagged": flagged,
+        "groups": checked,
+    }
+    kv_set("execution_quality_watchdog_state", summary)
+    log_activity(
+        "info",
+        "exec-quality-watchdog",
+        (
+            f"Execution-quality watchdog checked {len(checked)} strategy buckets, "
+            f"{len(flagged)} over cost budget"
+        ),
+        {"flagged": [f["strategy_id"] for f in flagged], "lookback_days": lookback_days},
     )
     return summary
 

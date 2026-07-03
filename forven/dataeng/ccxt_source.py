@@ -15,7 +15,10 @@ class CcxtSource:
     def __init__(self, exchange_id: str = "binance", exchange: object | None = None) -> None:
         self.id = str(exchange_id or "binance").strip().lower()
         self.exchange = exchange
-        self.capabilities = {Stream.CANDLES, Stream.FUNDING, Stream.OI, Stream.TRADES, Stream.ORDERBOOK}
+        # Only what fetch() actually implements — advertising TRADES/ORDERBOOK
+        # here made the registry resolve this source for streams it then
+        # rejected with SourceError.
+        self.capabilities = {Stream.CANDLES, Stream.FUNDING, Stream.OI}
         self._last_error = ""
 
     def fetch(

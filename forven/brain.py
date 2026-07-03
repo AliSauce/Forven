@@ -52,18 +52,9 @@ except ImportError:
 
 log = logging.getLogger("forven.brain")
 
-STAGE_TO_AGENT = {
-    "quick_screen": "simulation-agent",
-    "research_only": "strategy-developer",
-    "gauntlet": "simulation-agent",
-    "paper": "risk-manager",
-    # Live execution is automated by the scanner's parity kernel; the retired
-    # execution-trader agent no longer exists, so live oversight ownership falls
-    # to risk-manager (which already owns paper + live risk/allocation).
-    "live_graduated": "risk-manager",
-    "archived": None,
-    "rejected": None,
-}
+# Canonical stage→owner map lives in forven.roster (single source of truth);
+# re-exported here because many callers/tests import brain.STAGE_TO_AGENT.
+from forven.roster import STAGE_TO_AGENT, normalize_strategy_owner as _roster_normalize_strategy_owner
 
 VALID_TRANSITIONS = {
     "quick_screen": {"gauntlet", "research_only", "archived", "rejected", "backtest_failed"},
@@ -515,20 +506,8 @@ def _is_strategy_developer(agent: dict) -> bool:
 
 
 def _normalize_strategy_owner(value: str | None) -> str | None:
-    normalized = str(value or "").strip().lower()
-    if not normalized:
-        return None
-    if normalized == "system":
-        return "brain"
-    if normalized == "backtest-engineer":
-        return "simulation-agent"
-    # execution-trader is retired; carry its historical ownerships forward to
-    # risk-manager (which now owns live oversight).
-    if normalized == "execution-trader":
-        return "risk-manager"
-    if normalized in {"quant-researcher", "strategy-developer", "simulation-agent", "risk-manager", "ceo", "brain"}:
-        return normalized
-    return None
+    """Normalize a stored owner to a live owner id (delegates to the roster)."""
+    return _roster_normalize_strategy_owner(value)
 
 
 def _normalize_stage(value: str | None) -> str | None:
@@ -566,6 +545,11 @@ def _auto_approve_promotions_enabled(
     future per-transition policy, but ``auto`` no longer narrows the grant to a
     single transition — that narrowing is exactly what left paper→live parked
     in approval limbo and blocked unattended operation.
+
+    GO-LIVE-1 exception (see ``_requires_operator_promotion_approval``):
+    promotion INTO live_graduated is carved out of both levers — real capital
+    requires an explicit operator confirmation with a notional ceiling, so
+    only gauntlet→paper self-approves under auto.
     """
     try:
         settings = kv_get("forven:settings", {}) or {}
@@ -582,11 +566,31 @@ def _auto_approve_promotions_enabled(
         return False
 
 
+def _allow_auto_live_promotion() -> bool:
+    """Whether paper→live may self-approve. Default False and meant to stay
+    False: going live is the one transition that converts a signal into real
+    capital, so it requires a human confirmation with a notional ceiling. The
+    setting exists only because every gate threshold is operator-editable."""
+    try:
+        settings = kv_get("forven:settings", {}) or {}
+        if isinstance(settings, dict):
+            return str(settings.get("allow_auto_live_promotion", "false")).strip().lower() == "true"
+    except Exception:
+        pass
+    return False
+
+
 def _requires_operator_promotion_approval(current_stage: str, target_stage: str) -> bool:
     """Return True when this transition promotes a strategy into a capital-consuming
     stage and operator auto-approval is disabled."""
     if (current_stage, target_stage) not in _OPERATOR_PROMOTION_TRANSITIONS:
         return False
+    # GO-LIVE-1: promotion INTO live is never auto-approvable — neither
+    # auto_approve_promotions nor promotion_mode="auto" grants it. The operator
+    # confirms each go-live explicitly (typed confirmation + per-asset notional
+    # ceiling at the approve/promote endpoints).
+    if target_stage == "live_graduated" and not _allow_auto_live_promotion():
+        return True
     return not _auto_approve_promotions_enabled(current_stage, target_stage)
 
 
@@ -1106,8 +1110,8 @@ def _queue_failure_post_mortem(
         "- Corrective Action:\n"
         "- Preventive Guardrails:\n\n"
         "After analysis:\n"
-        "- store_chroma(collection='trade_post_mortems', ...)\n"
-        "- store_memory(...) with concise lessons to avoid recurrence."
+        "- write_file the full post-mortem under post_mortems/ in the workspace\n"
+        "- append concise lessons to LESSONS.md to avoid recurrence."
     )
     input_data = {
         "strategy_id": strategy_id,
@@ -1413,6 +1417,42 @@ def transition_stage(
                 return _record_blocked_transition(
                     f"Runtime loadability gate: {unloadable}",
                     "runtime_unloadable",
+                )
+
+        # DUP-1 GATE: never admit a strategy into a TRADING stage while an exact
+        # duplicate (same type/symbol/timeframe/params) is already trading — the two
+        # fire on the identical signal and silently DOUBLE exposure on every entry
+        # (S05275/S05276: the same Donchian promoted twice booked two identical SOL
+        # longs 4.5s apart). Operator force bypasses, like the other admission gates.
+        if (not force) and normalized_target in {"paper", "deployed", "live_graduated"}:
+            _dup_id = None
+            try:
+                from forven.db import find_duplicate_trading_strategy
+
+                _dup_row = conn.execute(
+                    "SELECT type, symbol, timeframe, params FROM strategies WHERE id = ?",
+                    (strategy_id,),
+                ).fetchone()
+                if _dup_row:
+                    _dup_id = find_duplicate_trading_strategy(
+                        conn,
+                        type_=str(_dup_row["type"] or ""),
+                        symbol=str(_dup_row["symbol"] or ""),
+                        timeframe=str(_dup_row["timeframe"] or "1h"),
+                        params=json.loads(_dup_row["params"] or "{}"),
+                        exclude_id=strategy_id,
+                    )
+            except Exception as exc:
+                _dup_id = None
+                log.warning("Duplicate-strategy check errored for %s: %s", strategy_id, exc)
+            if _dup_id:
+                log.error("DUPLICATE STRATEGY BLOCKED: %s -> %s (identical to trading %s)",
+                          strategy_id, normalized_target, _dup_id)
+                return _record_blocked_transition(
+                    f"Duplicate-strategy gate: {_dup_id} is already trading the identical "
+                    "type/symbol/timeframe/params — promoting this one would double exposure "
+                    "on every signal (archive one of them first)",
+                    "duplicate_trading_strategy",
                 )
 
         # WIP cap enforcement: refuse to admit another strategy into a capped stage
@@ -1904,28 +1944,6 @@ def transition_stage(
     if force_activity_message:
         log_activity("warning", "brain", force_activity_message)
 
-    # Store failures as agent narratives so agents learn from past mistakes
-    if normalized_target in ("archived", "rejected") and event_reason:
-        try:
-            strat_type = row["type"] or "unknown"
-        except (KeyError, IndexError):
-            strat_type = "unknown"
-        try:
-            current_symbol = row["symbol"] or "unknown"
-        except (KeyError, IndexError):
-            current_symbol = "unknown"
-        try:
-            from forven.vectordb import store_post_mortem
-            store_post_mortem(
-                trade_id=f"{strategy_id}-{normalized_target}-{now}",
-                strategy=strategy_id,
-                asset=current_symbol,
-                pnl_pct=0.0,
-                analysis=f"Strategy {strategy_id} ({strat_type}) archived from {current_stage}: {event_reason}",
-            )
-        except Exception:
-            pass
-
     post_mortem_task_id: int | None = None
     post_mortem_task_display_id: str | None = None
     if failure_transition and _should_queue_failure_post_mortem(
@@ -1985,7 +2003,7 @@ def transition_stage(
                     equity_f = float(equity_raw) if equity_raw is not None else 0.0
                 except (TypeError, ValueError):
                     equity_f = 0.0
-                if equity_f > 0 and source in {"exchange", "books_aggregate"}:
+                if equity_f > 0 and source in {"exchange", "books_only", "books_aggregate"}:
                     kv_set(baseline_key, {"equity": equity_f, "source": source, "stamped_at": now})
                     log.info(
                         "Stamped live go-live equity baseline for %s: $%.2f (%s)",
@@ -2481,7 +2499,7 @@ async def invoke(
 ) -> str:
     """Invoke the Brain ÃÂÃÂ¢ÃÂÃÂÃÂÃÂ the core decision loop.
 
-    1. Build context from workspace + SQLite + ChromaDB
+    1. Build context from workspace + SQLite
     2. Call AI with the assembled context
     3. Parse response for actions (task assignments, strategy changes, etc.)
     4. Execute actions and store results
@@ -2492,19 +2510,6 @@ async def invoke(
 
     # Build context
     context = build_brain_context(session_type)
-
-    # Inject the Brain's institutional memory (ChromaDB recall + brain_lessons),
-    # keyed on the strategy types/symbols currently in flight, so the cycle's
-    # promote/research decisions are informed by prior research and past judgment
-    # errors instead of starting from a blank slate each time. Best-effort.
-    try:
-        from forven.context import get_brain_learning_injection
-
-        learning = get_brain_learning_injection(_brain_inflight_query())
-        if learning:
-            context += "\n\n---\n\n" + learning
-    except Exception:
-        pass
 
     # Add pending agent task results
     completed_tasks = _get_completed_agent_tasks()
@@ -2566,8 +2571,8 @@ async def invoke(
     record_cache_observation(prompt_hash)
 
     # P1-T06: stash per-cycle context so a downstream execute_brain_actions
-    # call (sometimes outside this function — see process_task_queue) can
-    # write a fully-populated brain_decisions row.
+    # call (which may run outside this function, e.g. in the runtime worker's
+    # brain task) can write a fully-populated brain_decisions row.
     cycle_id = uuid.uuid4().hex
     situation_summary = (context or "")[:500]
     _set_brain_cycle_context(
@@ -2644,38 +2649,6 @@ def _build_cycle_prompt() -> str:
         "}\n"
         "Do not include markdown fences or any extra keys."
     )
-
-
-def _brain_inflight_query() -> str:
-    """Build a recall/lessons query from the strategy types + symbols in flight.
-
-    Keys the Brain's institutional-memory injection on what it's actually
-    deciding about right now (strategies in gauntlet/paper/deployed), so recall
-    and lessons surface prior research on those types rather than a generic dump.
-    Best-effort: returns "" on any error (the injector falls back to a generic
-    query). Distinct values only, capped to keep the FTS query small.
-    """
-    try:
-        with get_db() as conn:
-            rows = conn.execute(
-                """
-                SELECT DISTINCT type, symbol FROM strategies
-                WHERE LOWER(COALESCE(stage, status, '')) IN
-                    ('gauntlet', 'paper', 'paper_trading', 'deployed', 'live_graduated', 'backtesting')
-                ORDER BY updated_at DESC
-                LIMIT 12
-                """
-            ).fetchall()
-    except Exception:
-        return ""
-    terms: list[str] = []
-    for r in rows:
-        row = dict(r)
-        for key in ("type", "symbol"):
-            val = str(row.get(key) or "").strip()
-            if val and val not in terms:
-                terms.append(val)
-    return " ".join(terms[:12])
 
 
 def _get_completed_agent_tasks() -> list[dict]:
@@ -3464,30 +3437,6 @@ def run_strategy_review():
     return {"actions": actions, "candidates": candidates}
 
 
-def run_evolution_cycle():
-    """Run all 4 evolution pipeline steps in sequence.
-
-    Called manually or by a comprehensive scheduler job.
-    Steps: ideation ÃÂÃÂ¢ÃÂÃÂÃÂÃÂ testing ÃÂÃÂ¢ÃÂÃÂÃÂÃÂ paper graduation ÃÂÃÂ¢ÃÂÃÂÃÂÃÂ weekly review
-    """
-    from forven.evolution import (
-        run_ideation_step, run_testing_step,
-        check_paper_graduation, run_weekly_review,
-    )
-
-    log.info("Running full evolution cycle")
-    log_activity("info", "brain", "Starting full evolution cycle")
-
-    run_ideation_step()
-    run_testing_step()
-    check_paper_graduation()
-    result = run_weekly_review()
-
-    log.info("Evolution cycle complete: %s", result)
-    log_activity("info", "brain", f"Evolution cycle complete: {result}")
-    return result
-
-
 def assign_research_cycle():
     """Compatibility wrapper for the retired broad research cycle."""
     from forven.crucible_planner import run_crucible_planner_cycle
@@ -3550,62 +3499,6 @@ def assign_risk_audit():
     )
 
     log_activity("info", "brain", "Assigned risk audit to risk-manager")
-
-
-def process_task_queue():
-    """Process pending brain tasks from the queue (from Discord/scheduler)."""
-    from forven.db import claim_pending_tasks
-
-    rows = claim_pending_tasks("brain_invoke", limit=5, priority=True)
-
-    for task in rows:
-        task = dict(task)
-        payload = json.loads(task.get("payload", "{}"))
-
-        try:
-            response = invoke_sync(message=payload.get("message"))
-            decision = normalize_brain_decision(response)
-            executed = execute_brain_actions(decision, actor="brain")
-
-            with get_db() as conn:
-                conn.execute(
-                    "UPDATE tasks SET status='done', completed_at=?, result=? WHERE id=?",
-                    (
-                        datetime.now(timezone.utc).isoformat(),
-                        json.dumps({
-                            "response": response[:2000],
-                            "actions_executed": executed,
-                        }),
-                        task["id"],
-                    ),
-                )
-
-            # Post response to Discord if requested
-            channel = payload.get("channel")
-            if channel:
-                try:
-                    from forven.notifications import emit_notification
-                    from forven.notification_renderers import summarize_discord_text
-
-                    emit_notification(
-                        "brain_response",
-                        source="brain",
-                        title="Brain response ready",
-                        summary=summarize_discord_text(response, limit=320, max_lines=3) or response[:240],
-                        body=response,
-                        channel_id=str(channel),
-                        metadata={"channel_id": str(channel), "task_id": task["id"]},
-                    )
-                except Exception:
-                    pass
-
-        except Exception as e:
-            log.error("Brain task %d failed: %s", task["id"], e)
-            with get_db() as conn:
-                conn.execute(
-                    "UPDATE tasks SET status='failed', error=? WHERE id=?",
-                    (str(e)[:500], task["id"]),
-                )
 
 
 def run_gauntlet_backtest_migration():

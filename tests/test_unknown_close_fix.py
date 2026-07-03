@@ -7,8 +7,9 @@ position, returned no fill, the trade was marked pending_close_reconcile WITHOUT
 a usable exit price, and the reconcile sweep then finalized it as incomplete.
 
 These tests pin the fix:
-  * Fix 1 — the agent close tool closes a local paper trade LOCALLY at the mark,
-    never via the exchange.
+  * Fix 1 (superseded) — the agent close tool was deleted outright along with
+    the rest of the exchange tool module (agents have NO order path at all);
+    Fix 4 below pins that the tools stay out of the registry.
   * Fix 2 — marking pending-close derives a usable exit price from the
     pending-close metadata so the close finalizes WITH a price.
   * Fix 3 — the reconcile sweep resolves an exit price for a local paper trade
@@ -21,7 +22,6 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta, timezone
 
-import forven.exchange.hyperliquid as hl_mod
 import forven.scanner as scanner_mod
 
 
@@ -72,53 +72,6 @@ def _get_trade(trade_id: str) -> dict:
         row = conn.execute("SELECT * FROM trades WHERE id = ?", (trade_id,)).fetchone()
     assert row is not None
     return dict(row)
-
-
-# ── Fix 1: agent close tool closes local paper trades locally ───────────────
-
-
-def test_agent_close_of_local_paper_trade_is_local_and_complete(monkeypatch, forven_db):
-    """The execution-trader close tool, given a LOCAL paper trade, must close it
-    locally at the current mark — never via the exchange — and the close must be
-    COMPLETE (real exit price + P&L), not an 'unknown'/incomplete close."""
-    from forven.agents.tools_exchange import _tool_close_position
-
-    _insert_paper_trade("P-LOCAL", asset="SOL", direction="short", entry_price=75.0, size=10.0)
-
-    # Exchange close must NOT be called for a local paper trade.
-    monkeypatch.setattr(
-        hl_mod, "close_position",
-        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not hit exchange for local paper trade")),
-    )
-    monkeypatch.setattr(hl_mod, "get_all_mids", lambda testnet=True: {"SOL": 73.0})
-
-    out = json.loads(_tool_close_position({"asset": "SOL", "size": 10.0, "trade_id": "P-LOCAL"}))
-    assert out["status"] == "closed_local_paper"
-    assert out["exit_price"] == 73.0
-
-    trade = _get_trade("P-LOCAL")
-    assert trade["status"] == "CLOSED"
-    assert trade["exit_price"] == 73.0
-    sd = json.loads(trade["signal_data"])
-    assert sd["close_incomplete"] is False
-    assert sd["close_price_source"] == "agent_paper_local"
-    # short from 75 -> 73 is a +2/75 gain
-    assert trade["pnl_usd"] is not None and trade["pnl_usd"] > 0
-
-
-def test_agent_close_refuses_when_no_mark_rather_than_fabricate(monkeypatch, forven_db):
-    """No live mark → refuse, never fabricate an exit (which would be the very
-    'unknown close' this fix removes). The trade stays OPEN."""
-    from forven.agents.tools_exchange import _tool_close_position
-
-    _insert_paper_trade("P-NOMARK", asset="SOL")
-    monkeypatch.setattr(hl_mod, "close_position",
-                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not hit exchange")))
-    monkeypatch.setattr(hl_mod, "get_all_mids", lambda testnet=True: {})
-
-    out = json.loads(_tool_close_position({"asset": "SOL", "size": 10.0, "trade_id": "P-NOMARK"}))
-    assert "error" in out
-    assert _get_trade("P-NOMARK")["status"] == "OPEN"
 
 
 # ── Fix 2: marking pending-close persists a usable exit price ───────────────
@@ -232,18 +185,17 @@ def test_execution_trader_is_retired():
     """The agent is gone from the seed and the brain's assignable roster, and is
     queued for deletion on existing installs."""
     from forven.agents.tool_definitions import BRAIN_AGENT_IDS
-    from forven.bot import _build_default_agents, seed_default_agents
+    from forven.bot import _build_default_agents
     from forven.brain import STAGE_TO_AGENT
+    from forven.roster import DEPRECATED_AGENT_IDS, LIVE_AGENTS
 
     assert "execution-trader" not in BRAIN_AGENT_IDS
+    assert "execution-trader" not in LIVE_AGENTS
     assert "execution-trader" not in {a["agent_id"] for a in _build_default_agents()}
     # Live oversight ownership moved to risk-manager (no execution agent).
     assert STAGE_TO_AGENT["live_graduated"] == "risk-manager"
-    # Deletion path: seed_default_agents lists it among deprecated_agents.
-    import inspect
-
-    src = inspect.getsource(seed_default_agents)
-    assert "execution-trader" in src  # in the deprecated_agents removal set
+    # Deletion path: seed_default_agents removes every DEPRECATED_AGENT_IDS row.
+    assert "execution-trader" in DEPRECATED_AGENT_IDS
 
 
 def test_brain_owner_normalization_carries_execution_trader_to_risk_manager():

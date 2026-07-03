@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { page } from '$app/stores';
-	import { markNavIndicatorSeen } from '$lib/stores/navMetrics';
+	import { markNavIndicatorSeen, navRouteMetrics, navEventPulses } from '$lib/stores/navMetrics';
+	import NavBadge from '$lib/components/NavBadge.svelte';
 
 	export let connectionStatus: 'checking' | 'connected' | 'disconnected' | string = 'checking';
 
@@ -66,19 +67,9 @@
 			icon: 'M16 11c1.66 0 2.99-1.34 2.99-3S17.66 5 16 5c-1.66 0-3 1.34-3 3s1.34 3 3 3zm-8 0c1.66 0 2.99-1.34 2.99-3S9.66 5 8 5C6.34 5 5 6.34 5 8s1.34 3 3 3zm0 2c-2.33 0-7 1.17-7 3.5V19h14v-2.5c0-2.33-4.67-3.5-7-3.5zm8 0c-.29 0-.62.02-.97.05 1.16.84 1.97 1.97 1.97 3.45V19h6v-2.5c0-2.33-4.67-3.5-7-3.5z'
 		},
 		{
-			label: 'Memory',
-			href: '/memory',
-			icon: 'M6 4h12a2 2 0 012 2v12a2 2 0 01-2 2H8l-4 4V6a2 2 0 012-2zm2 3v2h8V7H8zm0 4v2h8v-2H8zm0 4v2h5v-2H8z'
-		},
-		{
 			label: 'Brain',
 			href: '/brain',
 			icon: 'M13 3a4 4 0 014 4v.18A4 4 0 0121 11v2a4 4 0 01-3 3.87V18a3 3 0 01-3 3h-1a3 3 0 01-3-3v-1H8a4 4 0 01-4-4v-2a4 4 0 014-4 4 4 0 014-4h1zm-2 4H8a2 2 0 00-2 2v4a2 2 0 002 2h3v3a1 1 0 001 1h1a1 1 0 001-1v-2h1a2 2 0 002-2v-2.18A4 4 0 0014 7.18V7a2 2 0 00-2-2h-1z'
-		},
-		{
-			label: 'Tasks',
-			href: '/tasks',
-			icon: 'M9 5h11v2H9V5zm0 6h11v2H9v-2zm0 6h11v2H9v-2zM4 6.5A1.5 1.5 0 115.5 5 1.5 1.5 0 014 6.5zm0 6A1.5 1.5 0 115.5 11 1.5 1.5 0 014 12.5zm0 6A1.5 1.5 0 115.5 17 1.5 1.5 0 014 18.5z'
 		},
 		{
 			label: 'Approvals',
@@ -127,20 +118,25 @@
 		);
 	}
 
-	$: {
-		const currentPath = $page.url.pathname;
+	// Depends on the metric/pulse stores too (not just navigation): while a
+	// route is active its indicators are seen by definition, so a heartbeat
+	// refresh must not resurrect a badge for the page the operator is already
+	// reading. markNavIndicatorSeen no-ops when already seen/clear.
+	function markActiveRouteSeen(currentPath: string, ..._deps: unknown[]): void {
 		allNavHrefs.forEach((href) => {
 			if (isRouteActive(href, currentPath)) {
 				markNavIndicatorSeen(href);
 			}
 		});
 	}
+
+	$: markActiveRouteSeen($page.url.pathname, $navRouteMetrics, $navEventPulses);
 </script>
 
 <aside class="relative z-40 w-60 flex-shrink-0 border-r border-[#222] bg-black flex flex-col">
 	<div class="px-3 py-4 border-b border-[#222] flex items-center justify-center gap-2">
-		<div class="w-2 h-2 bg-orange-500 shrink-0" title="forven"></div>
-		<div class="text-sm font-mono lowercase tracking-wide text-orange-500">forven</div>
+		<div class="w-2 h-2 bg-white shrink-0" title="forven"></div>
+		<div class="text-sm font-mono lowercase tracking-wide text-white">forven</div>
 	</div>
 
 	<nav aria-label="Primary navigation" class="flex-1 overflow-y-auto px-2 py-4 flex flex-col gap-4">
@@ -154,7 +150,7 @@
 					aria-label={link.label}
 					aria-current={isActive ? 'page' : undefined}
 					title={link.label}
-					class="group flex min-h-[48px] w-full items-center justify-start gap-3 rounded-md border px-3 py-2 transition-colors {isActive ? 'border-white text-white bg-[#111]' : 'border-transparent text-gray-400 hover:text-white hover:bg-[#0f0f0f]'}"
+					class="group flex min-h-[48px] w-full items-center justify-start gap-3 border-l-2 px-3 py-2 transition-colors {isActive ? 'border-l-white text-white bg-[#111]' : 'border-l-transparent text-[#888] hover:text-white hover:bg-[#111]'}"
 				>
 					<svg class="w-5 h-5 shrink-0" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
 						<path d={link.icon} />
@@ -162,12 +158,13 @@
 					<div class="min-w-0 flex-1">
 						<div class="truncate text-[11px] font-medium tracking-wide">{link.label}</div>
 					</div>
+					<NavBadge metric={$navRouteMetrics[link.href]} pulse={$navEventPulses[link.href]} active={isActive} />
 				</a>
 			{/each}
 		</div>
 
 		<section class="mt-auto border-t border-[#222] pt-3">
-			<div class="px-2 pb-2 text-[10px] font-semibold uppercase tracking-[0.18em] text-gray-500">Management</div>
+			<div class="px-2 pb-2 text-[10px] font-semibold uppercase tracking-[0.18em] text-[#666]">Management</div>
 			<div class="space-y-1">
 				{#each managementLinks as link}
 					{@const isActive = isRouteActive(link.href, $page.url.pathname)}
@@ -178,7 +175,7 @@
 						aria-label={link.label}
 						aria-current={isActive ? 'page' : undefined}
 						title={link.label}
-						class="group flex min-h-[48px] w-full items-center justify-start gap-3 rounded-md border px-3 py-2 transition-colors {isActive ? 'border-white text-white bg-[#111]' : 'border-transparent text-gray-400 hover:text-white hover:bg-[#0f0f0f]'}"
+						class="group flex min-h-[48px] w-full items-center justify-start gap-3 border-l-2 px-3 py-2 transition-colors {isActive ? 'border-l-white text-white bg-[#111]' : 'border-l-transparent text-[#888] hover:text-white hover:bg-[#111]'}"
 					>
 						<svg class="w-5 h-5 shrink-0" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
 							<path d={link.icon} />
@@ -186,6 +183,7 @@
 						<div class="min-w-0 flex-1">
 							<div class="truncate text-[11px] font-medium tracking-wide">{link.label}</div>
 						</div>
+						<NavBadge metric={$navRouteMetrics[link.href]} pulse={$navEventPulses[link.href]} active={isActive} />
 					</a>
 				{/each}
 			</div>
@@ -200,7 +198,7 @@
 			aria-label={settingsLink.label}
 			aria-current={isRouteActive(settingsLink.href, $page.url.pathname) ? 'page' : undefined}
 			title={settingsLink.label}
-			class="group my-2 flex min-h-[48px] w-full items-center justify-start gap-3 rounded-md border px-3 py-2 transition-colors {isRouteActive(settingsLink.href, $page.url.pathname) ? 'border-white text-white bg-[#111]' : 'border-transparent text-gray-400 hover:text-white hover:bg-[#0f0f0f]'}"
+			class="group my-2 flex min-h-[48px] w-full items-center justify-start gap-3 border-l-2 px-3 py-2 transition-colors {isRouteActive(settingsLink.href, $page.url.pathname) ? 'border-l-white text-white bg-[#111]' : 'border-l-transparent text-[#888] hover:text-white hover:bg-[#111]'}"
 		>
 			<svg class="w-5 h-5 shrink-0" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
 				<path d={settingsLink.icon} />
@@ -208,6 +206,11 @@
 			<div class="min-w-0 flex-1">
 				<div class="truncate text-[11px] font-medium tracking-wide">{settingsLink.label}</div>
 			</div>
+			<NavBadge
+				metric={$navRouteMetrics[settingsLink.href]}
+				pulse={$navEventPulses[settingsLink.href]}
+				active={isRouteActive(settingsLink.href, $page.url.pathname)}
+			/>
 		</a>
 	</div>
 
@@ -216,7 +219,7 @@
 			href="https://github.com/judder659/Forven"
 			target="_blank"
 			rel="noopener noreferrer"
-			class="text-[10px] text-gray-600 hover:text-gray-400 transition-colors"
+			class="text-[10px] text-[#555] hover:text-[#888] transition-colors"
 			title="Forven source code (AGPL-3.0)"
 		>Source · AGPL-3.0</a>
 	</div>
@@ -224,11 +227,11 @@
 	<div class="px-2 py-3 border-t border-[#222] flex items-center justify-center">
 		<div class="flex items-center">
 			<div
-				class="w-2 h-2 rounded-full ring-2 ring-black"
+				class="w-2 h-2 rounded-full"
 				title={`Status: ${connectionStatus}`}
-				class:bg-green-500={connectionStatus === 'connected'}
+				class:bg-emerald-400={connectionStatus === 'connected'}
 				class:bg-red-500={connectionStatus === 'disconnected'}
-				class:bg-yellow-500={connectionStatus === 'checking'}
+				class:bg-yellow-400={connectionStatus === 'checking'}
 			></div>
 		</div>
 	</div>

@@ -55,6 +55,168 @@ export function minutesToCron(minutes: string | number | null | undefined): stri
 	return hours < 24 ? `0 */${hours} * * *` : '0 0 * * *';
 }
 
+// ---------------------------------------------------------------------------
+// Friendly schedules — the routines page speaks "every N minutes / daily at
+// 9:00 AM" in LOCAL time; the backend still stores a UTC 5-field cron. These
+// helpers convert both ways. Crons that don't fit the friendly shapes (e.g.
+// Brain-proposed expressions) fall back to the advanced raw-cron editor.
+// ---------------------------------------------------------------------------
+
+export type Frequency = 'minutes' | 'hours' | 'daily' | 'weekly' | 'monthly';
+
+export interface FriendlySchedule {
+	freq: Frequency;
+	/** Interval for 'minutes' / 'hours'. */
+	every: number;
+	/** Local wall-clock 'HH:MM' for 'daily' / 'weekly' / 'monthly'. */
+	time: string;
+	/** Local day of week (0=Sunday) for 'weekly'. */
+	weekday: number;
+	/** Local day of month (1-31) for 'monthly'. */
+	dom: number;
+}
+
+export const WEEKDAY_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+const CRON_DOW_NAMES: Record<string, number> = { SUN: 0, MON: 1, TUE: 2, WED: 3, THU: 4, FRI: 5, SAT: 6 };
+
+export function defaultFriendlySchedule(): FriendlySchedule {
+	return { freq: 'daily', every: 30, time: '09:00', weekday: 1, dom: 1 };
+}
+
+function parseTime(time: string): { hour: number; minute: number } | null {
+	const m = /^(\d{1,2}):(\d{2})$/.exec((time || '').trim());
+	if (!m) return null;
+	const hour = Number(m[1]);
+	const minute = Number(m[2]);
+	if (hour < 0 || hour > 23 || minute < 0 || minute > 59) return null;
+	return { hour, minute };
+}
+
+/** A local wall-clock time today, as a Date (used to read the UTC equivalent). */
+function localToday(hour: number, minute: number): Date {
+	const d = new Date();
+	d.setHours(hour, minute, 0, 0);
+	return d;
+}
+
+/** Convert a friendly local-time schedule to a UTC 5-field cron. '' when invalid. */
+export function friendlyToCron(s: FriendlySchedule): string {
+	if (s.freq === 'minutes') return minutesToCron(s.every);
+	if (s.freq === 'hours') {
+		const h = Math.round(Number(s.every));
+		if (!Number.isFinite(h) || h < 1 || h > 23) return '';
+		return h === 1 ? '0 * * * *' : `0 */${h} * * *`;
+	}
+	const t = parseTime(s.time);
+	if (!t) return '';
+	if (s.freq === 'daily') {
+		const d = localToday(t.hour, t.minute);
+		return `${d.getUTCMinutes()} ${d.getUTCHours()} * * *`;
+	}
+	if (s.freq === 'weekly') {
+		// Next local occurrence of (weekday, time); its UTC day-of-week absorbs
+		// any midnight crossing introduced by the timezone offset.
+		const d = localToday(t.hour, t.minute);
+		d.setDate(d.getDate() + ((((s.weekday - d.getDay()) % 7) + 7) % 7));
+		return `${d.getUTCMinutes()} ${d.getUTCHours()} * * ${d.getUTCDay()}`;
+	}
+	if (s.freq === 'monthly') {
+		const dom = Math.round(Number(s.dom));
+		if (!Number.isFinite(dom) || dom < 1 || dom > 31) return '';
+		// Detect whether the local->UTC conversion crosses midnight using a
+		// mid-month reference day, then shift the requested day accordingly
+		// (wrapping within 1..31; the live fire-time preview shows the truth).
+		const ref = new Date();
+		ref.setDate(15);
+		ref.setHours(t.hour, t.minute, 0, 0);
+		const shift = ref.getUTCDate() - 15;
+		const utcDom = ((dom - 1 + shift + 31) % 31) + 1;
+		return `${ref.getUTCMinutes()} ${ref.getUTCHours()} ${utcDom} * *`;
+	}
+	return '';
+}
+
+/**
+ * Inverse of friendlyToCron for the shapes it produces (plus plain
+ * "m h * * dow/dom" crons from other authors). UTC fields are converted back
+ * to local wall-clock. Returns null when the cron doesn't fit — the caller
+ * falls back to the advanced raw-cron editor.
+ */
+export function cronToFriendly(expr: string | null | undefined): FriendlySchedule | null {
+	const parts = (expr || '').trim().split(/\s+/);
+	if (parts.length !== 5) return null;
+	const [min, hour, dom, mon, dow] = parts;
+	if (mon !== '*') return null;
+	const base = defaultFriendlySchedule();
+
+	const asMinutes = cronToMinutes(expr);
+	if (asMinutes !== null && asMinutes < 60) return { ...base, freq: 'minutes', every: asMinutes };
+	if (asMinutes !== null && asMinutes % 60 === 0 && asMinutes < 1440)
+		return { ...base, freq: 'hours', every: asMinutes / 60 };
+
+	const m = /^\d+$/.test(min) ? Number(min) : null;
+	const h = /^\d+$/.test(hour) ? Number(hour) : null;
+	if (m === null || h === null || m > 59 || h > 23) return null;
+
+	// Reconstruct local wall-clock from the stored UTC time.
+	const utcRef = new Date();
+	utcRef.setUTCHours(h, m, 0, 0);
+	const localTime = `${String(utcRef.getHours()).padStart(2, '0')}:${String(utcRef.getMinutes()).padStart(2, '0')}`;
+
+	if (dom === '*' && dow === '*') return { ...base, freq: 'daily', time: localTime };
+
+	if (dom === '*' && dow !== '*') {
+		let utcDow = CRON_DOW_NAMES[dow.toUpperCase()] ?? (/^\d+$/.test(dow) ? Number(dow) % 7 : null);
+		if (utcDow === null) return null;
+		// Roll a reference date to that UTC weekday and read its local weekday.
+		const d = new Date();
+		d.setUTCHours(h, m, 0, 0);
+		d.setUTCDate(d.getUTCDate() + ((((utcDow - d.getUTCDay()) % 7) + 7) % 7));
+		return { ...base, freq: 'weekly', time: localTime, weekday: d.getDay() };
+	}
+
+	if (dom !== '*' && dow === '*' && /^\d+$/.test(dom)) {
+		const utcDom = Number(dom);
+		if (utcDom < 1 || utcDom > 31) return null;
+		const ref = new Date();
+		ref.setUTCDate(15);
+		ref.setUTCHours(h, m, 0, 0);
+		const shift = ref.getDate() - 15;
+		const localDom = ((utcDom - 1 + shift + 31) % 31) + 1;
+		return { ...base, freq: 'monthly', time: localTime, dom: localDom };
+	}
+	return null;
+}
+
+/** 12-hour local time label for a 'HH:MM' string, e.g. '9:00 AM'. */
+function timeLabel(time: string): string {
+	const t = parseTime(time);
+	if (!t) return time;
+	const d = new Date();
+	d.setHours(t.hour, t.minute, 0, 0);
+	return d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+}
+
+/** Plain-English LOCAL-time description of a friendly schedule. */
+export function describeFriendly(s: FriendlySchedule): string {
+	if (s.freq === 'minutes') return s.every === 1 ? 'Every minute' : `Every ${s.every} minutes`;
+	if (s.freq === 'hours') return s.every === 1 ? 'Every hour' : `Every ${s.every} hours`;
+	if (s.freq === 'daily') return `Every day at ${timeLabel(s.time)}`;
+	if (s.freq === 'weekly') return `Every ${WEEKDAY_NAMES[s.weekday] ?? '?'} at ${timeLabel(s.time)}`;
+	if (s.freq === 'monthly') return `Monthly on day ${s.dom} at ${timeLabel(s.time)}`;
+	return '';
+}
+
+/**
+ * Plain-English local-time description of a cron expression, for routine
+ * cards. Falls back to '' when the cron doesn't fit a friendly shape (the
+ * caller shows the raw expression instead).
+ */
+export function describeCronLocal(expr: string | null | undefined): string {
+	const friendly = cronToFriendly(expr);
+	return friendly ? describeFriendly(friendly) : '';
+}
+
 /**
  * Inverse of minutesToCron for the patterns it produces, so an existing routine
  * can be re-opened in "every N minutes" mode. Returns null when the expression

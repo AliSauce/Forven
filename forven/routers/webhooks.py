@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import hmac
 import json
@@ -331,6 +332,15 @@ async def github_webhook(request: Request):
             "status": "ignored",
             "reason": f"Push ref '{pushed_ref}' does not match '{target_ref}'",
         }
+    # Everything below is synchronous and SLOW (DB claim, git fetch+pull over the
+    # network, an operator-configured post-pull command) — running it inline on an
+    # `async def` handler blocked the request loop for the whole update and dropped
+    # the live WebSocket. Offload the entire sync tail to a worker thread.
+    return await asyncio.to_thread(_apply_push_update_sync, delivery_id, payload)
+
+
+def _apply_push_update_sync(delivery_id: str, payload: dict) -> dict:
+    """Thread-side body of the push webhook: claim, pull, post-pull."""
     _claim_delivery_id(delivery_id, payload)
 
     acquired = _PULL_LOCK.acquire(blocking=False)

@@ -3,7 +3,7 @@
 Covers ``forven.control_plane.routines.dispatch_routine_now`` and the
 ``POST /api/routines/{id}/run`` route. The manual dispatch must enqueue a
 ``brain_invoke`` task using the SAME payload shape the scheduler builds for
-cron fires (prompt + tools_context + skills), differing only by ``source``.
+cron fires (prompt + tools_context + channel), differing only by ``source``.
 """
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ def _make(**overrides) -> int:
         prompt="summarize the day",
         cron_expr="0 17 * * *",
         tools_context="research",
-        skills=["recall", "post_mortem"],
+        channel="ops",
     )
     base.update(overrides)
     return r.create_routine(**base)
@@ -71,7 +71,9 @@ def test_dispatch_enqueues_brain_invoke_task(forven_db) -> None:
     assert payload["routine_id"] == routine_id
     assert payload["message"] == "summarize the day"
     assert payload["tools_context"] == "research"
-    assert payload["skills"] == ["recall", "post_mortem"]
+    # The bot posts the response to this Discord channel (payload.channel
+    # delivery, same as generic brain_invoke scheduler jobs).
+    assert payload["channel"] == "ops"
 
 
 def test_dispatch_records_run(forven_db) -> None:
@@ -130,3 +132,37 @@ def test_run_route_paused_routine_returns_409(client: TestClient) -> None:
     routine_id = _make(enabled=False)
     resp = client.post(f"/api/routines/{routine_id}/run")
     assert resp.status_code == 409
+
+
+# --- channel picker --------------------------------------------------------
+
+def test_channels_endpoint_prefers_live_bot_list(client: TestClient) -> None:
+    """When the bot has published its guild channels, the picker serves them
+    (raw ids + names) so the page works on any user's Discord server."""
+    init_db()
+    from forven.db import kv_set
+    from forven.discord_channels import AVAILABLE_CHANNELS_KV_KEY
+
+    kv_set(
+        AVAILABLE_CHANNELS_KV_KEY,
+        {
+            "updated_at": "2026-07-02T00:00:00+00:00",
+            "channels": [{"id": "123456", "name": "updates"}],
+        },
+    )
+    resp = client.get("/api/routines/channels")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["source"] == "discord"
+    assert {"id": "123456", "label": "#updates"} in body["channels"]
+
+
+def test_channels_endpoint_falls_back_to_alias_map(client: TestClient) -> None:
+    """Without a bot-published list, the static alias map still populates the
+    picker (and 'channels' is not captured by the /{routine_id} route)."""
+    init_db()
+    resp = client.get("/api/routines/channels")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["source"] == "aliases"
+    assert any(c["id"] == "ops" for c in body["channels"])

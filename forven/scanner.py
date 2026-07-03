@@ -452,8 +452,13 @@ def _book_account_equity(account_address: str | None) -> float | None:
         return None
     try:
         from forven.exchange.hyperliquid import get_account_value
+        # EQ-BASIS-4: require a REAL exchange read — the paper-mode fallback in
+        # get_account_value returns the daemon's own bookkeeping (ignoring the
+        # address), which would size a real order off a phantom balance.
         acc = get_account_value(
-            testnet=_resolve_hyperliquid_testnet(), account_address=account_address
+            testnet=_resolve_hyperliquid_testnet(),
+            require_connection=True,
+            account_address=account_address,
         )
         return _coerce_positive_float(acc.get("accountValue")) if isinstance(acc, dict) else None
     except Exception as exc:
@@ -1069,6 +1074,14 @@ def _guard_open_trade_execution_intent(
                 f"trade {trade_id} requested size {float(size):.6f} exceeds safe max {float(max_size):.6f}"
             )
 
+    # GO-LIVE-1: the operator's go-live per-asset notional ceiling also bounds
+    # the legacy/intent live path (the kernel path checks it before its order).
+    if str(trade.get("execution_type") or "").strip().lower() == "live":
+        from forven.exchange.risk import check_live_strategy_ceiling
+        _cl_ok, _cl_why = check_live_strategy_ceiling(strategy_id, float(size) * float(reference_price))
+        if not _cl_ok:
+            raise ValueError(f"trade {trade_id} blocked: {_cl_why}")
+
     risk_plan = _build_entry_risk_plan(
         direction=direction,
         entry_price=float(reference_price),
@@ -1665,20 +1678,38 @@ def fetch_candles(
     if is_sim_active():
         end_ms = int(get_now().timestamp() * 1000)
 
-        # Try pre-fetch cache first
+        # Try pre-fetch cache first — but, mirroring the live path's RESTART-1
+        # coverage gate, only serve it when it actually COVERS the request. The
+        # sim branch used to return ANY non-empty cache, so an under-prefetched
+        # window silently truncated the sim frame (short indicator warmups,
+        # kernel replays losing exit enforcement).
         from forven.sim.data_pump import get_cached_candles
         cached = get_cached_candles(normalized_coin, resolved_interval, end_ms, required_bars)
-        if cached is not None and not cached.empty:
+        if cached is not None and not cached.empty and len(cached) >= required_bars:
             return cached
 
-        # Fallback to API if cache miss
-        df = fetch_hyperliquid_candles(
-            normalized_coin,
-            bars=required_bars,
-            interval=resolved_interval,
-            end_time=end_ms,
-            clean=True,
-        )
+        # Cache miss or short cache: fetch the full window at the sim's
+        # virtual end time. If the venue can't serve more than the cache had,
+        # fall back to the (short) cache rather than failing the scan.
+        try:
+            df = fetch_hyperliquid_candles(
+                normalized_coin,
+                bars=required_bars,
+                interval=resolved_interval,
+                end_time=end_ms,
+                clean=True,
+            )
+        except Exception as exc:
+            if cached is not None and not cached.empty:
+                log.warning(
+                    "[%s] sim cache short (%d/%d bars @ %s) and direct fetch failed (%s) — "
+                    "serving the truncated cache",
+                    normalized_coin, len(cached), required_bars, resolved_interval, exc,
+                )
+                return cached
+            raise
+        if cached is not None and not cached.empty and len(df) <= len(cached):
+            return cached
         return df
 
     cached_rows, cache_age = load_candle_snapshot(normalized_coin, interval=resolved_interval)
@@ -3094,14 +3125,18 @@ SIGNAL_CHECKERS = {
 
 
 def _signed_slippage_bps(signal_price: float, fill_price: float, side: str) -> float:
-    """Compute directional slippage in bps."""
+    """Signed slippage in bps, POSITIVE = ADVERSE execution (buy filled above the
+    reference / sell filled below it). This is the same convention as
+    monitoring._calc_slippage_bps and agents.tools_exchange._signed_slippage_bps —
+    the scanner previously used the OPPOSITE sign (positive = favorable), so the
+    slippage monitor's 168h re-sweep silently flipped every recorded value."""
     signal_price = float(signal_price or 0)
     fill_price = float(fill_price or 0)
     if signal_price <= 0 or fill_price <= 0:
         return 0.0
     if side == "buy":
-        return ((signal_price - fill_price) / signal_price) * 1e4
-    return ((fill_price - signal_price) / signal_price) * 1e4
+        return ((fill_price - signal_price) / signal_price) * 1e4
+    return ((signal_price - fill_price) / signal_price) * 1e4
 
 
 def _update_trade_signal_data(trade_id: str, updates: dict) -> None:
@@ -3135,12 +3170,21 @@ def _update_trade_signal_data(trade_id: str, updates: dict) -> None:
         return
 
 
-def _update_trade_fill(trade_id: str, fill_price: float, fill_kind: str, signal_price: float | None = None, exchange_order_id: str | None = None, filled_size: float | None = None) -> None:
+def _update_trade_fill(trade_id: str, fill_price: float, fill_kind: str, signal_price: float | None = None, exchange_order_id: str | None = None, filled_size: float | None = None, mark_price: float | None = None) -> None:
     """Update a trade row with fill details from direct execution.
 
     `filled_size` is the size the exchange actually filled (an IOC entry can
     partial-fill). On an entry fill we persist it to trades.size so stops,
     closes, and PnL act on the real position rather than the requested size.
+
+    Execution-quality instrumentation: `signal_price` is the backtest-EXPECTED
+    price for this leg (the kernel's next-bar-open fill) and is persisted to
+    signal_entry/exit_price, so entry/exit_slippage_bps is the realized
+    expected-vs-actual skew (adverse-positive). `mark_price` — the venue mark at
+    the moment the order was placed — splits that skew: expected -> mark is the
+    decision-lag component (persisted as entry/exit_lag_bps); mark -> fill is
+    venue slippage (the remainder). A paper fill IS the mark, so paper skew is
+    pure lag.
     """
     try:
         with get_db() as conn:
@@ -3189,19 +3233,31 @@ def _update_trade_fill(trade_id: str, fill_price: float, fill_kind: str, signal_
                 signal_data.pop("pending_open_reconcile_at", None)
                 signal_data.pop("open_execution_failure_reason", None)
                 ref_price = signal_price if signal_price not in (None, 0) else row["signal_entry_price"]
+                if signal_price not in (None, 0):
+                    updates.append("signal_entry_price = ?")
+                    values.append(float(signal_price))
                 if ref_price not in (None, 0):
                     side = "buy" if direction == "long" else "sell"
                     updates.append("entry_slippage_bps = COALESCE(?, entry_slippage_bps)")
                     values.append(_signed_slippage_bps(float(ref_price), float(fill_price), side))
+                    if mark_price not in (None, 0):
+                        updates.append("entry_lag_bps = COALESCE(?, entry_lag_bps)")
+                        values.append(_signed_slippage_bps(float(ref_price), float(mark_price), side))
             elif fill_kind == "exit":
                 updates.extend(["fill_exit_price = ?", "exit_price = ?"])
                 values.append(float(fill_price))
                 values.append(float(fill_price))
                 ref_price = signal_price if signal_price not in (None, 0) else row["signal_exit_price"]
+                if signal_price not in (None, 0):
+                    updates.append("signal_exit_price = ?")
+                    values.append(float(signal_price))
                 if ref_price not in (None, 0):
                     side = "sell" if direction == "long" else "buy"
                     updates.append("exit_slippage_bps = COALESCE(?, exit_slippage_bps)")
                     values.append(_signed_slippage_bps(float(ref_price), float(fill_price), side))
+                    if mark_price not in (None, 0):
+                        updates.append("exit_lag_bps = COALESCE(?, exit_lag_bps)")
+                        values.append(_signed_slippage_bps(float(ref_price), float(mark_price), side))
             else:
                 return
 
@@ -3278,6 +3334,32 @@ def _fail_unfilled_open_trade(trade_id: str | None, reason: str | None) -> None:
         tid,
         reason,
     )
+
+
+def _notify_live_open_blocked(strat_id: str, asset: str, reason: str, reason_class: str) -> None:
+    """A refused LIVE open is a real-capital safety event the operator must see
+    without reading scanner logs. The scan re-attempts while the signal stays
+    active, so dedupe per (strategy, cause); the trade_blocked policy adds a 1h
+    cooldown on top."""
+    try:
+        from forven.notifications import emit_notification
+        emit_notification(
+            "trade_blocked",
+            severity="warn",
+            source="scanner",
+            title=f"Live open blocked ({asset})",
+            summary=f"{strat_id}: {reason}",
+            body=f"{strat_id}: {reason}",
+            metadata={
+                "strategy_id": strat_id,
+                "asset": asset,
+                "execution_mode": "live",
+                "reason_class": reason_class,
+            },
+            dedupe_key=f"trade_blocked:{strat_id}:{reason_class}",
+        )
+    except Exception as exc:
+        log.debug("Could not emit trade_blocked notification: %s", exc)
 
 
 def _report_execution_failure(strategy_id: str | None, action: str, trade_id: str | None, reason: str | None = None) -> None:
@@ -3498,6 +3580,7 @@ def _execute_direct(
                     signal_price=price,
                     exchange_order_id=exchange_order_id,
                     filled_size=filled_size_f,
+                    mark_price=result.get("mid"),
                 )
             if exchange_order_id is not None and "entry_exchange_order_id" not in order_meta:
                 order_meta["entry_exchange_order_id"] = exchange_order_id
@@ -3644,6 +3727,7 @@ def _execute_direct(
                     "exit",
                     signal_price=price,
                     exchange_order_id=exchange_order_id,
+                    mark_price=result.get("mid"),
                 )
             if exchange_order_id is not None and "exit_exchange_order_id" not in order_meta:
                 order_meta["exit_exchange_order_id"] = exchange_order_id
@@ -3746,9 +3830,6 @@ def _resolve_trade_vault_address(trade_id, *, strict: bool = False) -> str | Non
         book = dict(row).get("book") if row else None
         if not book:
             return None
-        label = books.normalize_book(book)
-        if label == books.MAIN_BOOK:
-            return None
         # BOOKS-1: distinguish a LEGITIMATE master route (a long book with no
         # dedicated sub-account) from a TRANSIENT settings-read failure. The
         # convenience books.book_address() path runs through books._settings(),
@@ -3757,9 +3838,24 @@ def _resolve_trade_vault_address(trade_id, *, strict: bool = False) -> str | Non
         # no-op that strands the real sub-account position). Read settings here
         # via kv_get, which RE-RAISES on a locked DB, so a transient failure
         # propagates to the except below and (strict) fails the close CLOSED.
+        # Settings are read BEFORE normalize_book so a NAMED-wallet label is
+        # normalized against a real registry read, not a swallowed empty one.
         settings = _kv_get("forven:settings", {})
         if not isinstance(settings, dict):
             settings = {}
+        raw_label = str(book or "").strip().lower()
+        label = books.normalize_book(raw_label, settings)
+        if label == books.MAIN_BOOK:
+            # WALLET-1: a label that is NOT literally main/blank collapsed to
+            # MAIN — either a named wallet whose registry entry was removed or
+            # a label this build doesn't know. Routing its order to master
+            # would hit the wrong account; fail closed.
+            if raw_label and raw_label != books.MAIN_BOOK:
+                raise RuntimeError(
+                    f"trade {normalized} routes to unknown wallet {raw_label!r} "
+                    "(named-wallet registry entry missing); refusing to route to master"
+                )
+            return None
         addr = books.book_address(label, settings)
         if addr is None and label == books.SHORT_BOOK:
             # A routed SHORT can never legitimately close on master: shorts are
@@ -3768,6 +3864,13 @@ def _resolve_trade_vault_address(trade_id, *, strict: bool = False) -> str | Non
             raise RuntimeError(
                 f"trade {normalized} routes to the short book but its sub-account "
                 "address is unavailable; refusing to downgrade the close to master"
+            )
+        if addr is None and label not in books.ALL_BOOKS:
+            # Named wallet resolved but its address vanished between normalize
+            # and resolve (registry mutation race) — same fail-closed rule.
+            raise RuntimeError(
+                f"trade {normalized} routes to named wallet {label!r} but its "
+                "address is unavailable; refusing to downgrade to master"
             )
         return addr
     except Exception as exc:
@@ -5592,7 +5695,16 @@ def _kernel_open_paper_trade(strat_id: str, strat: dict, action, *, sizing_equit
         register(trade_id, asset, direction, strat_id, float(alloc_risk), entry_price, execution_type="paper")
     except Exception:
         pass
-    _update_trade_fill(trade_id=trade_id, fill_price=entry_price, fill_kind="entry", signal_price=entry_price)
+    # Expected-vs-actual: the backtest-EXPECTED entry is the kernel's historical
+    # next-bar-open (kernel_entry_price), NOT the recorded fill — passing the fill
+    # as its own reference (the old behavior) made paper skew 0 by construction.
+    # A fill-now hop-in's entry_slippage_bps now records the real lag skew; a
+    # faithful open fills AT the expected price, so its 0 is a true measurement.
+    _update_trade_fill(
+        trade_id=trade_id, fill_price=entry_price, fill_kind="entry",
+        signal_price=kernel_entry_price if kernel_entry_price > 0 else entry_price,
+        mark_price=entry_price,
+    )
     return f"KERNEL-OPEN{' (fill-now)' if late else ''} {asset} {direction} @ {entry_price:.6g} size={units}"
 
 
@@ -5639,16 +5751,45 @@ def _late_trade_funding_pct(
         return 0.0
 
 
+def _price_exit_bar_close_stamp(exit_time_value, timeframe: str) -> str | None:
+    """Bar-CLOSE stamp for an intrabar PRICE exit (stop/TP/trailing).
+
+    The kernel's exit_time is the breach bar's index LABEL — its OPEN time. A price
+    level is touched mid-bar, so stamping the label backdates the close to before the
+    touch was even possible (E0010: TP touched ~10:45Z, stamped 10:00Z). The earliest
+    moment the engine can know an intrabar breach from closed candles is the bar's
+    CLOSE — label + bar duration. None when the label won't parse (caller keeps the
+    raw label rather than dropping the stamp)."""
+    dt = _parse_iso_ts(exit_time_value)
+    if dt is None:
+        return None
+    try:
+        from forven.strategies.backtest import _hours_per_bar
+
+        hours = float(_hours_per_bar(str(timeframe or "1h")))
+    except Exception:
+        hours = 1.0
+    from datetime import timedelta
+
+    return (dt + timedelta(hours=hours)).isoformat()
+
+
 def _kernel_close_recorded(
     strat_id: str, strat: dict, row: dict, trade: dict, direction: str,
     *, closed_at_override: str | None = None,
     current_price: float | None = None, current_time: str | None = None,
     funding_df: "pd.DataFrame | None" = None, timeframe: str | None = None,
+    pending: bool = False, mark_fill: bool = False,
 ) -> str | None:
     trade_id = str(row.get("id"))
     sd = parse_trade_signal_data(row.get("signal_data"))
     late = bool(sd.get("late_entry"))
     exit_price = float(trade.get("exit_price") or 0.0)
+    # Backtest-EXPECTED exit (the kernel's own fill), captured BEFORE the fill-now
+    # override below so exit_slippage_bps measures expected-vs-actual, not fill-vs-fill.
+    # A mark-watcher close may carry a separate expected level (expected_exit_price)
+    # when its actual fill diverged from the armed level.
+    kernel_exit_price = _coerce_positive_float(trade.get("expected_exit_price")) or exit_price
     pnl_pct_net = float(trade.get("pnl_pct") or 0.0)  # kernel net, equity-fraction
     equity_at_entry = _coerce_positive_float(sd.get("kernel_equity_at_entry")) or _PAPER_SANDBOX_INITIAL_CAPITAL
     pnl_usd = round(float(equity_at_entry) * pnl_pct_net, 4)
@@ -5656,31 +5797,48 @@ def _kernel_close_recorded(
     # FILL-NOW exit: a late hop-in's SIGNAL/time-stop exit is a decision the kernel just
     # made on the most-recently-closed bar — fill it at the CURRENT mark/time, exactly like
     # its fill-now ENTRY, instead of the kernel's historical exit-bar price (which can be
-    # delayed up to ~1 bar by the backtest's own fill convention). PRICE exits (stop/target/
-    # trailing) are excluded: those are owned by the re-anchored intrabar monitor
-    # (_kernel_handle_late_entry_exits), which already fills realistically bar-by-bar and
-    # never passes current_price here.
+    # delayed up to ~1 bar by the backtest's own fill convention). A PENDING (signal-bar-
+    # close) exit is by construction such a decision, whatever the row's provenance. PRICE
+    # exits (stop/target/trailing) are excluded: those are owned by the re-anchored intrabar
+    # monitor (_kernel_handle_late_entry_exits), which already fills realistically
+    # bar-by-bar and never passes current_price here.
     fresh_exit = (
-        late and exit_reason not in _KERNEL_PRICE_EXIT_REASONS
+        (late or pending) and exit_reason not in _KERNEL_PRICE_EXIT_REASONS
         and current_price is not None and float(current_price) > 0
     )
     if fresh_exit:
         exit_price = float(current_price)
-    _update_trade_fill(trade_id=trade_id, fill_price=exit_price, fill_kind="exit", signal_price=exit_price)
-    # closed_at = the kernel's actual EXIT-bar time (the trade really closed on the bar the
-    # kernel exited on, not the scan moment). close_trade_record stamps it directly.
+    _update_trade_fill(
+        trade_id=trade_id, fill_price=exit_price, fill_kind="exit",
+        signal_price=kernel_exit_price if kernel_exit_price > 0 else exit_price,
+        # A mark-fill close fills at the LEVEL while the venue mark is the tick that
+        # touched it — record the real mark so the lag/slippage split stays honest.
+        mark_price=float(current_price) if (mark_fill and current_price) else exit_price,
+    )
+    # closed_at = when the trade really closed. For a SIGNAL/time-stop exit the kernel's
+    # exit_time (bar label) IS the fill moment (market-on-open fills at the label). For a
+    # PRICE exit (stop/TP/trailing) the breach is INTRABAR — the label backdates it to the
+    # bar OPEN, before the level was even touched — so stamp the bar CLOSE instead.
     # closed_at_override clamps it (used when a fill-now exit lands at/before the fill time)
     # so the trade is never negative-duration while still realizing the kernel exit PRICE.
     _exit_time = trade.get("exit_time")
     _closed_at = str(_exit_time).replace(" ", "T") if _exit_time else None
-    if fresh_exit and current_time:
+    if _closed_at and not mark_fill and exit_reason in _KERNEL_PRICE_EXIT_REASONS:
+        _resolved_tf = timeframe or str(
+            strat.get("timeframe") or (strat.get("params") or {}).get("timeframe") or "1h"
+        ).strip().lower() or "1h"
+        _closed_at = _price_exit_bar_close_stamp(_exit_time, _resolved_tf) or _closed_at
+    if (fresh_exit or mark_fill) and current_time:
+        # mark_fill: the daemon's tick watcher saw the level touched NOW — the stamp is
+        # the touch moment itself, exactly like a real resting order's fill time.
         _closed_at = str(current_time).replace(" ", "T")
     if closed_at_override:
         _closed_at = str(closed_at_override).replace(" ", "T")
-    if late:
+    if late or pending or mark_fill:
         # FILL-NOW entry: the recorded entry is the current-mark fill price, NOT the kernel's
         # historical entry — so the kernel's historical-entry pnl_pct does NOT describe this
-        # position. Recompute the NET equity-fraction PnL from OUR actual entry, using the
+        # position (a PENDING close likewise has no kernel pnl at all — the kernel hasn't
+        # exited yet). Recompute the NET equity-fraction PnL from OUR actual entry, using the
         # kernel's own convention ((price_return*sign*lev - round_trip_drag) * size_fraction),
         # and write it equity-fraction-flagged via pnl_override so this close is COUNTED by the
         # promotion gate (which filters on pnl_is_equity_fraction). Omitting the flag — as the
@@ -5710,18 +5868,30 @@ def _kernel_close_recorded(
             _pnl_eq = 0.0
         _pnl_usd_eq = round(float(equity_at_entry) * _pnl_eq, 4)
         close_trade_record(
-            trade_id, signal_exit_price=exit_price, exit_price=exit_price,
-            close_reason=exit_reason, close_price_source="kernel", closed_at=_closed_at,
+            # signal_exit_price = the backtest-EXPECTED exit; the actual fill-now
+            # exit is carried by exit_price/fill_exit_price (which win the close's
+            # price resolution), so PnL is unchanged and the skew columns survive.
+            trade_id, signal_exit_price=kernel_exit_price if kernel_exit_price > 0 else exit_price,
+            exit_price=exit_price,
+            close_reason=exit_reason,
+            close_price_source="mark_watcher" if mark_fill else "kernel",
+            closed_at=_closed_at,
             extra_signal_data={
-                "kernel_exit_time": trade.get("exit_time"), "kernel_managed": True,
-                "close_fill_now": fresh_exit, "funding_cost_pct": _funding_pct,
+                "kernel_exit_time": trade.get("exit_time"), "kernel_managed": bool(sd.get("kernel_managed", True)),
+                "close_fill_now": fresh_exit, "close_mark_fill": mark_fill,
+                "funding_cost_pct": _funding_pct,
             },
             pnl_override={
                 "pnl_pct": round(_pnl_eq, 8), "net_pnl_pct": round(_pnl_eq, 8),
                 "pnl_usd": _pnl_usd_eq, "equity_fraction": True,
             },
         )
-        _tag = "fill-now" if fresh_exit else "fill-now entry, historical exit"
+        if mark_fill:
+            _tag = "mark-fill"
+        elif fresh_exit:
+            _tag = "fill-now"
+        else:
+            _tag = "fill-now entry, historical exit"
         return f"KERNEL-CLOSE ({_tag}) {strat.get('asset')} {direction} @ {exit_price:.6g} pnl={_pnl_eq * 100:.2f}% ({exit_reason})"
     # Faithful kernel trade: write the kernel's NET equity-fraction values (the kernel
     # pnl_pct is net-of-drag, size-scaled equity impact — close_trade_record's own pnl is a
@@ -5747,6 +5917,7 @@ def _kernel_close_paper_trade(
     funding_df: "pd.DataFrame | None" = None, timeframe: str | None = None,
 ) -> str | None:
     trade = action.trade or {}
+    pending = bool(getattr(action, "pending", False))
     if action.recorded and action.recorded.get("_row"):
         row = action.recorded["_row"]
         sd = parse_trade_signal_data(row.get("signal_data"))
@@ -5770,7 +5941,7 @@ def _kernel_close_paper_trade(
                 return _kernel_close_recorded(
                     strat_id, strat, row, trade, action.direction,
                     closed_at_override=row.get("opened_at"),
-                    funding_df=funding_df, timeframe=timeframe,
+                    funding_df=funding_df, timeframe=timeframe, pending=pending,
                 )
             # A LATE hop-in's PRICE exits are owned by its RE-ANCHORED stop/target (enforced
             # intrabar by _kernel_handle_late_entry_exits), NOT by the kernel's historical
@@ -5786,7 +5957,7 @@ def _kernel_close_paper_trade(
         return _kernel_close_recorded(
             strat_id, strat, row, trade, action.direction,
             current_price=current_price, current_time=current_time,
-            funding_df=funding_df, timeframe=timeframe,
+            funding_df=funding_df, timeframe=timeframe, pending=pending,
         )
     # Backfill: opened AND closed between scans — record the completed trade. Guard against
     # re-recording one already booked: if ANY trade already carries this kernel_entry_time,
@@ -5838,6 +6009,11 @@ def _kernel_refresh_paper_trade(action) -> str | None:
     if str(sd.get("stop_loss_source") or "").strip().lower() != "manual":
         updates["stop_loss"] = pos.get("stop_price")
         updates["stop_loss_price"] = pos.get("stop_price")
+        # The kernel's EFFECTIVE protective level (fixed stop ∨ ratcheted trailing) —
+        # persisted so the daemon's mark watcher can arm it like a real resting stop
+        # order. The trailing ratchet previously lived only inside scan-time replay
+        # (enforced but unpersisted); None clears a stale level when the trail is gone.
+        updates["effective_stop_price"] = _kernel_effective_stop(pos, action.direction)
     if str(sd.get("take_profit_source") or "").strip().lower() != "manual":
         updates["take_profit"] = pos.get("target_price")
         updates["take_profit_price"] = pos.get("target_price")
@@ -5847,6 +6023,108 @@ def _kernel_refresh_paper_trade(action) -> str | None:
         updates["kernel_entry_time"] = str(action.entry_time)
     if updates:
         _update_trade_signal_data(str(row.get("id")), updates)
+    return None
+
+
+def _kernel_effective_stop(pos: dict, direction: str) -> float | None:
+    """The kernel position's EFFECTIVE protective level right now: the tighter of the
+    fixed stop and the ratcheted trailing level (extreme through the last closed bar) —
+    the same combination simulate() checks intrabar. This is the level a real resting
+    stop order must sit at for the exchange to reproduce the kernel's exit."""
+    sign = -1.0 if str(direction or "long").strip().lower() == "short" else 1.0
+    eff = _coerce_positive_float(pos.get("stop_price"))
+    trail_pct = pos.get("trail_pct")
+    extreme = _coerce_positive_float(pos.get("extreme"))
+    if trail_pct and extreme:
+        trail_level = extreme * (1.0 - sign * float(trail_pct))
+        if eff is None:
+            eff = trail_level
+        else:
+            eff = max(eff, trail_level) if sign > 0 else min(eff, trail_level)
+    return eff
+
+
+def _kernel_refresh_live_trade(strat_id: str, action) -> str | None:
+    """LIVE-TRAIL-1: mirror the kernel's stop — INCLUDING the ratcheted trailing level —
+    onto the LIVE position's resting exchange stop order.
+
+    Before this, only the INITIAL stop/TP became real exchange trigger orders; the
+    kernel's trailing stop existed solely inside the scan-time replay, so a live
+    reversal through a trailed-up level was only detected a full bar + scan-lag later
+    and closed at market from far below it. Each refresh now compares the kernel's
+    effective level against the resting stop and, when it has TIGHTENED, replaces the
+    exchange order place-before-cancel (never leave the position unprotected on a
+    rejected replacement — the old stop stays). Stops are only ever tightened here; a
+    manual stop (stop_loss_source='manual') is the operator's and is never touched."""
+    row = (action.recorded or {}).get("_row")
+    if row is None:
+        return None
+    sd = parse_trade_signal_data(row.get("signal_data"))
+    if sd.get("manual_pause"):
+        return None  # MANUAL-1: detached from auto-management
+    pos = action.position or {}
+    direction = str(row.get("direction") or action.direction or "long").strip().lower()
+    sign = -1.0 if direction == "short" else 1.0
+    updates: dict = {}
+    if str(sd.get("stop_loss_source") or "").strip().lower() != "manual":
+        eff = _kernel_effective_stop(pos, direction)
+        old = _coerce_positive_float(
+            sd.get("stop_loss_price") if sd.get("stop_loss_price") is not None else sd.get("stop_loss")
+        )
+        # Replace only on a genuine TIGHTENING move (long: up, short: down) beyond float
+        # dust — the trailing ratchet moves at most once per closed bar, so this stays a
+        # low-rate cancel/replace, never a churn.
+        tightened = eff is not None and (
+            old is None or (eff - old) * sign > max(abs(old), 1e-9) * 1e-4
+        )
+        if tightened:
+            trade_id = str(row.get("id"))
+            asset = str(row.get("asset") or "").strip().upper()
+            size = abs(_coerce_positive_float(row.get("size")) or 0.0)
+            if asset and size > 0:
+                from forven.exchange.hyperliquid import cancel_order, place_protective_stop
+                vault = None
+                try:
+                    vault = _resolve_trade_vault_address(trade_id)
+                except Exception:
+                    vault = None
+                old_oid = sd.get("exchange_stop_order_id")
+                new_oid = None
+                try:
+                    result = place_protective_stop(
+                        asset, direction, size, float(eff),
+                        testnet=_resolve_hyperliquid_testnet(), vault_address=vault,
+                    )
+                    if isinstance(result, dict) and not result.get("error"):
+                        new_oid = result.get("stop_order_id") or result.get("order_id")
+                except Exception as exc:
+                    log.warning("[%s] live trailing-stop replace failed for %s (%s); keeping the existing stop",
+                                strat_id, asset, exc)
+                if new_oid:
+                    if old_oid:
+                        try:
+                            cancel_order(asset, int(old_oid), testnet=_resolve_hyperliquid_testnet(), vault_address=vault)
+                        except Exception:  # a stale/already-filled order is fine to ignore
+                            log.warning("[%s] old stop cancel failed for %s oid=%s", strat_id, asset, old_oid, exc_info=True)
+                    updates.update({
+                        "stop_loss": float(eff), "stop_loss_price": float(eff),
+                        "stop_loss_source": "kernel_trailing" if pos.get("trail_pct") else "kernel",
+                        "exchange_stop_order_id": str(new_oid), "sl_adjusted_at": get_now().isoformat(),
+                    })
+                else:
+                    updates["stop_loss_replace_failed"] = True
+                    updates["stop_loss_replace_failed_at"] = get_now().isoformat()
+    # Display-refresh the un-owned TP side like the paper refresh does (the resting TP
+    # order itself is static — placed at open, level never moves).
+    if str(sd.get("take_profit_source") or "").strip().lower() != "manual" and pos.get("target_price") is not None:
+        updates.setdefault("take_profit", pos.get("target_price"))
+        updates.setdefault("take_profit_price", pos.get("target_price"))
+    if (action.recorded or {}).get("_orphan") and action.entry_time:
+        updates["kernel_entry_time"] = str(action.entry_time)
+    if updates:
+        _update_trade_signal_data(str(row.get("id")), updates)
+    if updates.get("exchange_stop_order_id"):
+        return f"LIVE-STOP-RATCHET {row.get('asset')} {direction} → {float(updates['stop_loss']):.6g}"
     return None
 
 
@@ -6027,8 +6305,9 @@ def _kernel_handle_late_entry_exits(
             continue
 
         # Route through the SAME late-close path the reconciler uses (entry-based PnL from
-        # the hop-in price, kernel exit-bar timestamp), passing the re-anchored breach as a
-        # synthetic kernel trade. pnl_pct is ignored for late closes (recomputed from entry).
+        # the hop-in price, breach-bar CLOSE timestamp — an intrabar breach is only knowable
+        # at bar close), passing the re-anchored breach as a synthetic kernel trade.
+        # pnl_pct is ignored for late closes (recomputed from entry).
         synthetic = {
             "exit_price": float(exit_price),
             "pnl_pct": 0.0,
@@ -6110,6 +6389,11 @@ def _kernel_open_live_trade(strat_id: str, strat: dict, action, *, sizing_equity
                     "[%s] BLOCKED %s live — could not read %s-book sub-account balance; "
                     "not sizing a real order off the master wallet", strat_id, asset, open_book,
                 )
+                _notify_live_open_blocked(
+                    strat_id, asset,
+                    f"{open_book}-book sub-account balance unavailable for sizing (fail closed)",
+                    "book_balance_unavailable",
+                )
                 return f"BLOCKED {asset} live — {open_book}-book balance unavailable for sizing"
         if books.short_book_available():
             _cross, _cross_reason = _opposite_book_would_cross(asset, open_book)
@@ -6129,12 +6413,55 @@ def _kernel_open_live_trade(strat_id: str, strat: dict, action, *, sizing_equity
         return None
     stop_price = pos.get("stop_price")
     target_price = pos.get("target_price")
+    kernel_trail_pct = pos.get("trail_pct")
+    if stop_price is None and kernel_trail_pct:
+        # LIVE-TRAIL-1: a trailing-only profile carries no fixed stop, which the
+        # no-stop-no-open guard in _execute_direct would refuse. Its protective level
+        # DOES exist — the initial trailing level off the entry — so place the resting
+        # stop there; each refresh then ratchets it with the kernel's extreme.
+        _sgn = -1.0 if direction == "short" else 1.0
+        stop_price = round(float(ref_price) * (1.0 - _sgn * float(kernel_trail_pct)), 8)
+    # PORT-1 (precise gate): admission against the ACCOUNT-level budget with this
+    # order's actual risk (distance to its stop x units) and notional. Uses the
+    # AGGREGATE account equity, not the direction-book slice sizing_equity may have
+    # been narrowed to — the budget bounds the whole account. Not skippable by
+    # enforce_risk_caps; the coarse total-risk check in can_open covers non-kernel
+    # paths, this one owns per-asset / correlated-group net exposure.
+    from forven.exchange.risk import check_live_portfolio_budget
+    _add_notional = float(units) * float(ref_price)
+    if stop_price:
+        _add_risk = abs(float(ref_price) - float(stop_price)) * float(units)
+    else:
+        _add_risk = _add_notional * 0.03  # no stop known — conservative floor (mirrors risk._BUDGET_NO_STOP_RISK_FRAC)
+    # BOOK-BUDGET-1: the order draws on ONE wallet — pass the routed book and its
+    # balance (sizing_equity was narrowed to exactly that above) so admission is
+    # also checked against the wallet's own capacity, not just the aggregate.
+    _pb_ok, _pb_why = check_live_portfolio_budget(
+        asset, direction, add_risk_usd=_add_risk, add_notional_usd=_add_notional,
+        equity=_get_real_account_equity(),
+        book=open_book,
+        book_equity_usd=(float(sizing_equity) if (books_on and open_book) else None),
+    )
+    if not _pb_ok:
+        log.warning("[%s] BLOCKED %s live open — %s", strat_id, asset, _pb_why)
+        _notify_live_open_blocked(strat_id, asset, _pb_why, "portfolio_budget")
+        return f"BLOCKED {asset} live — {_pb_why}"
+    # GO-LIVE-1: the per-strategy notional ceiling the operator accepted at the
+    # go-live confirmation. One position per asset + asset pinned to the container
+    # means this per-order bound IS the strategy's per-asset exposure bound.
+    from forven.exchange.risk import check_live_strategy_ceiling
+    _cl_ok, _cl_why = check_live_strategy_ceiling(strat_id, _add_notional)
+    if not _cl_ok:
+        log.warning("[%s] BLOCKED %s live open — %s", strat_id, asset, _cl_why)
+        _notify_live_open_blocked(strat_id, asset, _cl_why, "go_live_ceiling")
+        return f"BLOCKED {asset} live — {_cl_why}"
     risk_pct = float(alloc_risk) if alloc_risk else min(float(size_fraction), 1.0)
     signal_data = {
         "kernel_managed": True, "kernel_entry_time": action.entry_time,
         "kernel_size_fraction": round(float(size_fraction), 8), "kernel_equity_at_entry": round(float(sizing_equity), 4),
         "stop_loss": stop_price, "stop_loss_price": stop_price,
         "take_profit": target_price, "take_profit_price": target_price,
+        "kernel_trail_pct": float(kernel_trail_pct) if kernel_trail_pct else None,
         "direction": direction, "source": "scanner.kernel.live",
     }
     # Pass book only when direction books are active so the books-off path keeps the
@@ -6326,6 +6653,9 @@ def manage_positions_via_kernel(strat_id: str, strat: dict, *, account_equity=No
             fee_bps=fee_bps, slippage_bps=slippage_bps, regime_gate=False,
             trade_mode=trade_mode, execution_controls=ec, initial_capital=initial_capital,
             strategy_type=strategy_type,
+            # PAIR form (BTC/USDT), not the bare coin: the intrabar resolver
+            # loads the lake 1m series, which lives under the pair directory.
+            symbol=str(strat.get("symbol") or "").strip() or None, timeframe=timeframe,
         )
     except Exception as exc:
         log.warning("[%s] kernel paper: run_strategy_execution failed (%s); SKIP scan (no legacy)", strat_id, exc)
@@ -6414,6 +6744,36 @@ def manage_positions_via_kernel(strat_id: str, strat: dict, *, account_equity=No
     # applies to live too (the shared reconciler), so live also stops chasing stale signals.
     _fill_now_max_bars = max(int(_scanner_float_setting("paper_kernel_fill_now_max_bars", 1)), 1)
     fresh_cutoff = str(df.index[-min(_fill_now_max_bars, len(df))]) if len(df) else None
+    # LAG-1 / SIGNAL-CLOSE ACTIONS: the kernel's pending_entries/pending_exits are the
+    # orders the LAST closed bar's signal decides for the FORMING bar's open — i.e. NOW.
+    # Without acting on them, an entry is only detected after the fill bar CLOSES (the
+    # kernel can't hold a position whose fill bar isn't in the frame), so every fill lands
+    # a full timeframe bar + scan-lag later than the validated backtest's next-bar-open
+    # fill (measured 10-330bps of adverse entry skew). Act on them THIS scan, but only
+    # when the forming bar really is the fill bar (wall-clock inside it) — on a stale
+    # frame the "next bar" is already history, and acting now would chase a stale signal
+    # (the anti-chase stance); the normal fill-now catch-up handles it when data recovers.
+    _bar_secs = _TIMEFRAME_SECONDS.get(timeframe, 3600)
+    _pending_next_label: str | None = None
+    _pending_live = False
+    if (res.pending_entries or res.pending_exits) and _scanner_bool_setting("kernel_signal_close_actions", True):
+        try:
+            _last_label_ts = float(df.index[-1].timestamp())
+            _now_s = get_now().timestamp()
+            _pending_live = _last_label_ts + _bar_secs <= _now_s < _last_label_ts + 2.0 * _bar_secs
+        except Exception:
+            _pending_live = False
+    if _pending_live:
+        try:
+            # The projected fill-bar label, in the kernel's own entry_time format
+            # (str(pd.Timestamp)) — the match key every subsequent scan REFRESHes on.
+            _pending_next_label = str(df.index[-1] + pd.Timedelta(seconds=_bar_secs))
+            for _pe in res.pending_entries.values():
+                _pe["entry_time"] = _pending_next_label
+        except Exception:
+            _pending_live, _pending_next_label = False, None
+    if not _pending_live:
+        res.pending_entries, res.pending_exits = {}, {}
     # Cross-asset guard: a recorded OPEN whose asset != the strategy's CURRENT asset is a
     # leftover from a symbol/asset flip while a position was open. The reconciler matches
     # only on (direction, entry_time) and would splice the new asset's stop/target onto the
@@ -6489,12 +6849,63 @@ def manage_positions_via_kernel(strat_id: str, strat: dict, *, account_equity=No
     hop_price = last_close
     _has_fresh_open = any(a.kind == "open" and getattr(a, "late_entry", False) for a in actions_plan)
     _has_late_close = any(
-        a.kind == "close" and a.recorded and a.recorded.get("_row")
-        and parse_trade_signal_data(a.recorded["_row"].get("signal_data")).get("late_entry")
+        a.kind == "close" and (
+            getattr(a, "pending", False)
+            or (a.recorded and a.recorded.get("_row")
+                and parse_trade_signal_data(a.recorded["_row"].get("signal_data")).get("late_entry"))
+        )
         for a in actions_plan
     )
     if _has_fresh_open or _has_late_close:
         hop_price = _fill_now_mark(asset, last_close)
+
+    # Materialize PENDING (signal-bar-close) actions at the actual fill mark. A pending
+    # OPEN arrives as the kernel's raw payload (signal-bar ATR + regime); size and stop it
+    # here with the EXACT controls the kernel ran with (res.ec — including the
+    # default_controls fallback resolved inside the pipeline) so the position the kernel
+    # materializes once the fill bar closes has the same geometry. A pending CLOSE gets
+    # its reference exit stamped at the mark (the paper applier fills fresh exits at
+    # current_price; the live applier's real reduce-only order fills at the exchange).
+    if any(getattr(a, "pending", False) for a in actions_plan):
+        from forven.strategies import sizing as _psizing
+        _mark_ok = _coerce_positive_float(hop_price) is not None
+        _plan: list = []
+        for a in actions_plan:
+            if not getattr(a, "pending", False):
+                _plan.append(a)
+                continue
+            if not _mark_ok or (a.kind == "open" and res.ec is None):
+                continue  # no usable mark/controls → drop; the fill-now catch-up covers it next scan
+            if a.kind == "open":
+                pe = a.position or {}
+                _sgn = 1.0 if a.direction == "long" else -1.0
+                _stop_dist = _psizing.entry_stop_dist_pct(
+                    res.ec, entry_price=float(hop_price), atr_value=pe.get("atr_value"),
+                )
+                _stop_price = None
+                if _stop_dist is not None and (res.ec.get("stop_loss_pct") is not None or res.ec.get("sizing_mode") == "atr"):
+                    _stop_price = float(hop_price) * (1.0 - _sgn * _stop_dist)
+                _target_price = None
+                if res.ec.get("take_profit_pct") is not None:
+                    _target_price = float(hop_price) * (1.0 + _sgn * res.ec["take_profit_pct"] / 100.0)
+                a.position = {
+                    "entry_price": float(hop_price), "entry_bar": len(df), "entry_time": a.entry_time,
+                    "regime": pe.get("regime"),
+                    "size_fraction": _psizing.size_fraction(
+                        res.ec, _stop_dist, leverage=max(float(leverage), 1e-9),
+                        initial_capital=initial_capital, closed_gross=res.closed_gross,
+                    ),
+                    "stop_price": _stop_price, "target_price": _target_price,
+                    "trail_pct": (res.ec["trailing_stop_pct"] / 100.0) if res.ec.get("trailing_stop_pct") is not None else None,
+                    "extreme": float(hop_price),
+                }
+            elif a.kind == "close":
+                a.trade = dict(a.trade or {})
+                a.trade.setdefault("exit_price", float(hop_price))
+                if _pending_next_label:
+                    a.trade.setdefault("exit_time", _pending_next_label)
+            _plan.append(a)
+        actions_plan = _plan
 
     out: list[str] = []
     # Resolve cross-asset orphans held out of reconcile above. Paper: flat-close the
@@ -6542,6 +6953,12 @@ def manage_positions_via_kernel(strat_id: str, strat: dict, *, account_equity=No
                         "to avoid sizing off a fabricated fallback",
                         strat_id, asset,
                     )
+                    _notify_live_open_blocked(
+                        strat_id, asset,
+                        "real account equity unavailable — live opens fail closed until the "
+                        "daemon equity snapshot recovers",
+                        "equity_unavailable",
+                    )
                     out.append(f"BLOCKED {asset} — real account equity unavailable for live sizing")
                     continue
                 msg = open_applier(strat_id, strat, a, sizing_equity=sizing_equity, leverage=leverage,
@@ -6552,7 +6969,9 @@ def manage_positions_via_kernel(strat_id: str, strat: dict, *, account_equity=No
                     funding_df=df, timeframe=timeframe,
                 )
             elif a.kind == "refresh":
-                msg = _kernel_refresh_paper_trade(a)
+                # LIVE-TRAIL-1: the live refresh mirrors the kernel's ratcheted trailing
+                # stop onto the resting exchange order; the paper refresh is display-only.
+                msg = _kernel_refresh_live_trade(strat_id, a) if is_live else _kernel_refresh_paper_trade(a)
             elif a.kind == "orphan_close":
                 msg = _kernel_close_orphan(a, last_close=last_close, last_time=last_time)
             else:
@@ -7002,134 +7421,179 @@ def _force_high_activity_signals(signal_rows: list[dict]) -> list[dict]:
     return forced_rows
 
 
+# Bounded worker pool for KERNEL-PAPER execution: each strategy's kernel replay +
+# local (DB-only) fills are independent of every other strategy's (unique-open index
+# is per strategy/asset/direction; each get_db() call opens its own connection;
+# close_trade_record is only-if-open atomic). Live/legacy items are NEVER pooled —
+# they share the exchange account and the portfolio-budget check, which must observe
+# each prior open before admitting the next.
+_EXEC_POOL_WORKERS = 8
+
+
 def _apply_execution_actions(signal_rows: list[dict], diagnostics_out: dict[str, dict] | None = None) -> list[str]:
-    """Apply execution logic for a previously evaluated signal matrix."""
+    """Apply execution logic for a previously evaluated signal matrix.
+
+    Kernel-PAPER strategies execute on a bounded thread pool (their work is local and
+    per-strategy independent); everything else (live kernel, legacy engines) keeps the
+    original sequential semantics on this thread, running CONCURRENTLY with the pool so
+    a fresh entry lands seconds after its scan instead of behind the whole sweep."""
     all_actions: list[str] = []
     account_equity = _get_account_equity()
 
+    paper_kernel_enabled = _paper_kernel_execution_enabled()
+    pooled: list[dict] = []
+    serial: list[dict] = []
     for item in signal_rows:
-        strat_id = str(item.get("strategy_id") or "")
-        if not strat_id:
-            continue
-        try:
-            strat = item["strategy"]
-            signal = item["signal"]
-            actions = None
-            kernel_mode: str | None = None  # 'paper' | 'live'
-            # Parity path: strategies with vectorized signals are managed by the shared
-            # backtest kernel (paper trades == backtest trades; live takes the SAME
-            # decisions with real fills).
-            if _paper_kernel_execution_enabled() and _is_kernel_paper_strategy(strat):
-                kernel_mode = "paper"
-                actions = manage_positions_via_kernel(
-                    strat_id, strat, account_equity=account_equity, execution_type="paper", diagnostics=diagnostics_out,
-                )
-            elif _live_kernel_execution_enabled() and _is_live_kernel_stage(strat):
-                kernel_mode = "live"
-                actions = manage_positions_via_kernel(
-                    strat_id, strat, account_equity=account_equity, execution_type="live", diagnostics=diagnostics_out,
-                )
+        strat = item.get("strategy") or {}
+        if str(item.get("strategy_id") or "") and paper_kernel_enabled and _is_kernel_paper_strategy(strat):
+            pooled.append(item)
+        else:
+            serial.append(item)
 
-            if actions is KERNEL_IMPURE_REFUSED:
-                # KCOPY-3: the purity guard refused this strategy as non-deterministic/
-                # stateful. It is untrustworthy on ANY engine — never downgrade it to the
-                # legacy per-bar engine (paper OR live), regardless of the legacy-fallback
-                # flag. Quarantine: skip. (manage_positions_via_kernel already logged +
-                # set the diagnostic; _signals_from_per_bar emits the one-shot log_activity
-                # so the operator sees it once.)
-                continue
-            if actions is KERNEL_SKIP_SCAN:
-                # Transient kernel failure — skip this strategy this scan. Do NOT fall
-                # through to the legacy engine, whose entry timing / exit model / PnL
-                # convention diverge from the backtest (would silently break parity).
-                continue
-            if actions is None:
-                # actions is None means: kernel not attempted (disabled / not a kernel
-                # stage) OR the strategy is genuinely non-vectorizable.
-                if kernel_mode == "paper":
-                    if not _paper_legacy_fallback_enabled():
-                        # Strict fail-closed (operator opted OUT of the fallback): a
-                        # strategy that cannot run the kernel cannot reproduce its
-                        # backtest, so flag non-parity and don't trade it.
-                        if diagnostics_out is not None:
-                            diagnostics_out[strat_id] = {
-                                "strategy_id": strat_id,
-                                "execution_decision": "non_vectorizable_no_parity",
-                                "reason": "strategy exposes no vectorized generate_signals; "
-                                          "not traded (paper_legacy_fallback_enabled is off)",
-                                "runtime_type": str(strat.get("runtime_type") or strat.get("type") or ""),
-                            }
-                        log.warning(
-                            "[%s] paper: non-vectorizable strategy has no parity engine; skipping "
-                            "(paper_legacy_fallback_enabled is off)",
-                            strat_id,
-                        )
-                        continue
-                    # Fallback ON (default): trade it on the legacy per-bar engine rather
-                    # than letting it silently never trade — but FLAG it loudly so the
-                    # operator knows it is NOT on the backtest-parity path (and must not be
-                    # promoted to live on these numbers).
-                    if diagnostics_out is not None:
-                        diagnostics_out[strat_id] = {
-                            "strategy_id": strat_id,
-                            "execution_decision": "non_vectorizable_legacy",
-                            "reason": "no vectorized generate_signals; traded on the legacy per-bar "
-                                      "engine (NOT kernel/backtest parity)",
-                            "runtime_type": str(strat.get("runtime_type") or strat.get("type") or ""),
-                        }
-                    log.warning(
-                        "[%s] paper: non-vectorizable strategy has no parity engine; trading on the "
-                        "legacy per-bar engine (NOT backtest parity)",
-                        strat_id,
-                    )
-                    try:
-                        log_activity(
-                            "warning", "scanner",
-                            f"NON-PARITY: {strat_id} has no vectorized signals; traded on the legacy "
-                            "per-bar engine (not kernel/backtest parity)",
-                        )
-                    except Exception:
-                        pass
-                if kernel_mode == "live":
-                    # LIVE, non-vectorizable: the kernel can't reproduce it, but a REAL
-                    # open position must stay strategy-managed (entry AND exit) — going
-                    # dark would leave it protected only by resting exchange SL/TP. Fall
-                    # through to the legacy live engine (pre-kernel behaviour) and surface
-                    # the loss of backtest parity to the operator.
-                    if diagnostics_out is not None:
-                        diagnostics_out[strat_id] = {
-                            "strategy_id": strat_id,
-                            "execution_decision": "live_non_vectorizable_legacy",
-                            "reason": "no vectorized generate_signals; managed on the legacy live "
-                                      "engine (NOT kernel/backtest parity)",
-                            "runtime_type": str(strat.get("runtime_type") or strat.get("type") or ""),
-                        }
-                    log.warning(
-                        "[%s] live: non-vectorizable strategy has no parity kernel; managing on the "
-                        "legacy live engine (not backtest parity)",
-                        strat_id,
-                    )
-                    try:
-                        log_activity(
-                            "warning", "scanner",
-                            f"LIVE-NON-PARITY: {strat_id} has no vectorized signals; managed on the "
-                            "legacy live engine (not kernel/backtest parity)",
-                        )
-                    except Exception:
-                        pass
-                actions = manage_positions(
-                    strat_id,
-                    strat,
-                    signal,
-                    account_equity=account_equity,
-                    diagnostics=diagnostics_out,
-                )
-            all_actions.extend(actions)
-        except Exception as e:
-            log.error("[%s] ERROR while applying execution actions: %s", strat_id, e, exc_info=True)
-            continue
+    if pooled:
+        with ThreadPoolExecutor(max_workers=min(_EXEC_POOL_WORKERS, len(pooled))) as pool:
+            futures = [
+                pool.submit(_apply_execution_action_item, item, account_equity, diagnostics_out)
+                for item in pooled
+            ]
+            for item in serial:
+                all_actions.extend(_apply_execution_action_item(item, account_equity, diagnostics_out))
+            for future in futures:
+                try:
+                    all_actions.extend(future.result() or [])
+                except Exception as e:  # the item fn catches; this is a pool-level fault
+                    log.error("Execution pool task failed: %s", e, exc_info=True)
+    else:
+        for item in serial:
+            all_actions.extend(_apply_execution_action_item(item, account_equity, diagnostics_out))
 
     return all_actions
+
+
+def _apply_execution_action_item(
+    item: dict, account_equity: float, diagnostics_out: dict[str, dict] | None
+) -> list[str]:
+    """Execution dispatch for ONE evaluated strategy row. Never raises."""
+    strat_id = str(item.get("strategy_id") or "")
+    if not strat_id:
+        return []
+    try:
+        strat = item["strategy"]
+        signal = item["signal"]
+        actions = None
+        kernel_mode: str | None = None  # 'paper' | 'live'
+        # Parity path: strategies with vectorized signals are managed by the shared
+        # backtest kernel (paper trades == backtest trades; live takes the SAME
+        # decisions with real fills).
+        if _paper_kernel_execution_enabled() and _is_kernel_paper_strategy(strat):
+            kernel_mode = "paper"
+            actions = manage_positions_via_kernel(
+                strat_id, strat, account_equity=account_equity, execution_type="paper", diagnostics=diagnostics_out,
+            )
+        elif _live_kernel_execution_enabled() and _is_live_kernel_stage(strat):
+            kernel_mode = "live"
+            actions = manage_positions_via_kernel(
+                strat_id, strat, account_equity=account_equity, execution_type="live", diagnostics=diagnostics_out,
+            )
+
+        if actions is KERNEL_IMPURE_REFUSED:
+            # KCOPY-3: the purity guard refused this strategy as non-deterministic/
+            # stateful. It is untrustworthy on ANY engine — never downgrade it to the
+            # legacy per-bar engine (paper OR live), regardless of the legacy-fallback
+            # flag. Quarantine: skip. (manage_positions_via_kernel already logged +
+            # set the diagnostic; _signals_from_per_bar emits the one-shot log_activity
+            # so the operator sees it once.)
+            return []
+        if actions is KERNEL_SKIP_SCAN:
+            # Transient kernel failure — skip this strategy this scan. Do NOT fall
+            # through to the legacy engine, whose entry timing / exit model / PnL
+            # convention diverge from the backtest (would silently break parity).
+            return []
+        if actions is None:
+            # actions is None means: kernel not attempted (disabled / not a kernel
+            # stage) OR the strategy is genuinely non-vectorizable.
+            if kernel_mode == "paper":
+                if not _paper_legacy_fallback_enabled():
+                    # Strict fail-closed (operator opted OUT of the fallback): a
+                    # strategy that cannot run the kernel cannot reproduce its
+                    # backtest, so flag non-parity and don't trade it.
+                    if diagnostics_out is not None:
+                        diagnostics_out[strat_id] = {
+                            "strategy_id": strat_id,
+                            "execution_decision": "non_vectorizable_no_parity",
+                            "reason": "strategy exposes no vectorized generate_signals; "
+                                      "not traded (paper_legacy_fallback_enabled is off)",
+                            "runtime_type": str(strat.get("runtime_type") or strat.get("type") or ""),
+                        }
+                    log.warning(
+                        "[%s] paper: non-vectorizable strategy has no parity engine; skipping "
+                        "(paper_legacy_fallback_enabled is off)",
+                        strat_id,
+                    )
+                    return []
+                # Fallback ON (default): trade it on the legacy per-bar engine rather
+                # than letting it silently never trade — but FLAG it loudly so the
+                # operator knows it is NOT on the backtest-parity path (and must not be
+                # promoted to live on these numbers).
+                if diagnostics_out is not None:
+                    diagnostics_out[strat_id] = {
+                        "strategy_id": strat_id,
+                        "execution_decision": "non_vectorizable_legacy",
+                        "reason": "no vectorized generate_signals; traded on the legacy per-bar "
+                                  "engine (NOT kernel/backtest parity)",
+                        "runtime_type": str(strat.get("runtime_type") or strat.get("type") or ""),
+                    }
+                log.warning(
+                    "[%s] paper: non-vectorizable strategy has no parity engine; trading on the "
+                    "legacy per-bar engine (NOT backtest parity)",
+                    strat_id,
+                )
+                try:
+                    log_activity(
+                        "warning", "scanner",
+                        f"NON-PARITY: {strat_id} has no vectorized signals; traded on the legacy "
+                        "per-bar engine (not kernel/backtest parity)",
+                    )
+                except Exception:
+                    pass
+            if kernel_mode == "live":
+                # LIVE, non-vectorizable: the kernel can't reproduce it, but a REAL
+                # open position must stay strategy-managed (entry AND exit) — going
+                # dark would leave it protected only by resting exchange SL/TP. Fall
+                # through to the legacy live engine (pre-kernel behaviour) and surface
+                # the loss of backtest parity to the operator.
+                if diagnostics_out is not None:
+                    diagnostics_out[strat_id] = {
+                        "strategy_id": strat_id,
+                        "execution_decision": "live_non_vectorizable_legacy",
+                        "reason": "no vectorized generate_signals; managed on the legacy live "
+                                  "engine (NOT kernel/backtest parity)",
+                        "runtime_type": str(strat.get("runtime_type") or strat.get("type") or ""),
+                    }
+                log.warning(
+                    "[%s] live: non-vectorizable strategy has no parity kernel; managing on the "
+                    "legacy live engine (not backtest parity)",
+                    strat_id,
+                )
+                try:
+                    log_activity(
+                        "warning", "scanner",
+                        f"LIVE-NON-PARITY: {strat_id} has no vectorized signals; managed on the "
+                        "legacy live engine (not kernel/backtest parity)",
+                    )
+                except Exception:
+                    pass
+            actions = manage_positions(
+                strat_id,
+                strat,
+                signal,
+                account_equity=account_equity,
+                diagnostics=diagnostics_out,
+            )
+        return list(actions or [])
+    except Exception as e:
+        log.error("[%s] ERROR while applying execution actions: %s", strat_id, e, exc_info=True)
+        return []
 
 
 def _scan_trade_summary() -> tuple[int, int, float]:
@@ -7258,6 +7722,19 @@ def run_scan(*, execute_positions: bool = True) -> dict:
         _RUN_SCAN_EXEC_LOCK.release()
 
 
+def _open_position_strategy_ids() -> set[str]:
+    """Strategy ids holding any OPEN trade — the scan's priority exit lane."""
+    try:
+        with get_db() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT COALESCE(strategy_id, strategy) AS sid FROM trades WHERE status = 'OPEN'"
+            ).fetchall()
+        return {str(r["sid"]) for r in rows if r["sid"]}
+    except Exception as exc:
+        log.debug("open-position priority lane: id load failed: %s", exc)
+        return set()
+
+
 def _run_scan_impl(*, execute_positions: bool = True) -> dict:
     """Inner scan body. Call ``run_scan`` (the single-flight wrapper) instead."""
     init_db()
@@ -7359,14 +7836,43 @@ def _run_scan_impl(*, execute_positions: bool = True) -> dict:
     except Exception as e:
         log.debug("Regime detection skipped: %s", e)
 
-    all_signals, signal_rows = _evaluate_signal_matrix(
-        active_strategies,
+    # PRIORITY EXIT LANE: strategies holding OPEN positions are evaluated AND executed
+    # FIRST, so a bar-close exit (pending signal close, kernel stop/TP replay) fills
+    # seconds after the bar closes instead of after the full matrix sweep (E0010's
+    # 8:00-bar exit only executed at 8:04, behind every no-position strategy). Disabled
+    # in high-activity test mode, whose forced signals rewrite the matrix pre-execution.
+    execution_diagnostics: dict[str, dict] = {}
+    priority_actions: list[str] = []
+    priority_signals: dict[str, dict] = {}
+    priority_rows: list[dict] = []
+    priority_ids: set[str] = set()
+    if execution_allowed and not paper_test_high_activity:
+        priority_ids = _open_position_strategy_ids() & set(active_strategies)
+    if priority_ids:
+        log.info("Priority exit lane: %d strategies with open positions", len(priority_ids))
+        priority_signals, priority_rows = _evaluate_signal_matrix(
+            {k: v for k, v in active_strategies.items() if k in priority_ids},
+            registry_active,
+            live_prices_for_scan,
+            asset_regimes,
+            relaxed_trade_filters=relaxed_trade_filters,
+            use_live_price_for_signal_price=use_live_price_for_signal_price,
+        )
+        priority_actions = _apply_execution_actions(priority_rows, execution_diagnostics)
+
+    rest_strategies = active_strategies
+    if priority_ids:
+        rest_strategies = {k: v for k, v in active_strategies.items() if k not in priority_ids}
+    rest_signals, rest_rows = _evaluate_signal_matrix(
+        rest_strategies,
         registry_active,
         live_prices_for_scan,
         asset_regimes,
         relaxed_trade_filters=relaxed_trade_filters,
         use_live_price_for_signal_price=use_live_price_for_signal_price,
     )
+    all_signals = {**priority_signals, **rest_signals}
+    signal_rows = priority_rows + rest_rows
 
     if paper_test_high_activity:
         signal_rows = _force_high_activity_signals(signal_rows)
@@ -7375,6 +7881,7 @@ def _run_scan_impl(*, execute_positions: bool = True) -> dict:
             for item in signal_rows
             if str(item.get("strategy_id") or "").strip()
         }
+        rest_rows = signal_rows  # priority lane is disabled in this mode
 
     scan_ts = get_now().isoformat()
     loader_diagnostics = dict(_LAST_STRATEGY_LOAD_DIAGNOSTICS)
@@ -7385,10 +7892,9 @@ def _run_scan_impl(*, execute_positions: bool = True) -> dict:
         execution_allowed=execution_allowed,
     )
 
-    all_actions: list[str] = []
-    execution_diagnostics: dict[str, dict] = {}
+    all_actions: list[str] = list(priority_actions)
     if execution_allowed:
-        all_actions = _apply_execution_actions(signal_rows, execution_diagnostics)
+        all_actions.extend(_apply_execution_actions(rest_rows, execution_diagnostics))
         scan_diagnostics.update(execution_diagnostics)
     elif requested_execution:
         log.info("Execution scan degraded to signal-only by policy; scanner_execution_enabled=false.")

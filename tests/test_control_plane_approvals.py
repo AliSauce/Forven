@@ -332,20 +332,25 @@ def test_promotion_approval_gate_detects_gauntlet_to_paper(forven_db):
     assert _requires_operator_promotion_approval("gauntlet", "paper") is True
     assert _requires_operator_promotion_approval("paper", "live_graduated") is True
 
-    # Auto mode = fully autonomous: BOTH gauntlet→paper AND paper→live_graduated
-    # self-approve so the pipeline can run unattended end-to-end.
+    # Auto mode: gauntlet→paper self-approves, but paper→live_graduated is
+    # carved out (GO-LIVE-1) — real capital always requires the operator's
+    # typed confirmation + notional ceiling.
     kv_set("forven:pipeline:settings", {"promotion_mode": "auto"})
     assert _requires_operator_promotion_approval("gauntlet", "paper") is False
-    assert _requires_operator_promotion_approval("paper", "live_graduated") is False
+    assert _requires_operator_promotion_approval("paper", "live_graduated") is True
 
     # Backwards/lateral transitions and quick_screen→gauntlet are not gated.
     assert _requires_operator_promotion_approval("paper", "gauntlet") is False
     assert _requires_operator_promotion_approval("quick_screen", "gauntlet") is False
     assert _requires_operator_promotion_approval("gauntlet", "archived") is False
 
-    # With auto_approve enabled, gate is disabled entirely.
+    # auto_approve grants gauntlet→paper but never go-live…
     kv_set("forven:settings", {"auto_approve_promotions": "true"})
     assert _requires_operator_promotion_approval("gauntlet", "paper") is False
+    assert _requires_operator_promotion_approval("paper", "live_graduated") is True
+
+    # …unless the deliberately-dangerous escape hatch is flipped too.
+    kv_set("forven:settings", {"auto_approve_promotions": "true", "allow_auto_live_promotion": True})
     assert _requires_operator_promotion_approval("paper", "live_graduated") is False
 
 

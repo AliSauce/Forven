@@ -112,6 +112,34 @@ def test_csv_parsing_funding():
     assert df["funding_rate"].iloc[0] == pytest.approx(0.0001)
 
 
+def test_csv_parsing_ohlcv_headerless_legacy():
+    # Archives BEFORE ~2022 have NO header row (same fixed column order).
+    # The header-assuming parser silently skipped every pre-2022 month
+    # ("Usecols do not match columns"), truncating deep history at 2022-01-01.
+    csv = (
+        "1593561600000,9138.08,9160.0,9100.0,9142.19,100.5,"
+        "1593565199999,915000.0,1000,50.0,457000.0,0\n"
+        "1593565200000,9142.19,9180.0,9120.0,9155.0,90.2,"
+        "1593568799999,825000.0,900,45.0,410000.0,0\n"
+    )
+    df = BV._parse_ohlcv_csv(_make_zip(csv))
+    assert df is not None
+    assert len(df) == 2
+    assert list(df.columns) == ["timestamp", "open", "high", "low", "close", "volume"]
+    assert df["open"].iloc[0] == pytest.approx(9138.08)
+    assert df["timestamp"].iloc[0].year == 2020
+
+
+def test_csv_parsing_funding_headerless_legacy():
+    csv = "1593561600000,8,0.0001\n1593590400000,8,0.00012\n"
+    df = BV._parse_funding_csv(_make_zip(csv))
+    assert df is not None
+    assert len(df) == 2
+    assert list(df.columns) == ["timestamp", "funding_rate"]
+    assert df["funding_rate"].iloc[0] == pytest.approx(0.0001)
+    assert df["timestamp"].iloc[0].year == 2020
+
+
 def test_csv_parsing_oi_from_metrics():
     # Binance metrics archives include create_time and sum_open_interest columns.
     csv = "create_time,sum_open_interest\n2021-01-01T00:00:00Z,12345.678\n"

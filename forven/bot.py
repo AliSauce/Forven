@@ -2,7 +2,7 @@
 
 This is the equivalent of OpenClaw's gateway. When Judder sends a message:
 1. Bot receives it
-2. Builds brain context (workspace + SQLite + ChromaDB)
+2. Builds brain context (workspace + SQLite)
 3. Calls AI with the message
 4. Posts the response back to the same channel
 5. Logs the interaction
@@ -71,45 +71,17 @@ def _bot_owns_runtime_loops() -> bool:
         "on",
     }
 
-# Defaults — overridden by config.json "discord_channels", "discord_owner_id"
-_DEFAULT_CHANNELS = {
-    "general": "1472929176213393505",
-    "ops": "1473714175300603924",
-    "approvals": "1473006244171354123",
-    "risk": "1473006244171354123",
-    "morning-brief": "1473323213143539868",
-    "evening-brief": "1473323214083199093",
-    "evening-summary": "1473323214083199093",
-    "chat": "1473412370528338003",
-    "heartbeat": "1473654720735481947",
-    "development": "1473714175300603924",
-    "strategies": "1473006243147808829",
-    "alerts": "1473006244171354123",
-    "research": "1473006245211275304",
-    "backtesting": "1473036255716577420",
-    "paper-trades": "1473036257625112808",
-    "market-data": "1473036258962968842",
-    "autopilot": "1473036260103815351",
-    "news": "1473036261345202340",
-    "full-stack-engineer": "1474937376928301169",
-    # Backward-compatible aliases that collapse old room-specific names onto the
-    # reduced notification/channel model.
-    "quant-researcher": "1473006245211275304",
-    "back-test-engineer": "1473036255716577420",
-    "risk-manager": "1473006244171354123",
-    "sentiment": "1473036261345202340",
-    "full-stack-engineers": "1473714175300603924",
-}
+# Channel alias map lives in forven.discord_channels (shared with the API);
+# config.json "discord_channels" / "discord_owner_id" override the defaults.
+from forven.discord_channels import AVAILABLE_CHANNELS_KV_KEY, load_channel_map
 
 
 def _load_discord_config() -> tuple[dict, dict, int]:
     """Load channels, reverse lookup, and owner ID from config (or defaults)."""
-    cfg = load_config()
-    channel_overrides = cfg.get("discord_channels", {}) or {}
-    channels = {**_DEFAULT_CHANNELS, **channel_overrides}
+    channels = load_channel_map()
     channel_names = {v: k for k, v in channels.items()}
-    
-    owner_val = cfg.get("discord_owner_id")
+
+    owner_val = load_config().get("discord_owner_id")
     owner_id = int(owner_val) if owner_val else 0
     return channels, channel_names, owner_id
 
@@ -506,6 +478,7 @@ def get_bot_token() -> str:
 def _build_default_agents() -> list[dict]:
     """Build the DEFAULT_AGENTS seed list, using dynamic settings from kv."""
     from forven.db import kv_get
+    from forven.roster import LIVE_AGENTS
 
     settings = kv_get("forven:settings", {})
     pipeline = kv_get("forven:pipeline_thresholds", {})
@@ -529,7 +502,7 @@ def _build_default_agents() -> list[dict]:
     return [
         {
             "agent_id": "quant-researcher",
-            "name": "Quant Researcher",
+            "name": LIVE_AGENTS["quant-researcher"]["name"],
             "role": "Research market structure, benchmark external ideas, identify missing data or feature gaps, and own data integrity, feature reliability, and dataset drift/decay checks.",
             "model": "openai",
             "model_id": get_default_model_for_provider("openai"),
@@ -537,12 +510,11 @@ def _build_default_agents() -> list[dict]:
             "instructions": (
                 "You are the Quant Researcher for Forven. Your focus is benchmarking, market structure research, data-gap discovery, and data integrity.\n"
                 "1. Read LESSONS.md and archived failure patterns before proposing anything.\n"
-                "2. Search ChromaDB (backtest_results, research_hypotheses, post-mortems) for useful precedents and missing coverage.\n"
-                "3. Analyze the current market regime, external sources, and exploitable edges.\n"
-                "4. Surface benchmark candidates, market observations, and data gaps that strategy-developer agents can use.\n"
-                "5. For any assigned post_mortem task, produce an explicit failure diagnosis with metric evidence, breached thresholds, and corrective actions.\n"
-                "6. Store each failure post-mortem in ChromaDB trade_post_mortems and summarize guardrails as agent narratives.\n"
-                "7. Own data integrity and feature reliability: validate feature definitions, audit dataset drift, feature decay, gaps, and outliers before strategy changes ship; treat data quality as a first-class risk factor.\n"
+                "2. Analyze the current market regime, external sources, and exploitable edges.\n"
+                "3. Surface benchmark candidates, market observations, and data gaps that strategy-developer agents can use.\n"
+                "4. For any assigned post_mortem task, produce an explicit failure diagnosis with metric evidence, breached thresholds, and corrective actions.\n"
+                "5. Record each failure post-mortem in the workspace (post_mortems/) and summarize guardrails in LESSONS.md.\n"
+                "6. Own data integrity and feature reliability: validate feature definitions, audit dataset drift, feature decay, gaps, and outliers before strategy changes ship; treat data quality as a first-class risk factor.\n"
                 "TRADE FREQUENCY: Every strategy must generate at least 30 trades/year. 4h charts: ~1 entry per 12 days. 1h charts: ~1 entry per 3 days. Fewer than 10/year fails WFA.\n"
                 "FILTER DISCIPLINE: Use at most 2 entry filters simultaneously (primary signal + one confirmation). Never stack 3+ conditions — it collapses trade frequency.\n"
                 "ADX LIMITS: adx_min must not exceed 30 on 1h/4h. If using adx_min AND adx_max, they must differ by ≥15 points.\n"
@@ -552,7 +524,7 @@ def _build_default_agents() -> list[dict]:
         },
         {
             "agent_id": "simulation-agent",
-            "name": "Simulation Agent",
+            "name": LIVE_AGENTS["simulation-agent"]["name"],
             "role": "Stress-test strategy hypotheses with Walk-Forward Analysis, Monte Carlo simulation, and parameter optimization. Validate that strategies are robust, not curve-fitted.",
             "model": "openai",
             "model_id": get_default_model_for_provider("openai"),
@@ -571,7 +543,7 @@ def _build_default_agents() -> list[dict]:
         },
         {
             "agent_id": "risk-manager",
-            "name": "Risk Manager",
+            "name": LIVE_AGENTS["risk-manager"]["name"],
             "role": f"Monitor portfolio risk, review position sizing, evaluate strategy health, enforce capital preservation rules. {max_dd}% drawdown kill, ${daily_loss} daily loss, {max_trade}% per trade.",
             "model": "openai",
             "model_id": get_default_model_for_provider("openai"),
@@ -595,7 +567,7 @@ def _build_default_agents() -> list[dict]:
         # closes. The row is deleted via `deprecated_agents` in seed_default_agents.
         {
             "agent_id": "strategy-developer",
-            "name": "Strategy Developer",
+            "name": LIVE_AGENTS["strategy-developer"]["name"],
             "role": "Generate market hypotheses and translate them directly into testable Strategy Container logic.",
             "model": "openai",
             "model_id": get_default_model_for_provider("openai"),
@@ -613,7 +585,7 @@ def _build_default_agents() -> list[dict]:
         },
         {
             "agent_id": "full-stack-engineer",
-            "name": "Full-Stack Engineer",
+            "name": LIVE_AGENTS["full-stack-engineer"]["name"],
             "role": "Operator-triggered diagnosis and triage for bug reports, approval troubleshooting, and notification-repair requests. The autonomous code-execution path is retired: this agent investigates and reports; it does not modify code.",
             "model": "openai",
             "model_id": get_default_model_for_provider("openai"),
@@ -629,7 +601,7 @@ def _build_default_agents() -> list[dict]:
         },
         {
             "agent_id": "brain",
-            "name": "Brain",
+            "name": LIVE_AGENTS["brain"]["name"],
             "role": "Central orchestrator and decision layer for Forven. Delegates work and arbitrates between agents.",
             "model": "openai",
             "model_id": get_default_model_for_provider("openai"),
@@ -668,12 +640,8 @@ def seed_default_agents() -> dict:
         existing = {r["id"] for r in conn.execute("SELECT id FROM agents").fetchall()}
 
     removed_deprecated: list[str] = []
-    deprecated_agents = {
-        "portfolio-optimizer", "sentiment-analyst", "data-scientist",
-        # Retired 2026-06-30: execution is owned by the scanner kernel + the
-        # operator's manual controls; no LLM order path remains.
-        "execution-trader",
-    }
+    from forven.roster import DEPRECATED_AGENT_IDS as deprecated_agents
+
     for deprecated_id in sorted(deprecated_agents & existing):
         try:
             delete_agent(deprecated_id)
@@ -787,6 +755,7 @@ class ForvenBot(commands.Bot):
         from forven.db import init_db
 
         init_db()
+        self._publish_available_channels()
         if not _bot_owns_runtime_loops():
             try:
                 seed_default_agents()
@@ -822,6 +791,39 @@ class ForvenBot(commands.Bot):
 
         # Bootstrap: seed agents, jobs, workspace, kick brain
         await self._bootstrap()
+
+    def _publish_available_channels(self) -> None:
+        """Publish the text channels this bot can post to (id + name) so the
+        API can offer a live channel picker (routines page) without importing
+        discord. Works on any user's server — no hardcoded channel ids.
+        """
+        if self.agent_id:
+            return
+        try:
+            channels = [
+                {"id": str(ch.id), "name": ch.name}
+                for guild in self.guilds
+                for ch in guild.text_channels
+                if ch.permissions_for(guild.me).send_messages
+            ]
+            kv_set_best_effort(
+                AVAILABLE_CHANNELS_KV_KEY,
+                {
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                    "channels": channels,
+                },
+            )
+        except Exception:
+            log.debug("Failed to publish available Discord channels", exc_info=True)
+
+    async def on_guild_channel_create(self, channel) -> None:
+        self._publish_available_channels()
+
+    async def on_guild_channel_delete(self, channel) -> None:
+        self._publish_available_channels()
+
+    async def on_guild_channel_update(self, before, after) -> None:
+        self._publish_available_channels()
 
     def _has_inflight_task_work(self) -> bool:
         return bool(self._active_agent_task_ids or self._active_brain_task_ids)
@@ -1353,7 +1355,6 @@ class ForvenBot(commands.Bot):
         """Generate an AI response for an agent-specific Discord bot."""
         from forven.ai import call_ai
         from forven.context import build_agent_context
-        from forven.vectordb import store_narrative
         from forven.workspace import append_workspace, read_workspace
 
         agent = self._agent_data
@@ -1436,26 +1437,12 @@ class ForvenBot(commands.Bot):
         except Exception as e:
             log.warning("Agent memory append failed (%s): %s", agent_id, e)
 
-        try:
-            summary = f"[Discord agent:{agent_id} #{channel_name}] Judder: {content[:200]} | {agent_name}: {response[:300]}"
-            store_narrative(
-                summary,
-                metadata={
-                    "type": "conversation",
-                    "channel": channel_name,
-                    "source": agent_id,
-                    "agent_id": agent_id,
-                },
-            )
-        except Exception:
-            pass
-
         return _sanitize_response(response)
 
     async def _generate_response(self, content: str, channel_id: str, channel_name: str, is_dm: bool) -> str:
         """Generate an AI response to a user message."""
         from forven.ai import call_ai
-        from forven.context import build_chat_context, store_conversation
+        from forven.context import build_chat_context
 
         # Build lightweight chat context (no operational noise)
         context = build_chat_context()
@@ -1513,12 +1500,6 @@ class ForvenBot(commands.Bot):
             )
         except Exception as e:
             log.warning("Workspace memory append failed: %s", e)
-
-        # AUTO-STORE: Save conversation to narrative memory for long-term recall
-        try:
-            await store_conversation(channel_name, content, response)
-        except Exception as e:
-            log.warning("Conversation store failed: %s", e)
 
         # Strip hallucinated tool calls before returning to Discord
         return _sanitize_response(response)
@@ -1941,7 +1922,7 @@ class ForvenBot(commands.Bot):
                     # Full-featured tools for chat — can look things up AND take actions
                     _chat_tool_names = {
                         # Read / search
-                        "read_file", "search_memory", "search_chroma",
+                        "read_file",
                         # Action tools
                         "run_backtest", "run_shell", "write_file",
                         # Brain tools
@@ -1955,8 +1936,6 @@ class ForvenBot(commands.Bot):
                             "\n\n---\n\n# TOOLS\n"
                             "You have tools to look things up AND take actions when asked:\n"
                             "- **read_file**: Read workspace files\n"
-                            "- **search_memory**: Search long-term memory\n"
-                            "- **search_chroma**: Search past experiments and post-mortems\n"
                             "- **run_backtest**: Run a backtest for a specific Strategy Container\n"
                             "- **run_shell**: Execute shell commands\n"
                             "- **write_file**: Create or update files\n"
@@ -2005,11 +1984,7 @@ class ForvenBot(commands.Bot):
                         "- **run_shell**: Execute commands (backtests, data checks)\n"
                         "- **read_file**: Read workspace files (LESSONS.md, evolution_journal.md, memory/)\n"
                         "- **write_file**: Write/append to workspace files (update lessons, log findings, evolve strategies)\n"
-                        "- **search_memory**: Search narrative memory for long-term context\n"
-                        "- **store_memory**: Store insights in narrative memory\n"
-                        "- **run_backtest**: Run a strategy backtest and get fitness score\n"
-                        "- **search_chroma**: Search ChromaDB for past experiments, post-mortems, and execution slippage\n"
-                        "- **store_chroma**: Store data in ChromaDB vector store\n\n"
+                        "- **run_backtest**: Run a strategy backtest and get fitness score\n\n"
                         "## Backtesting (Forven)\n"
                         "- **forven_list_datasets**: List available backtesting datasets\n"
                         "- **forven_create_strategy**: Create a strategy on Forven Backtesting\n"
@@ -2019,7 +1994,7 @@ class ForvenBot(commands.Bot):
                         "- **forven_get_results**: Get detailed backtest results\n\n"
                         "IMPORTANT: When you review agent output, ALWAYS assign follow-up tasks.\n"
                         "When you discover a lesson, UPDATE LESSONS.md. When you evolve a strategy, UPDATE evolution_journal.md.\n"
-                        "When you find something worth remembering long-term, STORE it in narrative memory.\n"
+                        "When you find something worth remembering long-term, write it to a workspace memory file.\n"
                         "You are the Brain — you don't just observe, you ACT. Assign work NOW."
                     )
 
@@ -2086,16 +2061,6 @@ class ForvenBot(commands.Bot):
                             "UPDATE tasks SET status='done', completed_at=?, result=? WHERE id=?",
                             (datetime.now(timezone.utc).isoformat(), json.dumps({"response": response[:2000]}), task["id"]),
                         )
-
-                    # Store brain cycle narrative in ChromaDB
-                    try:
-                        from forven.vectordb import store_narrative
-                        store_narrative(
-                            f"[Brain] {response[:500]}",
-                            metadata={"type": "brain_cycle", "source": "forven"},
-                        )
-                    except Exception:
-                        pass
 
                 # Post response to Discord if channel specified
                 delivery_channel = payload.get("channel")
@@ -2546,7 +2511,6 @@ def run_discord_audit(send_probe: bool = False) -> dict:
 
 async def start_bot():
     """Start the Discord bot (blocking)."""
-    os.environ.setdefault("FORVEN_DISABLE_CHROMA_IN_PROCESS", "1")
     if not _acquire_bot_lock():
         status = get_bot_lock_status()
         active_pid = status.get("active_pid")
@@ -2555,7 +2519,6 @@ async def start_bot():
         return
 
     try:
-        log.info("Bot process forcing subprocess-only/disabled ChromaDB access for stability on this host")
         # Symmetry with run_bot(): arm fail-closed spend enforcement before any
         # owns-runtime loop can start.
         from forven.model_selection import ensure_enforcement_armed
@@ -2598,7 +2561,6 @@ def run_bot():
         level=_logging.INFO,
         format="%(asctime)s [%(name)s] %(levelname)s %(message)s",
     )
-    os.environ.setdefault("FORVEN_DISABLE_CHROMA_IN_PROCESS", "1")
     if not _acquire_bot_lock():
         status = get_bot_lock_status()
         active_pid = status.get("active_pid")
@@ -2619,7 +2581,6 @@ def run_bot():
         return
 
     try:
-        log.info("Bot process forcing subprocess-only/disabled ChromaDB access for stability on this host")
         log.info("Starting Forven gateway (bot + scheduler + task processor)")
         # Arm fail-closed spend enforcement BEFORE any task/scheduler loop starts,
         # so a bot-owns-runtime process never spends on an unconnected/unselected

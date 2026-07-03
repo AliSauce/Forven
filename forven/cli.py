@@ -1036,12 +1036,12 @@ def evolution_status():
 
 @evolution.command("ideate")
 def evolution_ideate():
-    """Trigger ideation step (delegate research to strategy-developer swarm)."""
-    from forven.evolution import run_ideation_step
+    """Trigger an ideation pass (dispatch crucible work to strategy-developer)."""
+    from forven.crucible_planner import run_crucible_planner_cycle
     from forven.db import init_db
     init_db()
-    run_ideation_step()
-    click.echo("Ideation delegated to strategy-developer swarm")
+    run_crucible_planner_cycle(limit=3)
+    click.echo("Ideation delegated to the crucible planner")
 
 
 @evolution.command("test")

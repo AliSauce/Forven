@@ -280,6 +280,9 @@ def _normalize_dataset_rows(raw_rows: list[dict]) -> list[dict[str, object]]:
                 "row_count": row_count,
                 "asset_class": asset_class,
                 "market_type": market_type,
+                # Venue identity from the forven_market parquet stamp
+                # (perp/spot/unknown; "unstamped" = legacy pre-stamping file).
+                "market": str(raw.get("market") or "unstamped").strip().lower(),
             }
         )
     rows.sort(
@@ -625,6 +628,17 @@ def post_data_ingestion_submit(
 
 
 def get_data_ingestion_run(run_id: str):
+    # Live runs (and remote-mode fabricated runs) are keyed in the in-memory
+    # run store — a direct lookup, not the previous linear scan of up to 10k
+    # reconstructed rows on every 1.5s frontend poll.
+    from forven.data import get_ingestion_run
+
+    run = get_ingestion_run(str(run_id))
+    if run is not None:
+        run["symbol"] = _to_ui_symbol(run.get("symbol"))
+        return run
+    # Synthetic catalog ids ("dataset-N-...") and remote-listed runs still go
+    # through the composite listing.
     rows = get_data_ingestion_runs(limit=10_000, offset=0)
     match = next((row for row in rows if str(row.get("id")) == str(run_id)), None)
     if match is None:
@@ -975,6 +989,126 @@ def get_quality_reports(limit: int = 100) -> list[dict]:
         return reports
 
 
+def get_quality_report(symbol: str, timeframe: str) -> dict:
+    """Single-series quality report in leaderboard row shape.
+
+    The frontend has always called /data/quality/reports/{symbol}/{timeframe};
+    the route never existed server-side, so every call 404'd into a client-side
+    recompute fallback. Serve it from the cached leaderboard when present,
+    else compute the one series directly.
+    """
+    from forven.data import compute_data_quality, symbol_to_fs
+
+    fs_symbol = symbol_to_fs(symbol)
+    ui_symbol = _to_ui_symbol(fs_symbol)
+    for cached_at, reports in list(_quality_reports_cache.values()):
+        if (time.time() - cached_at) >= _QUALITY_REPORTS_TTL_SECONDS:
+            continue
+        for report in reports:
+            if report.get("symbol") == ui_symbol and report.get("timeframe") == timeframe:
+                return report
+    try:
+        q = compute_data_quality(fs_symbol, timeframe)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return _quality_report_from({"symbol": fs_symbol, "timeframe": timeframe}, q, 0)
+
+
+def get_dataset_versions(symbol: str | None = None, timeframe: str | None = None, limit: int = 50) -> list[dict]:
+    """Dataset version history — REAL, backed by the point-in-time revision log.
+
+    The frontend has always called /data/versions; no server route existed, so
+    it 404'd into a client-side reconstruction with checksum=None. Rows:
+    - one "current" row per series (live snapshot; checksum included only for
+      a single-series query — hashing every file on the unfiltered call is a
+      full-lake read);
+    - one row per RESTATEMENT event (bars superseded at the same observed_at),
+      from the append-only revision lake.
+    """
+    from forven.data import compute_checksum, scan_datasets, symbol_to_fs
+    from forven.dataeng.revisions import read_revisions, revisions_root
+
+    fs_filter = symbol_to_fs(symbol) if symbol else None
+    single_series = bool(fs_filter and timeframe)
+    rows: list[dict] = []
+
+    for ds in scan_datasets():
+        ds_symbol = str(ds.get("symbol") or "")
+        ds_tf = str(ds.get("timeframe") or "")
+        if fs_filter and ds_symbol != fs_filter:
+            continue
+        if timeframe and ds_tf != timeframe:
+            continue
+        rows.append(
+            {
+                "id": f"current-{ds_symbol}-{ds_tf}",
+                "symbol": _to_ui_symbol(ds_symbol),
+                "timeframe": ds_tf,
+                "source": ds.get("source") or "local",
+                "row_count": int(ds.get("row_count") or 0),
+                "start_ts": ds.get("start_ts"),
+                "end_ts": ds.get("end_ts"),
+                "checksum": compute_checksum(ds_symbol, ds_tf) if single_series else None,
+                "ingestion_run_id": None,
+                "created_at": ds.get("end_ts") or ds.get("start_ts") or _now(),
+            }
+        )
+
+    # Restatement events: enumerate only series that HAVE a revision log.
+    root = revisions_root()
+    if root.exists():
+        for sym_dir in sorted(root.iterdir()):
+            if not sym_dir.is_dir():
+                continue
+            if fs_filter and sym_dir.name != fs_filter:
+                continue
+            for rev_file in sorted(sym_dir.glob("*.parquet")):
+                rev_tf = rev_file.stem
+                if timeframe and rev_tf != timeframe:
+                    continue
+                try:
+                    revisions = read_revisions(sym_dir.name, rev_tf)
+                except Exception:
+                    continue
+                if revisions is None or revisions.empty:
+                    continue
+                grouped = revisions.groupby("observed_at")
+                for observed_at, group in grouped:
+                    ts = pd.to_datetime(group["timestamp"], utc=True, errors="coerce").dropna()
+                    rows.append(
+                        {
+                            "id": f"rev-{sym_dir.name}-{rev_tf}-{observed_at}",
+                            "symbol": _to_ui_symbol(sym_dir.name),
+                            "timeframe": rev_tf,
+                            "source": "restatement",
+                            "row_count": int(len(group)),
+                            "start_ts": ts.min().isoformat() if len(ts) else None,
+                            "end_ts": ts.max().isoformat() if len(ts) else None,
+                            "checksum": None,
+                            "ingestion_run_id": None,
+                            "created_at": str(observed_at),
+                        }
+                    )
+
+    rows.sort(key=lambda row: core._to_datetime_sort_key(row.get("created_at")), reverse=True)
+    return rows[: max(1, int(limit or 50))]
+
+
+def get_quality_gate(symbol: str, timeframe: str, window_days: int | None = None) -> dict:
+    """The exact fitness verdict the gauntlet's data gate applies before
+    scoring a strategy on this series (completeness, interior gaps, freshness,
+    listing window). Surfaces WHY a series is blocked in the UI instead of the
+    operator discovering it via a stalled gauntlet step."""
+    import pandas as pd
+
+    from forven.dataeng.quality_gate import check_series_quality
+
+    window_start = None
+    if window_days and int(window_days) > 0:
+        window_start = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=int(window_days))
+    return check_series_quality(symbol, timeframe, window_start=window_start).as_dict()
+
+
 def get_data_health():
     """Return merged DB/parquet health + per-stream freshness snapshot.
 
@@ -1249,6 +1383,19 @@ def execute_data_engine_catchup(
         ensure_universe_coverage()
     except Exception as exc:  # noqa: BLE001
         log.warning("Data Engine catch-up: universe coverage ensure skipped: %s", exc)
+
+    # Keep the symbol registry current (new listings, delistings) on the same
+    # cadence — one markets+tickers call per 30-min run. Best-effort, and
+    # gated on the same network switch as auto-backfill so the test suite
+    # never hits the venue (load_markets + fetch_tickers hang/slow tests).
+    try:
+        from forven.dataeng.coverage import _autobackfill_enabled
+        from forven.dataeng.universe import refresh_symbol_registry
+
+        if _autobackfill_enabled():
+            refresh_symbol_registry()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Data Engine catch-up: symbol registry refresh skipped: %s", exc)
 
     from forven.dataeng.catalog import Catalog
     from forven.dataeng.catchup import CatchUpPlanner
@@ -1643,97 +1790,95 @@ _STREAM_CADENCES = {
 }
 
 
-def _stream_health_from_df(df, cadence_secs: int) -> dict:
-    """Build a stream health dict from a loaded DataFrame (or None)."""
+
+
+def _stream_health_from_footer(row_count: int, last_ms: int | None, cadence_secs: int) -> dict:
+    """Stream health from footer stats only — NEVER a full column/series load.
+    The previous implementation loaded the ENTIRE series into pandas just to
+    read the last timestamp; on the post-backfill 1m series (millions of rows)
+    that made the Datasets tab take seconds per click on the single worker."""
+    if not row_count or last_ms is None:
+        return {"status": "no_data", "row_count": 0, "last_updated": None, "data_age_hours": None}
     now = datetime.now(timezone.utc)
-    if df is None or df.empty:
-        return {
-            "status": "no_data",
-            "row_count": 0,
-            "last_updated": None,
-            "data_age_hours": None,
-        }
-    row_count = len(df)
+    last_ts = pd.Timestamp(last_ms, unit="ms", tz="UTC")
+    age_secs = (now - last_ts).total_seconds()
+    return {
+        "status": "live" if age_secs <= cadence_secs * 2 else "accumulating",
+        "row_count": int(row_count),
+        "last_updated": last_ts.isoformat(),
+        "data_age_hours": round(age_secs / 3600, 2),
+    }
+
+
+def _footer_stream_stats(path) -> tuple[int, int | None]:
+    """(row_count, last_ms) for a stream parquet from its footer; (0, None)
+    when absent/unreadable."""
+    from forven.data import _footer_bounds
+
     try:
-        last_ts = pd.to_datetime(df["timestamp"].iloc[-1], utc=True)
-        age_secs = (now - last_ts).total_seconds()
-        age_hours = round(age_secs / 3600, 2)
-        if age_secs <= cadence_secs * 2:
-            status = "live"
-        else:
-            status = "accumulating"
-        return {
-            "status": status,
-            "row_count": row_count,
-            "last_updated": last_ts.isoformat(),
-            "data_age_hours": age_hours,
-        }
+        if not path.exists():
+            return 0, None
+        rows, _, last_ms = _footer_bounds(path)
+        return rows, last_ms
     except Exception:
-        return {
-            "status": "accumulating",
-            "row_count": row_count,
-            "last_updated": None,
-            "data_age_hours": None,
-        }
+        return 0, None
 
 
 def get_stream_health(symbol: str) -> dict:
     """Return health for OHLCV, Funding, and OI streams for a symbol."""
     try:
-        from forven.data import load_parquet, symbol_to_fs
-        from forven.data_manager import (
-            FUNDING_DIR, OI_DIR, _load_stream_parquet,
-            data_manager,
-        )
+        from forven.data import _series_row_count, dataset_last_timestamp_ms, symbol_to_fs
+        from forven.data_manager import FUNDING_DIR, OI_DIR, data_manager
         fs_symbol = symbol_to_fs(symbol)
 
-        # OHLCV — use most recently active timeframe
+        # OHLCV — use most recently active timeframe (footer reads only)
         timeframes = data_manager.get_active_timeframes(symbol)
         tf = next(iter(timeframes)) if timeframes else "1h"
-        ohlcv_df = load_parquet(symbol, tf)
-        ohlcv_health = _stream_health_from_df(ohlcv_df, _STREAM_CADENCES["ohlcv"])
+        ohlcv_health = _stream_health_from_footer(
+            _series_row_count(symbol, tf),
+            dataset_last_timestamp_ms(symbol, tf),
+            _STREAM_CADENCES["ohlcv"],
+        )
         ohlcv_health["timeframe"] = tf
 
         # Funding
-        funding_path = FUNDING_DIR / fs_symbol / "history.parquet"
-        funding_df = _load_stream_parquet(funding_path)
-        funding_health = _stream_health_from_df(funding_df, _STREAM_CADENCES["funding"])
+        funding_rows, funding_last = _footer_stream_stats(FUNDING_DIR / fs_symbol / "history.parquet")
+        funding_health = _stream_health_from_footer(funding_rows, funding_last, _STREAM_CADENCES["funding"])
 
-        # OI
-        oi_df = None
+        # OI — first timeframe with data
+        oi_rows, oi_last = 0, None
         for t in list(timeframes) + ["1h", "4h"]:
-            oi_path = OI_DIR / fs_symbol / f"{t}.parquet"
-            candidate = _load_stream_parquet(oi_path)
-            if candidate is not None:
-                oi_df = candidate
+            oi_rows, oi_last = _footer_stream_stats(OI_DIR / fs_symbol / f"{t}.parquet")
+            if oi_rows:
                 break
-        oi_health = _stream_health_from_df(oi_df, _STREAM_CADENCES["oi"])
+        oi_health = _stream_health_from_footer(oi_rows, oi_last, _STREAM_CADENCES["oi"])
 
-        # Source reason
-        active_symbols = data_manager.get_active_symbols()
+        # Source reason — two scalar per-symbol counts. The previous code first
+        # computed the WHOLE active set (an ~1s unindexed backtest_results scan)
+        # just to decide whether to run these counts; the counts themselves
+        # already answer the question.
         reason = None
-        if fs_symbol in active_symbols:
-            try:
-                from forven.db import get_db
-                from datetime import timedelta
-                cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
-                with get_db() as conn:
-                    strat_count = conn.execute(
-                        "SELECT COUNT(*) FROM strategies WHERE symbol = ? AND stage IN ('paper', 'paper_trading', 'live_graduated', 'deployed', 'gauntlet', 'active')",
-                        (fs_symbol,),
-                    ).fetchone()[0]
-                    bt_count = conn.execute(
-                        "SELECT COUNT(DISTINCT id) FROM backtest_results WHERE symbol = ? AND created_at >= ? AND deleted_at IS NULL",
-                        (fs_symbol, cutoff),
-                    ).fetchone()[0]
-                parts = []
-                if strat_count:
-                    parts.append(f"{strat_count} active {'strategy' if strat_count == 1 else 'strategies'}")
-                if bt_count:
-                    parts.append(f"{bt_count} recent {'backtest' if bt_count == 1 else 'backtests'}")
-                reason = ", ".join(parts) if parts else "in active set"
-            except Exception:
-                reason = "in active set"
+        try:
+            from forven.db import get_db
+            from datetime import timedelta
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+            with get_db() as conn:
+                strat_count = conn.execute(
+                    "SELECT COUNT(*) FROM strategies WHERE symbol = ? AND stage IN ('paper', 'paper_trading', 'live_graduated', 'deployed', 'gauntlet', 'active')",
+                    (fs_symbol,),
+                ).fetchone()[0]
+                bt_count = conn.execute(
+                    "SELECT COUNT(DISTINCT id) FROM backtest_results WHERE symbol = ? AND created_at >= ? AND deleted_at IS NULL",
+                    (fs_symbol, cutoff),
+                ).fetchone()[0]
+            parts = []
+            if strat_count:
+                parts.append(f"{strat_count} active {'strategy' if strat_count == 1 else 'strategies'}")
+            if bt_count:
+                parts.append(f"{bt_count} recent {'backtest' if bt_count == 1 else 'backtests'}")
+            reason = ", ".join(parts) if parts else None
+        except Exception:
+            reason = None
 
         return {
             "symbol": symbol,
@@ -1845,82 +1990,385 @@ def post_collect_stream(symbol: str, stream: str) -> dict:
 
 
 def get_active_symbols_with_reasons() -> list[dict]:
-    """Return active symbols with strategy/backtest counts as reasons."""
+    """Return active symbols with strategy/backtest counts as reasons.
+
+    Two GROUP BY queries on one connection instead of the previous
+    two-queries-per-symbol N+1 (matching semantics unchanged: exact
+    symbol-string equality)."""
     try:
         from forven.data_manager import data_manager
         from forven.db import get_db
         from datetime import timedelta
         cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
         symbols = data_manager.get_active_symbols()
-        result = []
-        for symbol in sorted(symbols):
-            try:
-                with get_db() as conn:
-                    strat_count = conn.execute(
-                        "SELECT COUNT(*) FROM strategies WHERE symbol = ? AND stage IN ('paper', 'paper_trading', 'live_graduated', 'deployed', 'gauntlet', 'active')",
-                        (symbol,),
-                    ).fetchone()[0]
-                    bt_count = conn.execute(
-                        "SELECT COUNT(DISTINCT id) FROM backtest_results WHERE symbol = ? AND created_at >= ? AND deleted_at IS NULL",
-                        (symbol, cutoff),
-                    ).fetchone()[0]
-                result.append({
-                    "symbol": symbol,
-                    "active_strategies": strat_count,
-                    "recent_backtests": bt_count,
-                })
-            except Exception:
-                result.append({"symbol": symbol, "active_strategies": 0, "recent_backtests": 0})
-        return result
+        strat_counts: dict[str, int] = {}
+        bt_counts: dict[str, int] = {}
+        try:
+            with get_db() as conn:
+                for sym, count in conn.execute(
+                    "SELECT symbol, COUNT(*) FROM strategies WHERE stage IN ('paper', 'paper_trading', 'live_graduated', 'deployed', 'gauntlet', 'active') GROUP BY symbol"
+                ).fetchall():
+                    strat_counts[str(sym)] = int(count)
+                for sym, count in conn.execute(
+                    "SELECT symbol, COUNT(DISTINCT id) FROM backtest_results WHERE created_at >= ? AND deleted_at IS NULL GROUP BY symbol",
+                    (cutoff,),
+                ).fetchall():
+                    bt_counts[str(sym)] = int(count)
+        except Exception:
+            pass
+        return [
+            {
+                "symbol": symbol,
+                "active_strategies": strat_counts.get(symbol, 0),
+                "recent_backtests": bt_counts.get(symbol, 0),
+            }
+            for symbol in sorted(symbols)
+        ]
     except Exception as exc:
         log.warning("get_active_symbols_with_reasons failed: %s", exc)
         return []
 
 
 _backfill_lock = threading.Lock()
+_backfill_cancel = threading.Event()
+_BACKFILL_STATE_KV_KEY = "data:backfill_state"
 _backfill_state: dict = {
     "running": False,
     "last_started_at": None,
     "last_result": None,
     "last_error": None,
+    "progress": None,
+    "cancel_requested": False,
 }
+_backfill_state_loaded = False
+
+
+def _load_backfill_state_locked() -> None:
+    """Seed last_result/last_error from KV once per process so the status
+    endpoint survives a restart (it was a process-local dict that reset to
+    empty). ``running`` is never restored — a restart kills the thread."""
+    global _backfill_state_loaded
+    if _backfill_state_loaded:
+        return
+    _backfill_state_loaded = True
+    try:
+        from forven.db import kv_get
+
+        saved = kv_get(_BACKFILL_STATE_KV_KEY, None)
+        if isinstance(saved, dict):
+            for key in ("last_started_at", "last_result", "last_error"):
+                if _backfill_state.get(key) is None:
+                    _backfill_state[key] = saved.get(key)
+    except Exception:
+        pass
+
+
+def _persist_backfill_state_locked() -> None:
+    try:
+        from forven.db import kv_set_best_effort
+
+        kv_set_best_effort(
+            _BACKFILL_STATE_KV_KEY,
+            {
+                "last_started_at": _backfill_state.get("last_started_at"),
+                "last_result": _backfill_state.get("last_result"),
+                "last_error": _backfill_state.get("last_error"),
+            },
+        )
+    except Exception:
+        pass
 
 
 def get_backfill_status() -> dict:
-    """Return current backfill state."""
+    """Return current backfill state (running flag, per-symbol progress,
+    last result/error — the latter restart-surviving via KV)."""
     with _backfill_lock:
+        _load_backfill_state_locked()
         return dict(_backfill_state)
+
+
+def post_cancel_backfill() -> dict:
+    """Request a cooperative stop of the running BV backfill (takes effect
+    between symbols)."""
+    with _backfill_lock:
+        if not _backfill_state["running"]:
+            raise HTTPException(status_code=409, detail="No backfill running")
+        _backfill_cancel.set()
+        _backfill_state["cancel_requested"] = True
+    return {"status": "cancelling"}
 
 
 def post_trigger_backfill(symbol: str | None = None) -> dict:
     """Trigger a Binance Vision backfill in a background thread."""
-    global _backfill_state
     with _backfill_lock:
         if _backfill_state["running"]:
             raise HTTPException(status_code=409, detail="Backfill already running")
-        _backfill_state = {
-            "running": True,
-            "last_started_at": _now(),
-            "last_result": None,
-            "last_error": None,
-        }
+        _load_backfill_state_locked()
+        _backfill_cancel.clear()
+        _backfill_state.update(
+            {
+                "running": True,
+                "last_started_at": _now(),
+                "last_result": None,
+                "last_error": None,
+                "progress": None,
+                "cancel_requested": False,
+            }
+        )
+
+    def _on_progress(done: int, total: int, current_symbol: str) -> None:
+        with _backfill_lock:
+            _backfill_state["progress"] = {
+                "done": int(done),
+                "total": int(total),
+                "current_symbol": current_symbol,
+            }
 
     def _run() -> None:
-        global _backfill_state
         try:
             from forven.data_manager import data_manager
-            result = data_manager.backfill(symbol=symbol)
+            result = data_manager.backfill(
+                symbol=symbol, progress_cb=_on_progress, cancel_event=_backfill_cancel
+            )
             with _backfill_lock:
                 _backfill_state["running"] = False
                 _backfill_state["last_result"] = result
+                _backfill_state["progress"] = None
+                _persist_backfill_state_locked()
         except Exception as exc:
             log.warning("post_trigger_backfill failed: %s", exc)
             with _backfill_lock:
                 _backfill_state["running"] = False
                 _backfill_state["last_error"] = str(exc)
+                _backfill_state["progress"] = None
+                _persist_backfill_state_locked()
 
     threading.Thread(target=_run, daemon=True, name="bv-backfill-ui").start()
     return {"status": "started", "symbol": symbol}
+
+
+_DEPTH_CALIBRATION_KV_PREFIX = "data:depth_calibration:"
+
+
+def get_depth_calibration(symbol: str) -> dict:
+    """Stored empirical depth profile for a symbol (median/p25 resting notional
+    per ±% level from BV bookDepth archives), or 404 when never computed."""
+    from forven.data import symbol_to_fs
+    from forven.db import kv_get
+
+    fs_symbol = symbol_to_fs(symbol)
+    payload = kv_get(f"{_DEPTH_CALIBRATION_KV_PREFIX}{fs_symbol}", None)
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=404, detail=f"no depth calibration for {fs_symbol}")
+    return payload
+
+
+def post_compute_depth_calibration(symbol: str, days: int = 30) -> dict:
+    """Compute + persist the empirical depth profile from BV bookDepth daily
+    archives (bounded window). Feeds liquidity-floor / slippage models with
+    MEASURED venue depth instead of assumptions."""
+    from forven.binance_vision import bv_client
+    from forven.data import symbol_to_fs
+    from forven.db import kv_set_best_effort
+
+    fs_symbol = symbol_to_fs(symbol)
+    bounded_days = max(1, min(int(days or 30), 90))
+    artifact = bv_client.sample_depth_calibration(fs_symbol, days=bounded_days)
+    if artifact is None:
+        raise HTTPException(status_code=404, detail=f"no bookDepth archives for {fs_symbol}")
+    kv_set_best_effort(f"{_DEPTH_CALIBRATION_KV_PREFIX}{fs_symbol}", artifact)
+    _log_data_action_safe(
+        "depth_calibration",
+        f"Computed depth calibration for {fs_symbol} over {artifact.get('sampled_days')} days",
+        symbol=fs_symbol,
+    )
+    return artifact
+
+
+def _log_data_action_safe(action: str, message: str, **detail) -> None:
+    try:
+        from forven.data import _log_data_action
+
+        _log_data_action(action, message, **detail)
+    except Exception:
+        pass
+
+
+_universe_lock = threading.Lock()
+_universe_cancel = threading.Event()
+_UNIVERSE_STATE_KV_KEY = "data:universe_seed_state"
+_universe_state: dict = {
+    "running": False,
+    "last_started_at": None,
+    "last_result": None,
+    "last_error": None,
+    "progress": None,
+}
+_universe_state_loaded = False
+
+
+def _load_universe_state_locked() -> None:
+    """Seed last_started/result/error from KV once per process. A seed that was
+    RUNNING when the process died is surfaced as failed ('backend restarted')
+    instead of silently blanking — the seed is resumable, so restarting it is
+    always safe. Caller holds _universe_lock."""
+    global _universe_state_loaded
+    if _universe_state_loaded:
+        return
+    _universe_state_loaded = True
+    try:
+        from forven.db import kv_get
+
+        saved = kv_get(_UNIVERSE_STATE_KV_KEY, None)
+        if isinstance(saved, dict):
+            for key in ("last_started_at", "last_result", "last_error"):
+                if _universe_state.get(key) is None:
+                    _universe_state[key] = saved.get(key)
+            if saved.get("running") and not _universe_state.get("last_error"):
+                _universe_state["last_error"] = "backend restarted mid-seed — restart the seed (it resumes)"
+    except Exception:
+        pass
+
+
+def _persist_universe_state_locked() -> None:
+    try:
+        from forven.db import kv_set_best_effort
+
+        kv_set_best_effort(
+            _UNIVERSE_STATE_KV_KEY,
+            {
+                "running": bool(_universe_state.get("running")),
+                "last_started_at": _universe_state.get("last_started_at"),
+                "last_result": _universe_state.get("last_result"),
+                "last_error": _universe_state.get("last_error"),
+            },
+        )
+    except Exception:
+        pass
+
+
+def get_data_universe() -> dict:
+    """Symbol registry (inception/delist/liquidity) + the planned research
+    universe ladder + seed job state."""
+    from forven.dataeng.universe import get_symbol_registry, plan_research_universe
+
+    try:
+        registry = get_symbol_registry()
+    except Exception as exc:
+        log.warning("get_data_universe registry read failed: %s", exc)
+        registry = []
+    try:
+        plan = plan_research_universe()
+    except Exception as exc:
+        log.warning("get_data_universe plan failed: %s", exc)
+        plan = []
+    with _universe_lock:
+        _load_universe_state_locked()
+        seed_state = dict(_universe_state)
+    config: dict = {}
+    try:
+        from forven.dataeng.settings import load_data_engine_settings
+
+        raw = load_data_engine_settings().research_universe
+        config = dict(raw) if isinstance(raw, dict) else {}
+    except Exception:
+        config = {}
+    return {
+        "registry_count": len(registry),
+        "active": sum(1 for row in registry if row.get("status") == "active"),
+        "delisted": sum(1 for row in registry if row.get("status") == "delisted"),
+        "registry": registry,
+        "plan": plan,
+        "seed": seed_state,
+        "config": config,
+    }
+
+
+def post_universe_config(payload: dict) -> dict:
+    """Update the research-universe sizing config (Settings-grade knobs surfaced
+    next to the Seed button: presets are premades, every number stays editable).
+    Only known keys are accepted; the seed itself remains strictly manual."""
+    from forven.dataeng.settings import load_data_engine_settings, save_data_engine_settings
+
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="config payload must be an object")
+
+    settings = load_data_engine_settings()
+    config = dict(settings.research_universe) if isinstance(settings.research_universe, dict) else {}
+
+    if "enabled" in payload:
+        config["enabled"] = bool(payload["enabled"])
+    for key, lo, hi in (
+        ("size", 1, 500),
+        ("intraday_top", 0, 500),
+        ("minute_top", 0, 100),
+        ("metrics_days", 0, 3650),
+    ):
+        if key in payload:
+            try:
+                value = int(payload[key])
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail=f"{key} must be an integer")
+            if not (lo <= value <= hi):
+                raise HTTPException(status_code=400, detail=f"{key} must be between {lo} and {hi}")
+            config[key] = value
+    # Tier tops can't exceed the universe size (a 1m tier larger than the plan
+    # is meaningless and confuses the estimate).
+    config["intraday_top"] = min(int(config.get("intraday_top", 20)), int(config.get("size", 50)))
+    config["minute_top"] = min(int(config.get("minute_top", 10)), int(config.get("intraday_top", 20)))
+
+    settings.research_universe = config
+    save_data_engine_settings(settings)
+    return {"config": config}
+
+
+def post_refresh_universe_registry() -> dict:
+    from forven.dataeng.universe import refresh_symbol_registry
+
+    return refresh_symbol_registry()
+
+
+def post_seed_research_universe() -> dict:
+    """Seed deep history for the research universe in a background thread.
+    Idempotent/resumable; cancel via post_cancel_universe_seed."""
+    with _universe_lock:
+        if _universe_state["running"]:
+            raise HTTPException(status_code=409, detail="Universe seed already running")
+        _load_universe_state_locked()
+        _universe_cancel.clear()
+        _universe_state.update(
+            {"running": True, "last_started_at": _now(), "last_result": None, "last_error": None, "progress": None}
+        )
+        _persist_universe_state_locked()
+
+    def _on_progress(done: int, total: int, symbol: str) -> None:
+        with _universe_lock:
+            _universe_state["progress"] = {"done": int(done), "total": int(total), "current_symbol": symbol}
+
+    def _run() -> None:
+        try:
+            from forven.dataeng.universe import seed_research_universe
+
+            result = seed_research_universe(progress_cb=_on_progress, cancel_event=_universe_cancel)
+            with _universe_lock:
+                _universe_state.update({"running": False, "last_result": result, "progress": None})
+                _persist_universe_state_locked()
+        except Exception as exc:
+            log.warning("Research universe seed failed: %s", exc)
+            with _universe_lock:
+                _universe_state.update({"running": False, "last_error": str(exc), "progress": None})
+                _persist_universe_state_locked()
+
+    threading.Thread(target=_run, daemon=True, name="universe-seed").start()
+    return {"status": "started"}
+
+
+def post_cancel_universe_seed() -> dict:
+    with _universe_lock:
+        if not _universe_state["running"]:
+            raise HTTPException(status_code=409, detail="No universe seed running")
+        _universe_cancel.set()
+    return {"status": "cancelling"}
 
 
 def get_coverage() -> dict:
@@ -1930,7 +2378,7 @@ def get_coverage() -> dict:
     Missing parquet files are omitted from the result.
     """
     from forven.data import DATA_DIR, coverage_entry, prune_coverage_cache
-    from forven.data_manager import FUNDING_DIR, OI_DIR
+    from forven.data_manager import BASIS_DIR, FUNDING_DIR, OI_DIR
 
     result: dict = {}
     ohlcv_root = Path(DATA_DIR)
@@ -1970,6 +2418,14 @@ def get_coverage() -> dict:
                 entry = _entry_for(pq_file)
                 if entry is not None:
                     result[symbol][f"oi/{pq_file.stem}"] = entry
+
+        # Basis (perp premium index) timeframes
+        basis_sym_dir = BASIS_DIR / symbol
+        if basis_sym_dir.exists():
+            for pq_file in sorted(basis_sym_dir.glob("*.parquet")):
+                entry = _entry_for(pq_file)
+                if entry is not None:
+                    result[symbol][f"basis/{pq_file.stem}"] = entry
 
         if not result[symbol]:
             del result[symbol]

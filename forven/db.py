@@ -19,6 +19,14 @@ from forven.config import (
     WORKSPACE_DIR,
     ensure_dirs,
 )
+from forven.roster import (
+    RETIRED_OWNER_SUCCESSORS as _RETIRED_OWNER_SUCCESSORS,
+    STAGE_OWNER_GUARD as _STAGE_TO_OWNER_FOR_LOCK,
+    STAGE_TO_AGENT as _STAGE_TO_AGENT,
+    VALID_APPROVAL_OWNERS as _VALID_APPROVAL_OWNERS,
+    normalize_agent_id as _normalize_agent_id_for_lock,
+    normalize_stage_key as _normalize_stage_for_lock,
+)
 
 SCHEMA_VERSION = 28
 DEFAULT_ID_WIDTH = 5
@@ -56,7 +64,6 @@ FACTORY_RESET_CATEGORIES = {
         "tables": ["strategies", "strategy_events", "strategy_recovery_state", "strategy_recovery_events", "archived_strategies", "approvals", "strategy_candidates", "backtest_runs", "backtest_results", "backtest_result_trash", "gauntlet_workflows", "gauntlet_steps", "gauntlet_artifacts", "gauntlet_events", "hypotheses", "hypothesis_artifacts", "data_gaps", "data_gap_links"],
         "counter_reset": True,
         "results_dir": True,
-        "chroma_collections": ["backtest_results", "research_hypotheses"],
     },
     "agent_task_history": {
         "label": "Agent Tasks & Audit",
@@ -69,7 +76,6 @@ FACTORY_RESET_CATEGORIES = {
         "description": "All trade records, portfolio positions, slippage audits, and decay audits",
         "default_keep": False,
         "tables": ["trades", "portfolio_positions", "trade_slippage_audit", "strategy_decay_audit"],
-        "chroma_collections": ["trade_post_mortems", "execution_slippage"],
     },
     "activity_log": {
         "label": "Activity Log",
@@ -78,10 +84,10 @@ FACTORY_RESET_CATEGORIES = {
         "tables": ["activity_log", "notifications", "notification_deliveries"],
     },
     "ai_memory": {
-        "label": "AI Memory & Vectors",
-        "description": "ChromaDB vector collections and workspace memory files (LESSONS.md, evolution_journal.md)",
+        "label": "AI Memory",
+        "description": "Workspace memory files (LESSONS.md, evolution_journal.md)",
         "default_keep": False,
-        "tables": ["memory_annotations", "memory_events"],
+        "tables": [],
         "files": True,
     },
     "scheduler_jobs": {
@@ -201,28 +207,12 @@ _PHANTOM_RECOVERY_INLINE_ELIGIBLE_STAGES = frozenset(
 )
 
 
-_VALID_APPROVAL_OWNERS = {
-    "quant-researcher",
-    "strategy-developer",
-    "risk-manager",
-    "simulation-agent",
-    "execution-trader",
-    "ceo",
-    "brain",
-    "system",
-}
-
-_LEGACY_APPROVAL_OWNER_ALIASES = {
-    "backtest-engineer": "simulation-agent",
-    "system": "brain",
-}
-
-
 def _normalize_approval_owner(value: str | None) -> str | None:
     normalized = str(value or "").strip().lower()
     if not normalized:
         return None
-    normalized = _LEGACY_APPROVAL_OWNER_ALIASES.get(normalized, normalized)
+    # Retired owners (incl. execution-trader) carry forward to their successor.
+    normalized = _RETIRED_OWNER_SUCCESSORS.get(normalized, normalized)
     return normalized if normalized in _VALID_APPROVAL_OWNERS else None
 
 
@@ -766,6 +756,8 @@ CREATE TABLE IF NOT EXISTS trades (
     fill_exit_price REAL,
     entry_slippage_bps REAL,
     exit_slippage_bps REAL,
+    entry_lag_bps REAL,
+    exit_lag_bps REAL,
     exit_price REAL,
     size REAL,
     risk_pct REAL,
@@ -1152,42 +1144,6 @@ CREATE TABLE IF NOT EXISTS agent_tasks (
     dismissed_note TEXT
 );
 
-CREATE TABLE IF NOT EXISTS memory_annotations (
-    source TEXT NOT NULL,
-    source_id TEXT NOT NULL,
-    source_kind TEXT,
-    title_override TEXT,
-    tags_json TEXT,
-    note TEXT,
-    tier TEXT,
-    pinned INTEGER NOT NULL DEFAULT 0,
-    hidden INTEGER NOT NULL DEFAULT 0,
-    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%S+00:00', 'now')),
-    PRIMARY KEY (source, source_id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_memory_annotations_updated_at
-    ON memory_annotations (updated_at);
-CREATE INDEX IF NOT EXISTS idx_memory_annotations_pinned
-    ON memory_annotations (pinned);
-CREATE INDEX IF NOT EXISTS idx_memory_annotations_hidden
-    ON memory_annotations (hidden);
-
-CREATE TABLE IF NOT EXISTS memory_events (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    source TEXT NOT NULL,
-    source_id TEXT NOT NULL,
-    action TEXT NOT NULL,
-    payload_json TEXT,
-    actor TEXT,
-    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%S+00:00', 'now'))
-);
-
-CREATE INDEX IF NOT EXISTS idx_memory_events_lookup
-    ON memory_events (source, source_id, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_memory_events_created_at
-    ON memory_events (created_at DESC);
-
 CREATE TABLE IF NOT EXISTS schema_version (
     version INTEGER PRIMARY KEY
 );
@@ -1239,6 +1195,7 @@ CREATE TABLE IF NOT EXISTS brain_routines (
     cron_expr TEXT NOT NULL,
     tools_context TEXT NOT NULL DEFAULT 'scheduled',
     skills_json JSON,
+    channel TEXT,
     enabled INTEGER NOT NULL DEFAULT 1,
     created_by TEXT,
     approval_id INTEGER,
@@ -1408,6 +1365,8 @@ CREATE TABLE IF NOT EXISTS bot_configs (
     reasoning_verbosity TEXT DEFAULT 'standard',
     asset_mode TEXT DEFAULT 'free_roam',
     locked_pairs TEXT,
+    execution_mode TEXT NOT NULL DEFAULT 'paper',
+    live_wallet TEXT,
     tools TEXT,
     web_allowlist TEXT,
     web_rate_limit INTEGER DEFAULT 10,
@@ -1855,6 +1814,11 @@ def _run_migrations(conn: sqlite3.Connection):
     _ensure_column(conn, "trades", "execution_type", "TEXT DEFAULT 'live'")
     _ensure_column(conn, "trades", "entry_slippage_bps", "REAL")
     _ensure_column(conn, "trades", "exit_slippage_bps", "REAL")
+    # Execution-quality watchdog: decision-lag component of the expected-vs-actual
+    # fill skew (expected -> mark-at-execution, adverse-positive bps); the remainder
+    # of entry/exit_slippage_bps is venue slippage (mark -> fill).
+    _ensure_column(conn, "trades", "entry_lag_bps", "REAL")
+    _ensure_column(conn, "trades", "exit_lag_bps", "REAL")
     # Fee-net PnL so the paper gate rehearses live economics. Paper fills already
     # carry realized slippage (entry/exit_slippage_bps), so only exchange fees are
     # deducted here; gross pnl_pct/pnl_usd are left untouched for other consumers.
@@ -1946,6 +1910,7 @@ def _run_migrations(conn: sqlite3.Connection):
             cron_expr TEXT NOT NULL,
             tools_context TEXT NOT NULL DEFAULT 'scheduled',
             skills_json JSON,
+            channel TEXT,
             enabled INTEGER NOT NULL DEFAULT 1,
             created_by TEXT,
             approval_id INTEGER,
@@ -1960,6 +1925,7 @@ def _run_migrations(conn: sqlite3.Connection):
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_brain_routines_enabled ON brain_routines (enabled)"
     )
+    _ensure_column(conn, "brain_routines", "channel", "TEXT")
     _ensure_column(conn, "strategies", "model", "TEXT")
     _ensure_column(conn, "strategies", "model_id", "TEXT")
     _ensure_column(conn, "strategies", "source", "TEXT")
@@ -2900,6 +2866,14 @@ def _run_migrations(conn: sqlite3.Connection):
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_agent_tasks_agent_status ON agent_tasks (agent_id, status)"
     )
+    # The task-manager/queue list endpoints ORDER BY created_at DESC LIMIT n;
+    # without these the query scans every (blob-heavy) row on each page load.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_agent_tasks_created_at ON agent_tasks (created_at DESC)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tasks_created_at ON tasks (created_at DESC)"
+    )
     conn.execute("DROP INDEX IF EXISTS idx_agent_tasks_active_dedup")
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_tasks_active_dedup "
@@ -3008,6 +2982,52 @@ def _run_migrations(conn: sqlite3.Connection):
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_task_checkpoints_task ON task_checkpoints (task_id)"
     )
+
+    # Agent run transcript: one row per conversation turn (assistant text +
+    # reasoning, tool calls with args/results) written by the runner AS EACH
+    # ROUND COMPLETES, so a crashed/timed-out run still has its partial
+    # transcript. This is the ground truth for "what was the agent thinking" —
+    # before this table only the initial prompt + final response survived.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS agent_task_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_display_id TEXT NOT NULL,
+            agent_id TEXT,
+            seq INTEGER NOT NULL,
+            tool_round INTEGER,
+            role TEXT NOT NULL,
+            content TEXT,
+            reasoning TEXT,
+            tool_name TEXT,
+            tool_call_id TEXT,
+            tool_args TEXT,
+            tool_result TEXT,
+            provider TEXT,
+            model_id TEXT,
+            input_tokens INTEGER,
+            output_tokens INTEGER,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%S+00:00', 'now'))
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_agent_task_messages_task ON agent_task_messages (task_display_id, seq)"
+    )
+
+    # Per-agent daily spend rollup. agent_tasks rows are pruned after the
+    # retention window; this tiny table is what keeps cost history durable
+    # (and powers per-agent spend views) after the runs themselves are gone.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS agent_spend_daily (
+            day TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            tasks INTEGER NOT NULL DEFAULT 0,
+            cost_usd REAL NOT NULL DEFAULT 0,
+            input_tokens INTEGER NOT NULL DEFAULT 0,
+            output_tokens INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%S+00:00', 'now')),
+            PRIMARY KEY (day, agent_id)
+        )
+    """)
 
     # Hermes-inspired Phase 1: Brain memory + decisions + FTS5 recall.
     # Brain-only: these tables back the Brain agent's persistent operational
@@ -3158,8 +3178,7 @@ def _run_migrations(conn: sqlite3.Connection):
         END
     """)
 
-    # Hermes-inspired Phase 3 (P3-T01): quant skill versioning + outcome closure
-    # + brain lessons. Brain-only persistence layer.
+    # Hermes-inspired Phase 3 (P3-T01): quant skill versioning + outcome closure.
     #
     # quant_skills_history captures every write to a SKILL.md as a row, so we
     # can answer "what changed in v3?" without re-reading the disk file. Skills
@@ -3227,56 +3246,17 @@ def _run_migrations(conn: sqlite3.Connection):
         "ON skill_outcome_events (skill_name, strategy_id, triggered_by)"
     )
 
-    # brain_lessons stores Brain's self-judgment lessons. Mirrors the
-    # brain_decisions FTS5 mirror pattern from Phase 1 so search_lessons() can
-    # match against situation_pattern + lesson_text.
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS brain_lessons (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            situation_pattern TEXT NOT NULL,
-            lesson_text TEXT NOT NULL,
-            evidence_decisions_json TEXT NOT NULL DEFAULT '[]',
-            confidence REAL NOT NULL DEFAULT 0.5 CHECK (confidence >= 0 AND confidence <= 1),
-            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%S+00:00', 'now')),
-            last_validated_at TEXT,
-            created_by TEXT NOT NULL DEFAULT 'brain'
-        )
-    """)
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_brain_lessons_created_at "
-        "ON brain_lessons (created_at DESC)"
-    )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_brain_lessons_confidence "
-        "ON brain_lessons (confidence DESC)"
-    )
+    # brain_lessons removed 2026-07-02: the KB never gained an autonomous writer
+    # (0 rows after months), so the module, endpoints, and prompt blocks were
+    # deleted. Drop the leftover tables on existing installs.
+    conn.execute("DROP TABLE IF EXISTS brain_lessons_fts")
+    conn.execute("DROP TABLE IF EXISTS brain_lessons")
 
-    conn.execute("""
-        CREATE VIRTUAL TABLE IF NOT EXISTS brain_lessons_fts USING fts5(
-            situation_pattern, lesson_text,
-            content='brain_lessons', content_rowid='id'
-        )
-    """)
-    conn.execute("""
-        CREATE TRIGGER IF NOT EXISTS brain_lessons_ai AFTER INSERT ON brain_lessons BEGIN
-            INSERT INTO brain_lessons_fts(rowid, situation_pattern, lesson_text)
-            VALUES (new.id, new.situation_pattern, new.lesson_text);
-        END
-    """)
-    conn.execute("""
-        CREATE TRIGGER IF NOT EXISTS brain_lessons_ad AFTER DELETE ON brain_lessons BEGIN
-            INSERT INTO brain_lessons_fts(brain_lessons_fts, rowid, situation_pattern, lesson_text)
-            VALUES ('delete', old.id, old.situation_pattern, old.lesson_text);
-        END
-    """)
-    conn.execute("""
-        CREATE TRIGGER IF NOT EXISTS brain_lessons_au AFTER UPDATE ON brain_lessons BEGIN
-            INSERT INTO brain_lessons_fts(brain_lessons_fts, rowid, situation_pattern, lesson_text)
-            VALUES ('delete', old.id, old.situation_pattern, old.lesson_text);
-            INSERT INTO brain_lessons_fts(rowid, situation_pattern, lesson_text)
-            VALUES (new.id, new.situation_pattern, new.lesson_text);
-        END
-    """)
+    # Memory Bank removed 2026-07-02: the operator curation layer was never
+    # used (0 annotations/events after months). Page, router, and domain module
+    # are gone; drop the leftover overlay tables on existing installs.
+    conn.execute("DROP TABLE IF EXISTS memory_annotations")
+    conn.execute("DROP TABLE IF EXISTS memory_events")
 
     # Hermes-inspired Phase 4 (P4-T01): MCP client server registry + per-agent
     # grants. Operational state, separate from brain_* memory tables.
@@ -3331,7 +3311,6 @@ FTS5_TABLES: tuple[str, ...] = (
     "brain_decisions_fts",
     "agent_tasks_fts",
     "task_audit_log_fts",
-    "brain_lessons_fts",
 )
 
 
@@ -4153,11 +4132,17 @@ def get_trades_stats(
 def get_open_trades(exclude_bots: bool = False) -> list[dict]:
     """Get all open trades.
 
-    When ``exclude_bots`` is True, Bot Factory paper trades (source='bot:{id}')
+    When ``exclude_bots`` is True, Bot Factory PAPER trades (source='bot:{id}')
     are omitted so live/strategy risk-reasoning contexts never count them as
-    real exposure. Defaults False to preserve every existing caller.
+    real exposure. A live-armed bot's LIVE rows are real exchange exposure and
+    stay visible. Defaults False to preserve every existing caller.
     """
-    bot_filter = " AND COALESCE(source, '') NOT LIKE 'bot:%'" if exclude_bots else ""
+    bot_filter = (
+        " AND NOT (COALESCE(source, '') LIKE 'bot:%'"
+        " AND LOWER(COALESCE(execution_type, 'paper')) != 'live')"
+        if exclude_bots
+        else ""
+    )
     with get_db() as conn:
         rows = conn.execute(
             # `strategy` is the human-facing label the live/open-trades UI renders
@@ -4605,6 +4590,175 @@ def log_tool_call(
         )
 
 
+# DUP-1: stages in which a strategy actually places (paper or real) trades. Two
+# strategies with identical type/symbol/timeframe/params in these stages double
+# exposure on every signal.
+_TRADING_STAGES = frozenset({"paper", "live", "live_graduated", "deployed"})
+
+
+def find_duplicate_trading_strategy(
+    conn: sqlite3.Connection,
+    *,
+    type_: str,
+    symbol: str,
+    timeframe: str,
+    params: dict | None,
+    exclude_id: str | None = None,
+) -> str | None:
+    """The id of an existing TRADING-stage strategy with the identical
+    type + symbol + timeframe + params, or None. Canonical (sorted-key) JSON
+    comparison so key order can't defeat the check."""
+    params_canon = json.dumps(params or {}, sort_keys=True)
+    stage_ph = ",".join("?" for _ in _TRADING_STAGES)
+    for row in conn.execute(
+        f"SELECT id, params FROM strategies WHERE type = ? AND symbol = ? AND timeframe = ? "
+        f"AND LOWER(COALESCE(stage, '')) IN ({stage_ph})",
+        (str(type_ or ""), str(symbol or ""), str(timeframe or "1h"), *sorted(_TRADING_STAGES)),
+    ).fetchall():
+        if exclude_id and str(row["id"]) == str(exclude_id):
+            continue
+        try:
+            existing_canon = json.dumps(json.loads(row["params"] or "{}"), sort_keys=True)
+        except Exception:
+            continue
+        if existing_canon == params_canon:
+            return str(row["id"])
+    return None
+
+
+# Per-field caps for transcript rows. Generous enough to read a full thought
+# process; anything larger already landed (gzipped, in full) in
+# tool_truncations via the tool-output caps.
+_TASK_MESSAGE_TEXT_CAP = 20_000
+_TASK_MESSAGE_ARGS_CAP = 8_000
+
+
+def append_task_message(
+    task_display_id: str,
+    agent_id: str | None,
+    seq: int,
+    role: str,
+    *,
+    content: str | None = None,
+    reasoning: str | None = None,
+    tool_name: str | None = None,
+    tool_call_id: str | None = None,
+    tool_args: str | None = None,
+    tool_result: str | None = None,
+    provider: str | None = None,
+    model_id: str | None = None,
+    input_tokens: int | None = None,
+    output_tokens: int | None = None,
+    tool_round: int | None = None,
+) -> bool:
+    """Append one transcript turn for an agent task. Best-effort: transcript
+    persistence must never fail the run itself."""
+    if not task_display_id or not role:
+        return False
+
+    def _cap(value: str | None, cap: int) -> str | None:
+        if value is None:
+            return None
+        text = str(value)
+        if len(text) > cap:
+            return text[:cap] + f"\n… [truncated {len(text) - cap} chars]"
+        return text
+
+    try:
+        with get_db() as conn:
+            conn.execute(
+                "INSERT INTO agent_task_messages "
+                "(task_display_id, agent_id, seq, tool_round, role, content, reasoning, "
+                " tool_name, tool_call_id, tool_args, tool_result, provider, model_id, "
+                " input_tokens, output_tokens) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    str(task_display_id).strip(),
+                    str(agent_id).strip() if agent_id else None,
+                    int(seq),
+                    int(tool_round) if tool_round is not None else None,
+                    str(role).strip(),
+                    _cap(content, _TASK_MESSAGE_TEXT_CAP),
+                    _cap(reasoning, _TASK_MESSAGE_TEXT_CAP),
+                    str(tool_name).strip() if tool_name else None,
+                    str(tool_call_id).strip() if tool_call_id else None,
+                    _cap(tool_args, _TASK_MESSAGE_ARGS_CAP),
+                    _cap(tool_result, _TASK_MESSAGE_TEXT_CAP),
+                    str(provider).strip() if provider else None,
+                    str(model_id).strip() if model_id else None,
+                    int(input_tokens) if input_tokens is not None else None,
+                    int(output_tokens) if output_tokens is not None else None,
+                ),
+            )
+        return True
+    except Exception as exc:  # noqa: BLE001 - transcript writes are best-effort
+        log.warning("append_task_message failed for %s: %s", task_display_id, exc)
+        return False
+
+
+def get_task_messages(task_display_id: str) -> list[dict]:
+    """Return the full ordered transcript for one agent task."""
+    if not task_display_id:
+        return []
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM agent_task_messages WHERE task_display_id = ? ORDER BY seq ASC, id ASC",
+            (str(task_display_id).strip(),),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def record_agent_spend(
+    agent_id: str | None,
+    *,
+    cost_usd: float | None,
+    input_tokens: int | None = None,
+    output_tokens: int | None = None,
+) -> bool:
+    """Fold one completed run into the per-agent daily spend rollup.
+
+    Best-effort: spend accounting must never fail the run itself.
+    """
+    normalized_agent = str(agent_id or "").strip().lower()
+    if not normalized_agent:
+        return False
+    day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    try:
+        with get_db() as conn:
+            conn.execute(
+                "INSERT INTO agent_spend_daily (day, agent_id, tasks, cost_usd, input_tokens, output_tokens) "
+                "VALUES (?, ?, 1, ?, ?, ?) "
+                "ON CONFLICT(day, agent_id) DO UPDATE SET "
+                "tasks = tasks + 1, "
+                "cost_usd = cost_usd + excluded.cost_usd, "
+                "input_tokens = input_tokens + excluded.input_tokens, "
+                "output_tokens = output_tokens + excluded.output_tokens, "
+                "updated_at = strftime('%Y-%m-%dT%H:%M:%S+00:00', 'now')",
+                (
+                    day,
+                    normalized_agent,
+                    float(cost_usd or 0.0),
+                    int(input_tokens or 0),
+                    int(output_tokens or 0),
+                ),
+            )
+        return True
+    except Exception as exc:  # noqa: BLE001 - spend rollup is best-effort
+        log.warning("record_agent_spend failed for %s: %s", normalized_agent, exc)
+        return False
+
+
+def get_agent_spend(days: int = 30) -> list[dict]:
+    """Per-agent spend rollup for the last ``days`` days (newest first)."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=max(1, int(days)))).strftime("%Y-%m-%d")
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM agent_spend_daily WHERE day >= ? ORDER BY day DESC, agent_id ASC",
+            (cutoff,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
 def create_strategy_container(
     conn: sqlite3.Connection,
     name: str,
@@ -4674,6 +4828,26 @@ def create_strategy_container(
 
     normalized_stage = str(stage or "quick_screen").strip().lower() or "quick_screen"
     normalized_symbol = _normalize_strategy_symbol(symbol, params)
+    # DUP-1: refuse creating a strategy DIRECTLY INTO a trading stage when an exact
+    # duplicate is already trading — same type + symbol + timeframe + identical params
+    # trades the identical signal, silently DOUBLING exposure on every entry
+    # (S05275/S05276: the same Donchian registered twice booked two identical SOL longs
+    # 4.5s apart). Research-stage duplicates are allowed (candidates legitimately share
+    # baseline params before the sweep differentiates them); the same check guards the
+    # promotion path (find_duplicate_trading_strategy), which is where a research-stage
+    # dup would otherwise become double exposure.
+    if normalized_stage in _TRADING_STAGES:
+        _dup_id = find_duplicate_trading_strategy(
+            conn, type_=str(type_ or ""), symbol=normalized_symbol,
+            timeframe=str(timeframe or "1h"), params=params,
+        )
+        if _dup_id:
+            raise ValueError(
+                f"duplicate strategy: {_dup_id} is already trading the identical "
+                f"type/symbol/timeframe/params ({type_} {normalized_symbol} {timeframe or '1h'}) — "
+                "registering it again would double exposure on every signal; archive the "
+                "existing strategy first if you mean to replace it"
+            )
     stage_aliases = {
         "researching": "quick_screen",
         "developing": "quick_screen",
@@ -4695,17 +4869,7 @@ def create_strategy_container(
         type_=type_,
         strategy_id=final_strategy_id,
     )
-    owner_by_stage = {
-        "quick_screen": "simulation-agent",
-        "research_only": "strategy-developer",
-        "gauntlet": "simulation-agent",
-        "paper": "risk-manager",
-        # execution-trader retired — live oversight owned by risk-manager.
-        "live_graduated": "risk-manager",
-        "archived": None,
-        "rejected": None,
-    }
-    owner = owner_by_stage.get(normalized_stage)
+    owner = _STAGE_TO_AGENT.get(normalized_stage)
     now = _now()
     normalized_hypothesis_id = str(hypothesis_id or "").strip() or None
     normalized_origin_task_id = str(origin_task_id or "").strip() or None
@@ -5005,41 +5169,8 @@ def _extract_strategy_id(task_input: object) -> str | None:
     return normalized or None
 
 
-def _normalize_agent_id_for_lock(agent_id: str | None) -> str:
-    normalized = str(agent_id or "").strip().lower()
-    if normalized == "backtest-engineer":
-        return "simulation-agent"
-    if normalized == "system":
-        return "brain"
-    return normalized
-
-
-_STAGE_TO_OWNER_FOR_LOCK = {
-    "quick_screen": "simulation-agent",
-    "gauntlet": "simulation-agent",
-    "paper": "risk-manager",
-    # execution-trader retired — live oversight owned by risk-manager.
-    "live_graduated": "risk-manager",
-}
-
-
-def _normalize_stage_for_lock(value: str | None) -> str:
-    normalized = str(value or "").strip().lower()
-    aliases = {
-        "researching": "quick_screen",
-        "developing": "quick_screen",
-        "backtesting": "gauntlet",
-        "paper_trading": "paper",
-        "papertrading": "paper",
-        "paper-trading": "paper",
-        "review": "live_graduated",
-        "ceoreview": "live_graduated",
-        "ceo-review": "live_graduated",
-        "ceo_review": "live_graduated",
-        "deployed": "live_graduated",
-        "retired": "archived",
-    }
-    return aliases.get(normalized, normalized)
+# _normalize_agent_id_for_lock, _STAGE_TO_OWNER_FOR_LOCK and
+# _normalize_stage_for_lock are imported from forven.roster (canonical).
 
 
 def _claim_ownership_for_task(conn: sqlite3.Connection, agent_id: str, task: sqlite3.Row) -> tuple[str | None, str | None]:
@@ -6001,17 +6132,6 @@ def _factory_reset_delete_directory_contents(path: Path) -> None:
             continue
 
 
-def _factory_reset_wipe_chroma_collections(collections: list[str]) -> None:
-    if not collections:
-        return
-    try:
-        from forven.vectordb import wipe_collections
-
-        wipe_collections(collections)
-    except Exception:
-        pass
-
-
 def factory_reset(keep_categories: list[str] | None = None, *, allow_credentials_wipe: bool = False) -> dict:
     """Factory reset data categories not selected in `keep_categories`.
 
@@ -6081,10 +6201,6 @@ def factory_reset(keep_categories: list[str] | None = None, *, allow_credentials
                 for key in keys:
                     conn.execute("DELETE FROM kv WHERE key = ?", (key,))
 
-            # Surgically wipe related Chroma collections
-            if config.get("chroma_collections"):
-                _factory_reset_wipe_chroma_collections(config["chroma_collections"])
-
             # Surgically wipe results artifacts
             if config.get("results_dir"):
                 repo_root = Path(__file__).parent.parent
@@ -6112,6 +6228,8 @@ def factory_reset(keep_categories: list[str] | None = None, *, allow_credentials
             conn.execute("INSERT OR REPLACE INTO container_counters (prefix, next_val) VALUES ('E', 1)")
 
     if "ai_memory" in wipe_set:
+        # Clean the legacy ChromaDB store left behind by old installs (the
+        # vector layer itself was removed).
         chroma_dir = FORVEN_HOME / "chromadb"
         if chroma_dir.exists():
             shutil.rmtree(chroma_dir, ignore_errors=True)
@@ -6809,24 +6927,6 @@ def mark_backtest_failed(strategy_id: str, failure_type: str, reason: str) -> No
             WHERE id = ?""",
             (f"\n[BACKTEST_FAILED] {failure_type}: {reason} at {now}", now, strategy_id)
         )
-    
-    # Store in ChromaDB for post-mortem
-    try:
-        from forven.vectordb import store_post_mortem
-        store_post_mortem(
-            doc_id=f"{strategy_id}_backtest_failed",
-            strategy_id=strategy_id,
-            content=f"Backtest failed: {failure_type}. Reason: {reason}. This container was marked as backtest_failed to prevent phantom container syndrome.",
-            metadata={
-                "failure_type": failure_type,
-                "reason": reason,
-                "lifecycle_stage": "backtest_failed"
-            }
-        )
-    except Exception:
-        pass  # Don't fail if ChromaDB is unavailable
-
-
 
 
 # =============================================================================
@@ -7187,69 +7287,6 @@ def verify_fitness_before_archive(strategy_id: str) -> tuple[bool, str]:
         return True, ""
 
 
-def verify_chroma_persistence(result_id: str) -> tuple[bool, str]:
-    """
-    ChromaDB Persistence Check (Guardrail #2).
-    Verify write confirmation after every backtest completes.
-    Returns (persisted, error_message).
-    """
-    normalized_result_id = str(result_id or "").strip()
-    if not normalized_result_id:
-        return False, "Missing result_id for ChromaDB persistence verification"
-    try:
-        from forven.vectordb import _check_chroma_available
-
-        if not _check_chroma_available():
-            return False, "ChromaDB unavailable; persistence verification skipped"
-    except Exception as e:
-        return False, f"ChromaDB availability verification error: {str(e)}"
-
-    try:
-        import subprocess
-        import sys
-        import textwrap
-
-        from forven.config import CHROMA_DIR
-
-        script = textwrap.dedent(
-            """
-            import json
-            import pathlib
-            import sys
-
-            import chromadb
-
-            result_id = sys.argv[1]
-            chroma_dir = pathlib.Path(sys.argv[2])
-            client = chromadb.PersistentClient(path=str(chroma_dir))
-            collection = client.get_or_create_collection(
-                "backtest_results",
-                metadata={"hnsw:space": "cosine"},
-            )
-            result = collection.get(ids=[result_id])
-            print(json.dumps({"persisted": bool(result and result.get("ids") and result_id in result["ids"])}))
-            """
-        )
-        proc = subprocess.run(
-            [sys.executable, "-c", script, normalized_result_id, str(CHROMA_DIR)],
-            capture_output=True,
-            text=True,
-            timeout=20,
-        )
-        if proc.returncode != 0:
-            return (
-                False,
-                "ChromaDB verification subprocess failed "
-                f"(exit {proc.returncode}): {(proc.stderr or '').strip()[:300]}",
-            )
-        payload = json.loads(proc.stdout or "{}")
-        if bool(payload.get("persisted")):
-            return True, ""
-        return False, f"Result {normalized_result_id} not found in ChromaDB - PERSISTENCE VERIFICATION FAILED"
-    except Exception as e:
-        return False, f"ChromaDB verification subprocess error: {str(e)}"
-
-
 def detect_ghost_containers() -> list[dict]:
     """
     Ghost Container Detection (Guardrail #4).
@@ -7356,7 +7393,12 @@ def _default_bot_model() -> str:
 
 
 def create_bot(config: dict) -> str:
-    """Create a new bot and return its ID."""
+    """Create a new bot and return its ID.
+
+    Every bot is born in PAPER mode regardless of the incoming config (clones
+    of a live-armed bot included) — live execution is armed only through the
+    explicit go-live endpoint with its typed confirmation + notional ceiling.
+    """
     bot_id = str(uuid4())
     now = _now_utc()
     with get_db() as conn:
@@ -7370,8 +7412,8 @@ def create_bot(config: dict) -> str:
                 reasoning_verbosity, asset_mode, locked_pairs,
                 tools, web_allowlist, web_rate_limit, data_sources,
                 max_llm_calls_per_day, max_consecutive_errors, template_id,
-                status, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'stopped', ?, ?)""",
+                execution_mode, status, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'paper', 'stopped', ?, ?)""",
             (
                 bot_id,
                 config.get("name", "Untitled Bot"),
@@ -7437,19 +7479,31 @@ def get_bot(bot_id: str) -> dict | None:
 
 
 def list_bots() -> list[dict]:
-    """List all bots with status info."""
+    """List all bots with status info plus a per-bot trade digest
+    (realized P&L, open/closed counts) so the roster can show performance
+    without N+1 stats calls."""
     with get_db() as conn:
         rows = conn.execute(
             """SELECT c.id, c.name, c.model, c.status, c.asset_mode,
                       c.capital_allocation, c.locked_pairs, c.template_id,
-                      c.reasoning_verbosity, c.created_at, c.updated_at,
+                      c.reasoning_verbosity, c.execution_mode, c.live_wallet,
+                      c.created_at, c.updated_at,
                       s.pid, s.status AS runtime_status, s.last_heartbeat,
                       s.started_at, s.error_message, s.llm_calls_today,
-                      s.consecutive_errors, c.max_llm_calls_per_day
+                      s.consecutive_errors, s.realized_pnl, c.max_llm_calls_per_day
                FROM bot_configs c
                LEFT JOIN bot_status s ON c.id = s.bot_id
                ORDER BY c.created_at DESC"""
         ).fetchall()
+        digest_rows = conn.execute(
+            """SELECT source,
+                      SUM(CASE WHEN status = 'OPEN' THEN 1 ELSE 0 END) AS open_positions,
+                      SUM(CASE WHEN status = 'CLOSED' THEN 1 ELSE 0 END) AS closed_trades
+                 FROM trades
+                WHERE source LIKE 'bot:%'
+             GROUP BY source"""
+        ).fetchall()
+        digests = {str(r["source"]): dict(r) for r in digest_rows}
         results = []
         for row in rows:
             d = dict(row)
@@ -7458,6 +7512,10 @@ def list_bots() -> list[dict]:
                     d["locked_pairs"] = json.loads(d["locked_pairs"])
                 except (json.JSONDecodeError, TypeError):
                     pass
+            digest = digests.get(f"bot:{d['id']}") or {}
+            d["open_positions"] = int(digest.get("open_positions") or 0)
+            d["closed_trades"] = int(digest.get("closed_trades") or 0)
+            d["realized_pnl"] = float(d.get("realized_pnl") or 0.0)
             results.append(d)
         return results
 
@@ -7492,7 +7550,11 @@ def update_bot(bot_id: str, updates: dict) -> None:
         set_parts = []
         values = []
         for key, val in updates.items():
-            if key in ("id", "created_at"):
+            # execution_mode and live_wallet are deliberately NOT settable
+            # through the generic update path — both are armed atomically by
+            # the typed go-live confirmation (dedicated endpoint); a plain
+            # config PUT must never flip a bot live or redirect its orders.
+            if key in ("id", "created_at", "execution_mode", "live_wallet"):
                 continue
             if key in json_fields and val is not None and not isinstance(val, str):
                 val = json.dumps(val)
@@ -7588,6 +7650,40 @@ def set_bot_status(
             "UPDATE bot_configs SET status = ? WHERE id = ?",
             (status, bot_id),
         )
+
+
+def set_bot_live_wallet(bot_id: str, wallet: str | None) -> None:
+    """Set (or clear, with None) the named wallet a live bot routes orders to.
+
+    Only the go-live endpoint calls this — the generic update path strips
+    live_wallet. Registration validity is the caller's job (api_go_live checks
+    the label against the wallet registry)."""
+    cleaned = str(wallet or "").strip().lower() or None
+    with get_db() as conn:
+        cur = conn.execute(
+            "UPDATE bot_configs SET live_wallet = ?, updated_at = ? WHERE id = ?",
+            (cleaned, _now_utc(), bot_id),
+        )
+        if cur.rowcount == 0:
+            raise ValueError(f"Bot {bot_id} not found")
+
+
+def set_bot_execution_mode(bot_id: str, mode: str) -> None:
+    """Set a bot's execution mode ('paper' | 'live').
+
+    Only the go-live / go-paper endpoints call this — the generic update path
+    strips execution_mode so live can never be armed by a plain config PUT.
+    """
+    normalized = str(mode or "").strip().lower()
+    if normalized not in ("paper", "live"):
+        raise ValueError(f"invalid execution_mode {mode!r} (expected 'paper' or 'live')")
+    with get_db() as conn:
+        cur = conn.execute(
+            "UPDATE bot_configs SET execution_mode = ?, updated_at = ? WHERE id = ?",
+            (normalized, _now_utc(), bot_id),
+        )
+        if cur.rowcount == 0:
+            raise ValueError(f"Bot {bot_id} not found")
 
 
 def get_bot_status(bot_id: str) -> dict | None:
@@ -7811,6 +7907,11 @@ def execute_bot_trade(
     entry_fee_usd: float | None = None,
     stop_loss_price: float | None = None,
     take_profit_price: float | None = None,
+    execution_type: str = "paper",
+    book: str | None = None,
+    risk_pct: float | None = None,
+    leverage: float | None = None,
+    asset: str | None = None,
 ) -> str:
     """Record a bot OPEN trade in the trades table. Returns trade ID.
 
@@ -7818,6 +7919,13 @@ def execute_bot_trade(
     actual fill price after slippage; `signal_price` is the pre-slippage
     decision price. Fees are recorded in signal_data so P&L reconciliation
     can deduct them at close.
+
+    execution_type='live' records a REAL order (live_exec places it through
+    the sanctioned gate stack): `asset` carries the exchange coin ("BTC")
+    while `ticker` stays the bot's pair ("BTC/USDT", kept in signal_data.pair
+    so the runner and UI can map the row back to its market-data feed);
+    `book`/`risk_pct`/`leverage` mirror what register() needs for the live
+    risk budget.
     """
     with get_db() as conn:
         bot = conn.execute(
@@ -7830,11 +7938,17 @@ def execute_bot_trade(
         # used on scanner + recovered trades. Bots are a separate, isolated product
         # whose venue/data semantics differ (the trade is already tagged source=bot:{id});
         # stamping the crypto-strategy venue here would be incorrect.
+        exec_type = str(execution_type or "paper").strip().lower()
+        if exec_type not in ("paper", "live"):
+            raise ValueError(f"invalid bot execution_type {execution_type!r}")
+        asset_value = str(asset or ticker)
         signal_data: dict = {
             "bot_id": bot_id,
             "bot_name": bot_name,
             "reasoning": reasoning,
         }
+        if asset_value != ticker:
+            signal_data["pair"] = ticker
         if entry_fee_bps is not None:
             signal_data["entry_fee_bps"] = float(entry_fee_bps)
         if entry_fee_usd is not None:
@@ -7856,14 +7970,15 @@ def execute_bot_trade(
                     """INSERT INTO trades
                     (id, strategy, strategy_name, strategy_id, asset, symbol, direction,
                      entry_price, signal_entry_price, fill_entry_price, entry_slippage_bps,
-                     size, status, execution_type, source, signal_data, opened_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', 'paper', ?, ?, ?)""",
+                     size, risk_pct, leverage, status, execution_type, book, source,
+                     signal_data, opened_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?, ?, ?, ?)""",
                     (
                         trade_id,
                         f"bot:{bot_id}",
                         bot_name,
                         f"bot:{bot_id}",
-                        ticker,
+                        asset_value,
                         ticker,
                         direction.lower(),
                         price or 0,
@@ -7871,6 +7986,10 @@ def execute_bot_trade(
                         price or 0,
                         float(entry_slippage_bps) if entry_slippage_bps is not None else None,
                         qty,
+                        float(risk_pct) if risk_pct is not None else None,
+                        float(leverage) if leverage is not None else None,
+                        exec_type,
+                        book,
                         f"bot:{bot_id}",
                         json.dumps(signal_data),
                         _now_utc(),
@@ -7978,39 +8097,29 @@ def close_bot_trade(
         result["signal_data"] = signal_data
         net_pnl = adjusted
 
-    # Atomically credit the owning bot's realized_pnl from this close so a crash
-    # between the trade-close and the runner's in-memory accumulation can't drop
-    # the P&L. Startup also rebuilds realized from the ledger (reconcile_bot_realized_pnl),
-    # so this and orphan-reconcile closes stay consistent with the trade list.
-    bot_realized = _bump_bot_realized_pnl_for_trade(trade_id, net_pnl)
+    # Rebuild the bot's realized_pnl from the closed-trade ledger. The close
+    # choke-point (close_trade_record) already reconciled with the GROSS P&L;
+    # the fee adjustment above changed this trade's pnl_usd, so reconcile again
+    # to land on the net. Ledger-derived (not incremental) so replays, crashes,
+    # and out-of-band closes can never double-count or drop P&L.
+    bot_realized = _reconcile_bot_realized_pnl_for_trade(trade_id)
     if bot_realized is not None:
         result["bot_realized_pnl"] = bot_realized
     return result
 
 
-def _bump_bot_realized_pnl_for_trade(trade_id: str, net_pnl: float) -> float | None:
-    """Credit a bot's realized_pnl by a just-closed trade's net P&L, deriving the
-    bot_id from the trade's source ('bot:{id}'). Returns the new realized_pnl, or
-    None when the trade is not a Bot Factory trade (no bot to credit)."""
+def _reconcile_bot_realized_pnl_for_trade(trade_id: str) -> float | None:
+    """Rebuild the owning bot's realized_pnl from the ledger, deriving the
+    bot_id from the trade's source ('bot:{id}'). Returns the new realized_pnl,
+    or None when the trade is not a Bot Factory trade (no bot to credit)."""
     with get_db() as conn:
         row = conn.execute(
             "SELECT source FROM trades WHERE id = ?", (trade_id,)
         ).fetchone()
-        src = str((row["source"] if row else "") or "")
-        if not src.startswith("bot:"):
-            return None
-        bot_id = src.split(":", 1)[1]
-        cur = conn.execute(
-            "SELECT realized_pnl FROM bot_status WHERE bot_id = ?", (bot_id,)
-        ).fetchone()
-        if not cur:
-            return None
-        new_val = float(cur["realized_pnl"] or 0.0) + float(net_pnl or 0.0)
-        conn.execute(
-            "UPDATE bot_status SET realized_pnl = ? WHERE bot_id = ?",
-            (new_val, bot_id),
-        )
-        return new_val
+    src = str((row["source"] if row else "") or "")
+    if not src.startswith("bot:"):
+        return None
+    return reconcile_bot_realized_pnl(src.split(":", 1)[1])
 
 
 def accrue_bot_funding(bot_id: str, funding_delta: float) -> float | None:
@@ -8087,7 +8196,8 @@ def get_open_bot_positions(bot_id: str) -> list[dict]:
     with get_db() as conn:
         rows = conn.execute(
             """SELECT id, asset, symbol, direction, size, entry_price,
-                      fill_entry_price, signal_entry_price, signal_data, opened_at
+                      fill_entry_price, signal_entry_price, signal_data, opened_at,
+                      execution_type
                  FROM trades
                 WHERE source = ? AND status = 'OPEN'
              ORDER BY opened_at ASC""",
@@ -8106,19 +8216,25 @@ def get_open_bot_positions(bot_id: str) -> list[dict]:
             entry = d.get("fill_entry_price") or d.get("entry_price") or d.get("signal_entry_price") or 0
             positions.append({
                 "trade_id": d["id"],
-                "ticker": d.get("asset") or d.get("symbol"),
+                # Live rows store the exchange coin in `asset` ("BTC") and keep
+                # the bot's market-data pair ("BTC/USDT") in signal_data.pair —
+                # the runner keys its snapshot/decisions by pair, so prefer it.
+                "ticker": sig.get("pair") or d.get("asset") or d.get("symbol"),
+                "asset": d.get("asset"),
                 "direction": d.get("direction") or "long",
                 "qty": d.get("size") or 0,
                 "entry_price": entry,
                 # No live mark is persisted in the DB (the runner marks to market
                 # in-process), so expose None rather than echoing entry as a
                 # fake-flat "current" price. The runner handles None safely and
-                # refreshes on its next tick; the UI shows "—" until a live mark.
+                # refreshes on its next tick; the API layer attaches the daemon's
+                # mark snapshot before serving to the UI.
                 "current_price": None,
                 "stop_loss_price": sig.get("stop_loss_price"),
                 "take_profit_price": sig.get("take_profit_price"),
                 "entry_fee_usd": float(sig.get("entry_fee_usd") or 0),
                 "opened_at": d.get("opened_at"),
+                "execution_type": str(d.get("execution_type") or "paper").lower(),
             })
         return positions
 
@@ -8189,6 +8305,11 @@ def reconcile_orphaned_bot_trades(
     the last recorded entry price (zero-P&L) with close_reason='orphan'
     so the trade no longer lingers as phantom exposure in the UI.
 
+    PAPER rows only: a LIVE bot trade mirrors a REAL exchange position, and
+    ghost-closing it locally would strand that position untracked (and
+    fabricate a zero-P&L close). Live bot rows are the exchange reconciler's
+    job, exactly like strategy live trades.
+
     Returns a list of {trade_id, bot_id, ticker, action} dicts. When
     `dry_run=True`, returns what *would* close without modifying anything.
     """
@@ -8196,7 +8317,7 @@ def reconcile_orphaned_bot_trades(
     with get_db() as conn:
         rows = conn.execute(
             """SELECT id, source, asset, symbol, entry_price, fill_entry_price,
-                      signal_entry_price, size, direction
+                      signal_entry_price, size, direction, execution_type
                  FROM trades
                 WHERE status = 'OPEN' AND source LIKE 'bot:%'"""
         ).fetchall()
@@ -8206,6 +8327,8 @@ def reconcile_orphaned_bot_trades(
             src = row["source"] or ""
             if not src.startswith("bot:"):
                 continue
+            if str(row["execution_type"] or "").strip().lower() == "live":
+                continue  # real exchange position — reconciler-owned, never ghost-close
             bot_id = src.split(":", 1)[1]
             if bot_id in active:
                 continue
@@ -8248,14 +8371,16 @@ def reconcile_orphaned_bot_trades(
 
 
 def close_open_bot_trades(bot_id: str, reason: str = "bot_deleted") -> list[str]:
-    """Close every OPEN paper trade for a single bot at its entry price (≈0 gross
+    """Close every OPEN PAPER trade for a single bot at its entry price (≈0 gross
     P&L, minus fees). Used on delete so the bot's positions don't linger as
-    phantom exposure once its config — and attribution — is gone."""
+    phantom exposure once its config — and attribution — is gone. Live rows are
+    excluded — the delete path refuses to run while real positions are open."""
     source = f"bot:{bot_id}"
     with get_db() as conn:
         rows = conn.execute(
             "SELECT id, fill_entry_price, entry_price, signal_entry_price "
-            "FROM trades WHERE source = ? AND status = 'OPEN'",
+            "FROM trades WHERE source = ? AND status = 'OPEN' "
+            "AND LOWER(COALESCE(execution_type, 'paper')) != 'live'",
             (source,),
         ).fetchall()
         targets = [

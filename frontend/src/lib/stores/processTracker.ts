@@ -30,7 +30,7 @@ export interface TrackedProcess {
 export interface ToastItem {
 	id: string;
 	message: string;
-	type: 'success' | 'error' | 'info';
+	type: 'success' | 'error' | 'warning' | 'info';
 	href?: string;
 	duration: number;
 }

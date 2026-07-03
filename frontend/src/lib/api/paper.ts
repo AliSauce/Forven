@@ -139,7 +139,7 @@ export interface PaperTradingSession {
 	account_value?: number | null;
 	account_withdrawable?: number | null;
 	account_margin_used?: number | null;
-	balance_source?: 'exchange' | 'books_aggregate' | 'simulated' | 'unavailable' | string | null;
+	balance_source?: 'exchange' | 'books_only' | 'books_aggregate' | 'simulated' | 'unavailable' | string | null;
 	account_network?: string | null;
 	account_synced_at?: string | null;
 	total_pnl: number;

@@ -7,6 +7,11 @@ class ApprovalDecisionBody(BaseModel):
     actor: str | None = None
     feedback: str | None = None
     reason: str | None = None
+    # GO-LIVE-1: approving a paper→live_graduated promotion requires the typed
+    # confirmation phrase ("GO LIVE") and an initial per-asset notional ceiling
+    # in USD (enforced per live order by forven.exchange.risk).
+    confirm: str | None = Field(default=None, max_length=32)
+    live_notional_ceiling_usd: float | None = Field(default=None, gt=0)
 
 
 class ApprovalHandoffBody(BaseModel):

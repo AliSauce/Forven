@@ -969,6 +969,8 @@ export interface WalkForwardRobustnessResult {
 	degradation: number;
 	robust: boolean;
 	verdict: string;
+	verdict_reasons?: string[];
+	verdict_thresholds?: { max_degradation?: number; min_oos_sharpe?: number; min_folds?: number };
 	method?: string;
 	job_id?: string;
 	persisted_result_id?: string;
@@ -986,6 +988,8 @@ export interface MonteCarloRobustnessResult {
 	prob_profitable: number;
 	prob_loss_gt_10: number;
 	verdict: string;
+	verdict_reasons?: string[];
+	verdict_thresholds?: { min_prob_profitable?: number; max_dd_p95?: number };
 	equity_paths: number[][];
 	return_histogram: RobustnessHistogram;
 	drawdown_histogram: RobustnessHistogram;
@@ -1043,6 +1047,13 @@ export interface RegimeSplitEntry {
 	name: string;
 	trade_count: number;
 	win_rate: number;
+	// Return-space stats — the verdict is computed from these (position-size-invariant).
+	avg_return_pct?: number;
+	total_return_pct?: number;
+	best_return_pct?: number;
+	worst_return_pct?: number;
+	// Dollar-PnL stats — display-only; synthesized from returns when the baseline
+	// trades lack real PnL, so never use these to judge the verdict.
 	avg_pnl: number;
 	total_pnl: number;
 	best_trade: number;
@@ -1052,10 +1063,15 @@ export interface RegimeSplitEntry {
 export interface RegimeSplitRobustnessResult {
 	n_trades: number;
 	n_regimes: number;
+	n_regimes_observed?: number;
 	regimes: RegimeSplitEntry[];
 	dominant_regime: string;
 	weakest_regime: string;
 	verdict: string;
+	verdict_reasons?: string[];
+	profitable_regime_share?: number;
+	regime_min_trades?: number;
+	dropped_low_trade_regimes?: string[];
 	method?: string;
 	n_classified_trades?: number;
 	unresolved_trades?: number;
@@ -1676,6 +1692,7 @@ export interface AiDropzoneSession {
 	metadata: Record<string, unknown>;
 	started_at: string;
 	ended_at?: string | null;
+	last_activity_at?: string | null;
 	strategy_count?: number;
 	run_count?: number;
 }

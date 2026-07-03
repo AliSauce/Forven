@@ -371,6 +371,46 @@ def _binance_symbol(coin: str) -> str:
     return f"{base}/USDT"
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Perp-canonical market resolution (data-manager overhaul Phase 1).
+# Execution is HL PERPS and deep history (Binance Vision) is USD-M FUTURES, so
+# the canonical candle/price series for a crypto asset is the Binance USD-M
+# perp — not spot. Spot remains the automatic fallback for bases with no
+# listed perp, so spot-only alts keep working.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_PERP_MARKETS_CACHE: dict[str, object] = {"loaded_at": 0.0, "symbols": frozenset()}
+_PERP_MARKETS_TTL_SECONDS = 3600.0
+
+
+def _perp_symbols() -> frozenset:
+    """Unified symbols of listed Binance USD-M linear perps (cached ~1h)."""
+    now = time.time()
+    if now - float(_PERP_MARKETS_CACHE["loaded_at"]) < _PERP_MARKETS_TTL_SECONDS:
+        return _PERP_MARKETS_CACHE["symbols"]
+    try:
+        markets = _binance_futures_exchange().load_markets()
+        symbols = frozenset(
+            sym for sym, m in markets.items()
+            if isinstance(m, dict) and m.get("swap") and m.get("linear") and m.get("active", True)
+        )
+        _PERP_MARKETS_CACHE["symbols"] = symbols
+        _PERP_MARKETS_CACHE["loaded_at"] = now
+    except Exception as exc:
+        log.warning("Could not load Binance USD-M markets (perp resolution degraded to spot): %s", exc)
+    return _PERP_MARKETS_CACHE["symbols"]
+
+
+def resolve_binance_market(coin: str) -> tuple[object, str, str]:
+    """(exchange, ccxt_symbol, market) for a coin: the USD-M perp when listed
+    ("BTC/USDT:USDT" on the futures client), else the spot pair."""
+    spot_pair = _binance_symbol(coin)
+    perp_symbol = f"{spot_pair}:USDT"
+    if perp_symbol in _perp_symbols():
+        return _binance_futures_exchange(), perp_symbol, "perp"
+    return _binance_exchange(), spot_pair, "spot"
+
+
 def fetch_binance_candles(
     coin: str,
     *,
@@ -398,8 +438,10 @@ def fetch_binance_candles(
         raise ValueError(f"unsupported interval: {interval}")
 
     requested_bars = max(int(bars), 1)
-    symbol = _binance_symbol(normalized_coin)
-    exchange = _binance_exchange()
+    # Perp-canonical (Phase 1): the USD-M perp series when listed — matching
+    # the HL-perp execution venue and the Binance Vision futures history —
+    # with automatic spot fallback for bases without a perp.
+    exchange, symbol, _market = resolve_binance_market(normalized_coin)
     end_ms = int(end_time) if end_time else int(time.time() * 1000)
     start_ms = end_ms - (requested_bars + 1) * interval_ms
 
@@ -453,32 +495,35 @@ def fetch_binance_prices(coins) -> dict[str, float]:
     tokens = [str(c).strip().upper() for c in (coins or []) if c]
     if not tokens:
         return {}
-    exchange = _binance_exchange()
-    sym_to_coin: dict[str, str] = {}
-    for token in tokens:
-        sym = _binance_symbol(token)
-        from forven.symbol_mapping import _extract_crypto_base
+    from forven.symbol_mapping import _extract_crypto_base
 
-        sym_to_coin[sym] = _extract_crypto_base(token) or token
+    # Perp-canonical (Phase 1): mark paper positions at the USD-M perp price
+    # (the venue semantics we execute on via HL perps), spot fallback per coin.
+    by_exchange: dict[int, tuple[object, dict[str, str]]] = {}
+    for token in tokens:
+        exchange, sym, _market = resolve_binance_market(token)
+        bucket = by_exchange.setdefault(id(exchange), (exchange, {}))
+        bucket[1][sym] = _extract_crypto_base(token) or token
     out: dict[str, float] = {}
-    try:
-        tickers = exchange.fetch_tickers(list(sym_to_coin.keys()))
-        for sym, ticker in (tickers or {}).items():
-            coin = sym_to_coin.get(sym)
-            last = ticker.get("last") if isinstance(ticker, dict) else None
-            if last is None and isinstance(ticker, dict):
-                last = ticker.get("close")
-            if coin and last is not None:
-                out[coin] = float(last)
-    except Exception:
-        for sym, coin in sym_to_coin.items():
-            try:
-                ticker = exchange.fetch_ticker(sym)
-                last = ticker.get("last") or ticker.get("close")
-                if last is not None:
+    for exchange, sym_to_coin in by_exchange.values():
+        try:
+            tickers = exchange.fetch_tickers(list(sym_to_coin.keys()))
+            for sym, ticker in (tickers or {}).items():
+                coin = sym_to_coin.get(sym)
+                last = ticker.get("last") if isinstance(ticker, dict) else None
+                if last is None and isinstance(ticker, dict):
+                    last = ticker.get("close")
+                if coin and last is not None:
                     out[coin] = float(last)
-            except Exception:
-                continue
+        except Exception:
+            for sym, coin in sym_to_coin.items():
+                try:
+                    ticker = exchange.fetch_ticker(sym)
+                    last = ticker.get("last") or ticker.get("close")
+                    if last is not None:
+                        out[coin] = float(last)
+                except Exception:
+                    continue
     return out
 
 

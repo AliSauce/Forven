@@ -1229,16 +1229,6 @@ def _load_recent_execution_metrics(
     return compute_live_metrics(pnls)
 
 
-def run_ideation_step():
-    """Compatibility wrapper for the retired broad ideation cycle."""
-    from forven.crucible_planner import run_crucible_planner_cycle
-
-    log.info("Evolution: routing ideation step through crucible planner")
-    result = run_crucible_planner_cycle(limit=3)
-    log_activity("info", "evolution", f"Ideation step: delegated to crucible planner: {result}")
-    return result
-
-
 def _run_backtest_validation_sync(
     strategy_id: str,
     strategy_type: str,
@@ -1825,6 +1815,27 @@ def _run_testing_step_impl(code_first: bool = True) -> dict:
 
         strat_id = candidate["id"]
         stage_name = _strategy_stage(candidate)
+
+        # V3-workflow-managed strategies are OFF LIMITS here. The workflow runs the
+        # full sweep-before-gate sequence (optimization -> confirmation -> re-validated
+        # WFA/MC/jitter -> paper_promotion_gate) and performs its own stage
+        # transitions; the fast-path/readiness promotion below judges whatever
+        # PRE-optimization evidence happens to exist, and a premature promotion then
+        # CANCELS the in-flight workflow via cancel_param_locked_workflows (S05427:
+        # promoted to paper off a boundary WFA while param_jitter was mid-run, real
+        # gauntlet never finished). Defer until the workflow reaches a terminal state.
+        try:
+            from forven.gauntlet.store import has_active_workflow_for_strategy
+
+            if has_active_workflow_for_strategy(strat_id):
+                deferred_ids = list(outcome.get("workflow_deferred_ids") or [])
+                deferred_ids.append(strat_id)
+                outcome["workflow_deferred_ids"] = deferred_ids
+                log.debug("Evolution: %s deferred to active gauntlet workflow", strat_id)
+                continue
+        except Exception as exc:
+            log.warning("Evolution: workflow-deferral check failed for %s: %s", strat_id, exc)
+
         strat_type = candidate.get("type", "")
         params = candidate.get("params", {})
         if isinstance(params, str):
@@ -2182,8 +2193,7 @@ def _run_testing_step_impl(code_first: bool = True) -> dict:
             f"   Use run_backtest with strategy_type={strat_type} and pick the best symbol/timeframe context by robustness + fitness.\n"
             f"2. If baseline Sharpe > 0.5, you MUST run Walk-Forward Analysis (WFA) via the `optimize_strategy` tool.\n"
             "3. If WFA passes without severe degradation, you MUST run the full robustness gauntlet and persist the actual artifacts for walk_forward, monte_carlo, param_jitter, cost_stress, and regime_split. Do not treat synthetic verdict summaries as promotion evidence.\n"
-            "4. Record all baseline results and robustness artifacts in ChromaDB via store_chroma.\n"
-            "5. Summarize: PASS (promote to paper) or FAIL (archive).\n\n"
+            "4. Summarize: PASS (promote to paper) or FAIL (archive).\n\n"
             f"Quick Screen floor: Return >= {min_return_pct}%, Sharpe >= {min_sharpe}, MaxDD <= {max_dd_pct}%.\n"
             f"Gauntlet floor: Composite robustness >= {min_robustness}/100 plus persisted robustness artifacts for every required test."
         )
@@ -2361,16 +2371,6 @@ def _check_gauntlet_overflow_alert():
         # Clear alert when under threshold
         if kv_get(alert_key):
             kv_set(alert_key, None)
-
-
-def run_coding_step():
-    """Compatibility wrapper for the retired broad coding cycle."""
-    from forven.crucible_planner import run_crucible_planner_cycle
-
-    log.info("Evolution: routing coding step through crucible planner")
-    result = run_crucible_planner_cycle(limit=3)
-    log_activity("info", "evolution", f"Coding step: delegated to crucible planner: {result}")
-    return result
 
 
 def check_paper_graduation():
@@ -2648,11 +2648,11 @@ def run_weekly_review():
                 description=(
                     f"WEEKLY REVIEW — Post-mortem analysis for retired strategies: {', '.join(retired)}\n\n"
                     "For each retired strategy:\n"
-                    "1. Use search_chroma to review its backtest history\n"
+                    "1. Use forven_get_results to review its backtest history\n"
                     "2. Identify why it failed (regime change? parameter drift? fundamental flaw?)\n"
                     "3. Extract lessons learned\n"
-                    "4. Store post-mortem in ChromaDB via store_chroma (trade_post_mortems collection)\n"
-                    "5. Store key insights in narrative memory via store_memory\n\n"
+                    "4. write_file the post-mortem under post_mortems/ in the workspace\n"
+                    "5. Append key insights to LESSONS.md\n\n"
                     "These lessons should inform future ideation cycles."
                 ),
                 strategy_id=retired[0],

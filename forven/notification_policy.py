@@ -15,6 +15,7 @@ DEFAULT_NOTIFICATION_PREFERENCES: dict[str, Any] = {
     "trade_opened_to_discord": True,
     "trade_closed_to_discord": True,
     "trade_failed_to_discord": True,
+    "trade_blocked_to_discord": True,
     "agent_completion_to_discord": False,
     "agent_failure_to_discord": True,
     "pipeline_transition_to_discord": False,
@@ -113,6 +114,26 @@ def resolve_notification_policy(
             channel_name=channel_name or "alerts",
             send_to_discord=bool(prefs.get("trade_failed_to_discord", True)),
             cooldown_seconds=300,
+        )
+    elif event_type == "equity_anomaly":
+        # A persistently-implausible live equity reading (fail-closed rejects).
+        # One alert per hour while it persists; gated by the risk alerts pref.
+        policy.update(
+            delivery_mode="discord_immediate",
+            channel_name=channel_name or "risk",
+            send_to_discord=bool(prefs.get("risk_critical_to_discord", True)),
+            cooldown_seconds=3600,
+        )
+    elif event_type == "trade_blocked":
+        # A LIVE open refused by a risk gate (hard caps, portfolio budget,
+        # go-live ceiling, fail-closed equity). The scan re-attempts while the
+        # signal stays active, so the cooldown is 1h per dedupe key — one alert
+        # per strategy per cause, not one per 5-minute scan.
+        policy.update(
+            delivery_mode="discord_immediate",
+            channel_name=channel_name or "alerts",
+            send_to_discord=bool(prefs.get("trade_blocked_to_discord", True)),
+            cooldown_seconds=3600,
         )
     elif event_type == "agent_task_completed":
         send_to_discord = bool(prefs.get("agent_completion_to_discord", False)) or bool(

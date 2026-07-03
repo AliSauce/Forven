@@ -31,6 +31,7 @@ const lifecycleMocks = vi.hoisted(() => ({
 	getPaperLiveReadiness: vi.fn(),
 	getPipelineConfig: vi.fn(),
 	getPromotionReadiness: vi.fn(),
+	getStrategyExecutionGrowth: vi.fn(),
 	runTimeframeSweep: vi.fn(),
 }));
 
@@ -87,6 +88,12 @@ vi.mock('$app/stores', () => ({
 		},
 	},
 }));
+// lightweight-charts needs a real canvas 2D context, which jsdom lacks — stub the
+// chart component so Overview cards that render it (e.g. Strategy Growth) mount.
+vi.mock('$lib/components/EquityChart.svelte', async () => {
+	const module = await import('./stubs/EquityChartStub.svelte');
+	return { default: module.default };
+});
 
 import StrategyDetailPage from '../routes/lab/strategy/[id]/+page.svelte';
 
@@ -465,28 +472,32 @@ function clickByTestId(target: HTMLDivElement, testId: string): void {
 }
 
 async function openBacktestHistory(target: HTMLDivElement): Promise<void> {
-	await waitForCondition(() =>
-		Array.from(target.querySelectorAll('button')).some((candidate) =>
-			(candidate.textContent ?? '').includes('Gauntlet History'),
-		),
-	);
-	clickButtonByText(target, 'Gauntlet History');
+	await waitForCondition(() => target.querySelector('[data-testid="strategy-tab-backtests"]') !== null);
+	clickByTestId(target, 'strategy-tab-backtests');
 	await waitForCondition(() => target.querySelector('[data-testid^="backtest-row-"]') !== null);
 }
 
-async function openRobustnessTab(target: HTMLDivElement): Promise<void> {
-	await waitForCondition(() =>
-		Array.from(target.querySelectorAll('button')).some((candidate) =>
-			(candidate.textContent ?? '').includes('Robustness'),
-		),
-	);
-	clickButtonByText(target, 'Robustness');
+async function openOptimizationTab(target: HTMLDivElement): Promise<void> {
+	await waitForCondition(() => target.querySelector('[data-testid="strategy-tab-optimizations"]') !== null);
+	clickByTestId(target, 'strategy-tab-optimizations');
 	await waitForCondition(() => target.textContent?.includes('Run Optimization') ?? false);
 }
 
+async function openRobustnessTab(target: HTMLDivElement): Promise<void> {
+	await waitForCondition(() => target.querySelector('[data-testid="strategy-tab-robustness"]') !== null);
+	clickByTestId(target, 'strategy-tab-robustness');
+	await waitForCondition(() => target.textContent?.includes('Robustness Runners') ?? false);
+}
+
 async function openOptimizationHistory(target: HTMLDivElement): Promise<void> {
-	await openRobustnessTab(target);
+	await openOptimizationTab(target);
 	await waitForCondition(() => target.querySelector('[data-testid^="optimization-row-"]') !== null);
+}
+
+async function openGauntletParamsPanel(target: HTMLDivElement): Promise<void> {
+	await waitForCondition(() => target.querySelector('[data-testid="strategy-tab-backtests"]') !== null);
+	clickByTestId(target, 'strategy-tab-backtests');
+	await waitForCondition(() => target.textContent?.includes('Gauntlet Parameters') ?? false);
 }
 
 async function waitForAddParamMetadata(target: HTMLDivElement): Promise<void> {
@@ -537,6 +548,7 @@ describe('/lab/strategy/[id] backtest history', () => {
 		lifecycleMocks.getPaperLiveReadiness.mockReset();
 		lifecycleMocks.getPipelineConfig.mockReset();
 		lifecycleMocks.getPromotionReadiness.mockReset();
+		lifecycleMocks.getStrategyExecutionGrowth.mockReset();
 		lifecycleMocks.runTimeframeSweep.mockReset();
 		lifecycleMocks.getGauntletStatus.mockResolvedValue(gauntletStatus);
 		lifecycleMocks.getPipelineConfig.mockResolvedValue(pipelineThresholds);
@@ -840,7 +852,7 @@ describe('/lab/strategy/[id] backtest history', () => {
 		);
 
 		app = mount(StrategyDetailPage, { target });
-		await openRobustnessTab(target);
+		await openOptimizationTab(target);
 
 		expect(target.querySelector('[data-testid="optimization-params-panel"]')).not.toBeNull();
 		expect(target.querySelector('[data-testid="opt-param-select-fast"]')).not.toBeNull();
@@ -862,7 +874,7 @@ describe('/lab/strategy/[id] backtest history', () => {
 		);
 
 		app = mount(StrategyDetailPage, { target });
-		await openRobustnessTab(target);
+		await openOptimizationTab(target);
 
 		const panel = () => target.querySelector('[data-testid="optimization-params-panel"]') as HTMLElement | null;
 		const selectAll = () => target.querySelector('[data-testid="opt-param-select-all"]') as HTMLInputElement | null;
@@ -922,7 +934,7 @@ describe('/lab/strategy/[id] backtest history', () => {
 		apiMocks.submitOptimization.mockResolvedValue({ job_id: 'OPT-JOB-1', status: 'succeeded' });
 
 		app = mount(StrategyDetailPage, { target });
-		await openRobustnessTab(target);
+		await openOptimizationTab(target);
 
 		setSelectValue(target.querySelector<HTMLSelectElement>('#container-opt-timeframe'), '4h');
 		setInputValue(target.querySelector<HTMLInputElement>('#container-opt-start'), '2025-01-15');
@@ -997,7 +1009,7 @@ describe('/lab/strategy/[id] backtest history', () => {
 		apiMocks.submitOptimization.mockResolvedValue({ job_id: 'OPT-JOB-LEGACY-LEV', status: 'succeeded' });
 
 		app = mount(StrategyDetailPage, { target });
-		await openRobustnessTab(target);
+		await openOptimizationTab(target);
 
 		clickByTestId(target, 'opt-param-select-fast');
 		setInputValue(target.querySelector<HTMLInputElement>('[data-testid="opt-param-min-fast"]'), '10');
@@ -1035,7 +1047,7 @@ describe('/lab/strategy/[id] backtest history', () => {
 		);
 
 		app = mount(StrategyDetailPage, { target });
-		await openRobustnessTab(target);
+		await openOptimizationTab(target);
 
 		await waitForCondition(() => target.querySelector('[data-testid="opt-exec-select-leverage"]') !== null);
 		clickByTestId(target, 'opt-exec-select-leverage');
@@ -1063,7 +1075,7 @@ describe('/lab/strategy/[id] backtest history', () => {
 		);
 
 		app = mount(StrategyDetailPage, { target });
-		await openRobustnessTab(target);
+		await openOptimizationTab(target);
 
 		clickByTestId(target, 'opt-param-select-fast');
 		setInputValue(target.querySelector<HTMLInputElement>('[data-testid="opt-param-min-fast"]'), '20');
@@ -1266,15 +1278,15 @@ describe('/lab/strategy/[id] backtest history', () => {
 		const leverageChip = activeChips.find((chip) => chip.textContent?.includes('leverage=2'));
 		const profileChip = activeChips.find((chip) => chip.textContent?.includes('execution_profile'));
 		expect(leverageChip).toBeTruthy();
-		expect(leverageChip?.getAttribute('class') ?? '').not.toContain('amber');
-		expect(profileChip?.getAttribute('class') ?? '').not.toContain('amber');
+		expect(leverageChip?.getAttribute('class') ?? '').not.toContain('yellow');
+		expect(profileChip?.getAttribute('class') ?? '').not.toContain('yellow');
 
-		// A run whose leverage differs from the default still flags amber.
+		// A run whose leverage differs from the default still flags the changed highlight.
 		const otherChips = Array.from(
 			target.querySelectorAll('[data-testid="backtest-param-summary-B_OTHER"] span'),
 		);
 		const otherLeverage = otherChips.find((chip) => chip.textContent?.includes('leverage=5'));
-		expect(otherLeverage?.getAttribute('class') ?? '').toContain('amber');
+		expect(otherLeverage?.getAttribute('class') ?? '').toContain('yellow');
 	});
 
 	it('marks the Gauntlet Parameters card active (green) when no backtest run is pinned', async () => {
@@ -1291,9 +1303,9 @@ describe('/lab/strategy/[id] backtest history', () => {
 		expect(panel?.querySelector('summary')?.textContent).toContain('Active');
 	});
 
-	it('shows execution settings on the Default Parameters card (Configuration tab)', async () => {
-		// The Configuration tab is the default tab. Its Default Parameters card must now
-		// render the shared execution-settings form seeded from the saved execution_profile.
+	it('shows execution settings inside the Gauntlet Parameters panel', async () => {
+		// The Gauntlet Parameters panel must render the shared execution-settings form
+		// seeded from the saved execution_profile.
 		const container = buildContainer(['B1001'], {
 			params: {
 				fast: 12,
@@ -1303,7 +1315,8 @@ describe('/lab/strategy/[id] backtest history', () => {
 		apiMocks.getStrategyContainer.mockResolvedValue(container);
 
 		app = mount(StrategyDetailPage, { target });
-		await waitForCondition(() => target.textContent?.includes('Default Parameters') ?? false);
+		await openGauntletParamsPanel(target);
+		await waitForCondition(() => target.textContent?.includes('Gauntlet Parameters') ?? false);
 		await waitForCondition(() => target.textContent?.includes('Execution Settings') ?? false);
 
 		expect(target.textContent).toContain('Sizing Mode');
@@ -1329,10 +1342,8 @@ describe('/lab/strategy/[id] backtest history', () => {
 		app = mount(StrategyDetailPage, { target });
 		// Open the Gauntlet section (no history rows needed) and reach the params pane
 		// on its DEFAULT view — the exact state the user reported as stuck "Unsaved".
-		await waitForCondition(() =>
-			Array.from(target.querySelectorAll('button')).some((b) => (b.textContent ?? '').includes('Gauntlet History')),
-		);
-		clickButtonByText(target, 'Gauntlet History');
+		await waitForCondition(() => target.querySelector('[data-testid="strategy-tab-backtests"]') !== null);
+		clickByTestId(target, 'strategy-tab-backtests');
 		await waitForCondition(() => target.querySelector('[data-testid="backtest-params-save"]') !== null);
 
 		const save = target.querySelector('[data-testid="backtest-params-save"]') as HTMLButtonElement | null;
@@ -1438,6 +1449,7 @@ describe('/lab/strategy/[id] backtest history', () => {
 			);
 
 			app = mount(StrategyDetailPage, { target });
+			await openGauntletParamsPanel(target);
 			await waitForCondition(() => target.querySelector('[data-testid="add-param-select"]') !== null);
 			await waitForCondition(() => target.textContent?.includes('available from ETH-RSI_MOMENTUM-S7762062.') ?? false);
 
@@ -1458,6 +1470,7 @@ describe('/lab/strategy/[id] backtest history', () => {
 			);
 
 			app = mount(StrategyDetailPage, { target });
+			await openGauntletParamsPanel(target);
 			await waitForCondition(() => target.querySelector('[data-testid="add-param-select"]') !== null);
 			await waitForAddParamMetadata(target);
 
@@ -1480,6 +1493,7 @@ describe('/lab/strategy/[id] backtest history', () => {
 			);
 
 			app = mount(StrategyDetailPage, { target });
+			await openGauntletParamsPanel(target);
 			await waitForCondition(() => target.querySelector('[data-testid="add-param-select"]') !== null);
 			await waitForAddParamMetadata(target);
 
@@ -1511,6 +1525,7 @@ describe('/lab/strategy/[id] backtest history', () => {
 			});
 
 			app = mount(StrategyDetailPage, { target });
+			await openGauntletParamsPanel(target);
 			await waitForCondition(() => target.querySelector('[data-testid="add-param-select"]') !== null);
 			await waitForAddParamMetadata(target);
 
@@ -1544,6 +1559,7 @@ describe('/lab/strategy/[id] backtest history', () => {
 			);
 
 			app = mount(StrategyDetailPage, { target });
+			await openGauntletParamsPanel(target);
 			await waitForCondition(() => target.textContent?.includes('All supported params from') ?? false);
 
 			const addParamSelect = target.querySelector<HTMLSelectElement>('[data-testid="add-param-select"]');
@@ -1563,6 +1579,7 @@ describe('/lab/strategy/[id] backtest history', () => {
 			);
 
 			app = mount(StrategyDetailPage, { target });
+			await openGauntletParamsPanel(target);
 			await waitForCondition(() => target.querySelector('[data-testid="add-param-select"]') !== null);
 
 			const addParamSelect = target.querySelector<HTMLSelectElement>('[data-testid="add-param-select"]');
@@ -1585,9 +1602,10 @@ describe('/lab/strategy/[id] backtest history', () => {
 			);
 
 			app = mount(StrategyDetailPage, { target });
-			await waitForCondition(() => target.textContent?.includes('Default Parameters') ?? false);
+			await openGauntletParamsPanel(target);
+			await waitForCondition(() => target.textContent?.includes('Gauntlet Parameters') ?? false);
 
-			expect(target.textContent).toContain('Default Parameters');
+			expect(target.textContent).toContain('Gauntlet Parameters');
 			expect(target.textContent).not.toContain('Loading container...');
 			const addParamSelect = target.querySelector('[data-testid="add-param-select"]') as HTMLSelectElement | null;
 			expect(addParamSelect).not.toBeNull();
@@ -1621,7 +1639,8 @@ describe('/lab/strategy/[id] backtest history', () => {
 			});
 
 			app = mount(StrategyDetailPage, { target });
-			await waitForCondition(() => target.textContent?.includes('Default Parameters') ?? false);
+			await openGauntletParamsPanel(target);
+			await waitForCondition(() => target.textContent?.includes('Gauntlet Parameters') ?? false);
 
 			const fastInput = target.querySelector<HTMLInputElement>('input[type="number"]');
 			setInputValue(fastInput, '13');
@@ -1815,29 +1834,25 @@ describe('/lab/strategy/[id] backtest history', () => {
 		}, { pinnedBacktestId: 'B1001' });
 	});
 
-	it('opens a single robustness runner from gauntlet status tiles', async () => {
+	it('expands the selected robustness runner from gauntlet status tiles', async () => {
 		apiMocks.getStrategyContainer.mockResolvedValue(buildContainer(['B1001']));
 
 		app = mount(StrategyDetailPage, { target });
 		await openRobustnessTab(target);
-		clickButtonByText(target, 'Robustness Suite');
 		await waitForCondition(() => target.querySelector('[data-testid="gauntlet-test-monte_carlo"]') !== null);
 
+		// All five runner headers render as accordions; only the selected test starts expanded.
 		expect(target.textContent).toContain('Walk-Forward Analysis');
-		expect(target.textContent).not.toContain('Monte Carlo Simulation');
+		expect(target.textContent).toContain('Monte Carlo Simulation');
+		expect(target.querySelector('[data-testid="runner-body-walk_forward"]')).not.toBeNull();
+		expect(target.querySelector('[data-testid="runner-body-monte_carlo"]')).toBeNull();
+		expect(target.querySelector('[data-testid="runner-body-param_jitter"]')).toBeNull();
 
 		clickByTestId(target, 'gauntlet-test-monte_carlo');
-		await waitForCondition(() => target.textContent?.includes('Monte Carlo Simulation') ?? false);
-
-		expect(target.textContent).not.toContain('Walk-Forward Analysis');
-		expect(target.textContent).toContain('Monte Carlo Simulation');
-		expect(target.textContent).not.toContain('Parameter Jitter');
+		await waitForCondition(() => target.querySelector('[data-testid="runner-body-monte_carlo"]') !== null);
 
 		clickByTestId(target, 'gauntlet-test-parameter_jitter');
-		await waitForCondition(() => target.textContent?.includes('Parameter Jitter') ?? false);
-
-		expect(target.textContent).not.toContain('Monte Carlo Simulation');
-		expect(target.textContent).toContain('Parameter Jitter');
+		await waitForCondition(() => target.querySelector('[data-testid="runner-body-param_jitter"]') !== null);
 	});
 
 	it('marks the gauntlet status tile with the completed runner verdict', async () => {
@@ -1889,7 +1904,6 @@ describe('/lab/strategy/[id] backtest history', () => {
 
 		app = mount(StrategyDetailPage, { target });
 		await openRobustnessTab(target);
-		clickButtonByText(target, 'Robustness Suite');
 		await waitForCondition(() => target.querySelector('[data-testid="gauntlet-test-verdict-walk_forward"]') !== null);
 		expect(target.querySelector('[data-testid="gauntlet-test-verdict-walk_forward"]')?.textContent).toContain('OFF');
 
@@ -1900,6 +1914,275 @@ describe('/lab/strategy/[id] backtest history', () => {
 
 		expect(target.querySelector('[data-testid="gauntlet-test-verdict-walk_forward"]')?.textContent).toContain('FAIL');
 		expect(target.textContent).toContain('1 / 5 completed');
+	});
+
+	it('renders the strategy growth curve from closed execution trades on the Overview', async () => {
+		const container = buildContainer(['B1001']);
+		(container.execution as Record<string, unknown>).trades = [
+			{
+				id: 'T1',
+				asset: 'BTC',
+				direction: 'long',
+				status: 'CLOSED',
+				execution_type: 'paper_challenger',
+				entry_price: 100,
+				pnl: 120,
+				pnl_usd: 120,
+				pnl_pct: 1.2,
+				opened_at: '2026-03-01T00:00:00Z',
+				closed_at: '2026-03-02T00:00:00Z',
+			},
+			{
+				id: 'T2',
+				asset: 'BTC',
+				direction: 'short',
+				status: 'CLOSED',
+				execution_type: 'paper_challenger',
+				entry_price: 110,
+				pnl: -45,
+				pnl_usd: -45,
+				pnl_pct: -0.4,
+				opened_at: '2026-03-03T00:00:00Z',
+				closed_at: '2026-03-04T00:00:00Z',
+			},
+			{
+				id: 'T3',
+				asset: 'BTC',
+				direction: 'long',
+				status: 'OPEN',
+				execution_type: 'paper_challenger',
+				entry_price: 111,
+				pnl: null,
+				opened_at: '2026-03-05T00:00:00Z',
+				closed_at: null,
+			},
+		];
+		apiMocks.getStrategyContainer.mockResolvedValue(container);
+
+		app = mount(StrategyDetailPage, { target });
+		await waitForCondition(() => target.querySelector('[data-testid="overview-growth-card"]') !== null);
+
+		const card = target.querySelector('[data-testid="overview-growth-card"]');
+		// The open trade is excluded; total = +120 - 45 = +$75.00 across 2 closed trades.
+		expect(card?.textContent).toContain('2 closed trades');
+		expect(card?.textContent).toContain('+$75.00');
+		// All closed trades are paper -> the curve is the $10k paper book equity.
+		expect(card?.textContent).toContain('Paper book equity');
+		const chartStub = card?.querySelector('[data-testid="equity-chart-stub"]');
+		expect(chartStub).not.toBeNull();
+		// Anchor point at the earliest open + one point per closed trade.
+		expect(chartStub?.getAttribute('data-points')).toBe('3');
+		expect(chartStub?.getAttribute('data-drawdown')).toBe('yes');
+	});
+
+	it('shows the growth empty state when the strategy has no closed trades', async () => {
+		apiMocks.getStrategyContainer.mockResolvedValue(buildContainer(['B1001']));
+
+		app = mount(StrategyDetailPage, { target });
+		await waitForCondition(() => target.querySelector('[data-testid="overview-growth-card"]') !== null);
+
+		expect(target.querySelector('[data-testid="overview-growth-card"]')?.textContent).toContain(
+			'No closed paper/live trades yet',
+		);
+	});
+
+	it('prefers the uncapped execution-growth endpoint over the container trade slice', async () => {
+		apiMocks.getStrategyContainer.mockResolvedValue(buildContainer(['B1001']));
+		lifecycleMocks.getStrategyExecutionGrowth.mockResolvedValue({
+			ok: true,
+			strategy_id: 'S0001',
+			trades: [
+				{ closed_at: '2026-01-02T00:00:00Z', opened_at: '2026-01-01T00:00:00Z', pnl: 50, execution_type: 'paper_challenger' },
+				{ closed_at: '2026-01-04T00:00:00Z', opened_at: '2026-01-03T00:00:00Z', pnl: -20, execution_type: 'paper_challenger' },
+				{ closed_at: '2026-01-06T00:00:00Z', opened_at: '2026-01-05T00:00:00Z', pnl: 30, execution_type: 'paper_challenger' },
+			],
+		});
+
+		app = mount(StrategyDetailPage, { target });
+		await waitForCondition(() =>
+			target.querySelector('[data-testid="overview-growth-card"] [data-testid="equity-chart-stub"]') !== null,
+		);
+
+		const card = target.querySelector('[data-testid="overview-growth-card"]');
+		expect(card?.textContent).toContain('3 closed trades');
+		expect(card?.textContent).toContain('+$60.00');
+		// Anchor point + one point per closed trade from the endpoint series.
+		expect(card?.querySelector('[data-testid="equity-chart-stub"]')?.getAttribute('data-points')).toBe('4');
+	});
+
+	it('marks lifecycle events inside the growth window as chart annotations', async () => {
+		const container = buildContainer(['B1001']);
+		(container.execution as Record<string, unknown>).trades = [
+			{
+				id: 'T1', asset: 'BTC', direction: 'long', status: 'CLOSED', execution_type: 'paper_challenger',
+				pnl: 120, pnl_usd: 120, opened_at: '2026-03-01T00:00:00Z', closed_at: '2026-03-02T00:00:00Z',
+			},
+			{
+				id: 'T2', asset: 'BTC', direction: 'short', status: 'CLOSED', execution_type: 'paper_challenger',
+				pnl: -45, pnl_usd: -45, opened_at: '2026-03-03T00:00:00Z', closed_at: '2026-03-04T00:00:00Z',
+			},
+		];
+		(container.events as Record<string, unknown>[]) = [
+			{
+				id: 'E1', strategy_id: 'S0001', from_state: 'gauntlet', to_state: 'paper', actor: 'brain',
+				reason: null, idempotency_key: null, created_at: '2026-03-03T12:00:00Z',
+				owner_from: null, owner_to: null, details_json: null,
+			},
+		];
+		apiMocks.getStrategyContainer.mockResolvedValue(container);
+
+		app = mount(StrategyDetailPage, { target });
+		await waitForCondition(() =>
+			target.querySelector('[data-testid="overview-growth-card"] [data-testid="equity-chart-stub"]') !== null,
+		);
+
+		const chartStub = target.querySelector('[data-testid="overview-growth-card"] [data-testid="equity-chart-stub"]');
+		expect(chartStub?.getAttribute('data-annotations')).toBe('1');
+	});
+
+	it('shows the Backtest↔Reality parity card from recorded slippage and cost drag', async () => {
+		const container = buildContainer(['B1001']);
+		(container.execution as Record<string, unknown>).trades = [
+			{
+				id: 'T1', asset: 'BTC', direction: 'long', status: 'CLOSED', execution_type: 'paper_challenger',
+				pnl_usd: 100, pnl_pct: 0.052, net_pnl_pct: 0.05, leverage: 2,
+				entry_slippage_bps: 6, exit_slippage_bps: 2,
+				opened_at: '2026-03-01T00:00:00Z', closed_at: '2026-03-02T00:00:00Z',
+			},
+			{
+				id: 'T2', asset: 'BTC', direction: 'long', status: 'CLOSED', execution_type: 'paper_challenger',
+				pnl_usd: -40, pnl_pct: -0.02, net_pnl_pct: -0.022, leverage: 2,
+				entry_slippage_bps: 2, exit_slippage_bps: -1,
+				opened_at: '2026-03-03T00:00:00Z', closed_at: '2026-03-04T00:00:00Z',
+			},
+		];
+		apiMocks.getStrategyContainer.mockResolvedValue(container);
+
+		app = mount(StrategyDetailPage, { target });
+		await waitForCondition(() => target.querySelector('[data-testid="overview-parity-metrics"]') !== null);
+
+		const card = target.querySelector('[data-testid="overview-parity-card"]');
+		// Avg entry slippage (6+2)/2 = +4.0 bps, exit (2-1)/2 = +0.5 bps.
+		expect(card?.textContent).toContain('+4.0 bps');
+		expect(card?.textContent).toContain('+0.5 bps');
+		// Cost drag: ((0.052-0.05)+( -0.02 - -0.022))/2 = 0.002 → 0.200%.
+		expect(card?.textContent).toContain('0.200%');
+		expect(card?.textContent).toContain('avg leverage 2.0×');
+	});
+
+	it('marks stale gauntlet verdicts with a STALE badge and warning', async () => {
+		apiMocks.getStrategyContainer.mockResolvedValue(buildContainer(['B1001']));
+		lifecycleMocks.getGauntletStatus.mockResolvedValue({
+			...gauntletStatus,
+			tests: {
+				...gauntletStatus.tests,
+				walk_forward: { result_id: 'WF-1', status: 'passed', verdict: 'PASS', stale: true },
+			},
+		});
+
+		app = mount(StrategyDetailPage, { target });
+		await waitForCondition(() => target.querySelector('[data-testid="gauntlet-test-stale-walk_forward"]') !== null);
+
+		expect(target.querySelector('[data-testid="gauntlet-test-stale-walk_forward"]')?.textContent).toContain('Stale');
+		expect(target.querySelector('[data-testid="gauntlet-stale-warning"]')?.textContent).toContain('Params changed');
+	});
+
+	it('renders readiness progress bars from the numeric extra payload', async () => {
+		apiMocks.getStrategyContainer.mockResolvedValue(buildContainer(['B1001']));
+		lifecycleMocks.getPromotionReadiness.mockResolvedValue({
+			ready: false,
+			strategy_id: 'S0001',
+			steps: [
+				{
+					name: 'validation_artifacts',
+					status: 'failed',
+					detail: 'Insufficient paper trades: 6/10',
+					actionable: null,
+					extra: { current: 6, threshold: 10, direction: 'gte', unit: 'trades' },
+				},
+			],
+		});
+
+		app = mount(StrategyDetailPage, { target });
+		await waitForCondition(() =>
+			target.querySelector('[data-testid="readiness-progress-validation_artifacts"]') !== null,
+		);
+
+		const progress = target.querySelector('[data-testid="readiness-progress-validation_artifacts"]');
+		expect(progress?.textContent).toContain('6 trades');
+		expect(progress?.textContent).toContain('target 10 trades');
+	});
+
+	it('shows rich closed/open trade views and manual close on the Execution tab', async () => {
+		const container = buildContainer(['B1001']);
+		(container.strategy as Record<string, unknown>).paper_session_id = 'PS-1';
+		(container.execution as Record<string, unknown>).trades = [
+			{
+				id: 'T-CLOSED', asset: 'BTC', direction: 'long', status: 'CLOSED', execution_type: 'paper_challenger',
+				fill_entry_price: 100.5, fill_exit_price: 105.9,
+				pnl_usd: 120, pnl_pct: 0.0518, net_pnl_pct: 0.0512, fees_pct: 0.0018,
+				entry_slippage_bps: 4.2, exit_slippage_bps: -1.1,
+				signal_data: JSON.stringify({ close_reason: 'take_profit' }),
+				opened_at: '2026-03-01T00:00:00Z', closed_at: '2026-03-02T00:00:00Z',
+			},
+			{
+				id: 'T-OPEN', asset: 'BTC', direction: 'short', status: 'OPEN', execution_type: 'paper_challenger',
+				entry_price: 100, size: 0.5, leverage: 3,
+				signal_data: JSON.stringify({ stop_loss: 95.5, take_profit: 120.25 }),
+				opened_at: '2026-03-05T00:00:00Z', closed_at: null,
+			},
+		];
+		apiMocks.getStrategyContainer.mockResolvedValue(container);
+
+		app = mount(StrategyDetailPage, { target });
+		await waitForCondition(() => target.querySelector('[data-testid="strategy-tab-execution"]') !== null);
+		clickByTestId(target, 'strategy-tab-execution');
+		await waitForCondition(() => target.querySelector('[data-testid="execution-closed-trades"]') !== null);
+
+		// Summary strip aggregates the closed trade.
+		expect(target.querySelector('[data-testid="execution-summary-strip"]')?.textContent).toContain('+$120.00');
+		// Fraction fields are scaled to percent for display.
+		const closedTable = target.querySelector('[data-testid="execution-closed-trades"]');
+		expect(closedTable?.textContent).toContain('5.12%');
+		expect(closedTable?.textContent).toContain('0.180%');
+		expect(closedTable?.textContent).toContain('+4.2 bps');
+		expect(closedTable?.textContent).toContain('-1.1 bps');
+		expect(closedTable?.textContent).toContain('take profit');
+		// Open position shows the in-code stop/target from signal_data + close control.
+		const openTable = target.querySelector('[data-testid="execution-open-trades"]');
+		expect(openTable?.textContent).toContain('95.5000');
+		expect(openTable?.textContent).toContain('120.2500');
+		expect(target.querySelector('[data-testid="execution-close-position"]')).not.toBeNull();
+	});
+
+	it('compares two gauntlet runs with metric deltas and a param diff', async () => {
+		const container = buildContainer(['B1001', 'B1002']);
+		(container.history as Record<string, unknown>).backtests = [
+			buildHistoryItem('B1001', { metrics: { sharpe_ratio: 0.4 }, config: { params: { fast: 12, slow: 26, signal: 9 } } }),
+			buildHistoryItem('B1002', { metrics: { sharpe_ratio: 0.9 }, config: { params: { fast: 18, slow: 26, signal: 9 } } }),
+		];
+		apiMocks.getStrategyContainer.mockResolvedValue(container);
+		apiMocks.getResult.mockImplementation(async (resultId: string) => buildResult(resultId));
+		apiMocks.getResultChartContext.mockImplementation(async (resultId: string) => buildChartContext(resultId));
+
+		app = mount(StrategyDetailPage, { target });
+		await openBacktestHistory(target);
+
+		clickByTestId(target, 'compare-select-B1001');
+		await waitForCondition(() => target.querySelector('[data-testid="compare-hint"]') !== null);
+		clickByTestId(target, 'compare-select-B1002');
+		await waitForCondition(() => target.querySelector('[data-testid="run-compare-panel"]') !== null);
+
+		const panel = target.querySelector('[data-testid="run-compare-panel"]');
+		expect(panel?.textContent).toContain('A · B1001');
+		expect(panel?.textContent).toContain('B · B1002');
+		expect(target.querySelector('[data-testid="compare-metrics-table"]')).not.toBeNull();
+		// Param diff: only `fast` differs.
+		expect(panel?.textContent).toContain('1 changed');
+		const diff = target.querySelector('[data-testid="compare-param-diff"]');
+		expect(diff?.textContent).toContain('fast');
+		expect(diff?.textContent).toContain('12');
+		expect(diff?.textContent).toContain('18');
 	});
 
 	it('links back to the parent hypothesis when one is attached', async () => {

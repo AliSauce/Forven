@@ -516,7 +516,7 @@ def test_optimize_strategy_uses_explicit_parameter_ranges(monkeypatch):
         lambda **_kwargs: {"verdict": "PASS", "degradation": 0.1},
     )
     monkeypatch.setattr("forven.api_core.get_settings", lambda: {"backtest_duration_days": 365})
-    monkeypatch.setattr("forven.vectordb.store_backtest_result", lambda **_kwargs: None)
+    monkeypatch.setattr("forven.quant_skills_extractor.record_backtest_for_learning", lambda **_kwargs: None)
 
     result = optimize_strategy(
         strategy_id="S-explicit-space",
@@ -551,7 +551,7 @@ def test_optimize_strategy_normalizes_frontend_parameter_range_dicts(monkeypatch
         lambda **_kwargs: {"verdict": "PASS", "degradation": 0.1},
     )
     monkeypatch.setattr("forven.api_core.get_settings", lambda: {"backtest_duration_days": 365})
-    monkeypatch.setattr("forven.vectordb.store_backtest_result", lambda **_kwargs: None)
+    monkeypatch.setattr("forven.quant_skills_extractor.record_backtest_for_learning", lambda **_kwargs: None)
 
     result = optimize_strategy(
         strategy_id="S-explicit-dict-space",
@@ -602,7 +602,7 @@ def test_optimize_strategy_honors_execution_ranges_objective_window_and_base_par
     monkeypatch.setattr("forven.strategies.optimizer.grid_search", _fake_grid_search)
     monkeypatch.setattr("forven.strategies.optimizer.walk_forward", _fake_walk_forward)
     monkeypatch.setattr("forven.api_core.get_settings", lambda: {"backtest_duration_days": 365})
-    monkeypatch.setattr("forven.vectordb.store_backtest_result", lambda **_kwargs: None)
+    monkeypatch.setattr("forven.quant_skills_extractor.record_backtest_for_learning", lambda **_kwargs: None)
 
     result = optimize_strategy(
         strategy_id="S-execution-real",
@@ -779,7 +779,7 @@ def test_optimize_strategy_explicit_risk_axes_survive(monkeypatch):
         lambda **_kwargs: {"verdict": "PASS", "degradation": 0.1},
     )
     monkeypatch.setattr("forven.api_core.get_settings", lambda: {"backtest_duration_days": 365})
-    monkeypatch.setattr("forven.vectordb.store_backtest_result", lambda **_kwargs: None)
+    monkeypatch.setattr("forven.quant_skills_extractor.record_backtest_for_learning", lambda **_kwargs: None)
 
     result = optimize_strategy(
         strategy_id="S-explicit-risk-axes",

@@ -305,7 +305,7 @@ def test_post_backtesting_run_local_forwards_body_execution_controls(forven_db, 
     monkeypatch.setattr(bt_mod, "backtest_strategy", _fake_backtest_strategy)
     monkeypatch.setattr("forven.api_core._write_backtest_result_artifacts", lambda *args, **kwargs: None)
     monkeypatch.setattr("forven.api_core.auto_assign_best_symbol", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr("forven.vectordb.store_backtest_result", lambda **_kwargs: None)
+    monkeypatch.setattr("forven.quant_skills_extractor.record_backtest_for_learning", lambda **_kwargs: None)
 
     with patch("forven.api_core.kv_get", return_value={"remote_engine_enabled": False}):
         response = post_backtesting_run(
@@ -383,7 +383,7 @@ def test_post_backtesting_run_local_persists_result_rows_for_agent_flow(forven_d
 
     monkeypatch.setattr("forven.api_core._write_backtest_result_artifacts", lambda *args, **kwargs: None)
     monkeypatch.setattr("forven.api_core.auto_assign_best_symbol", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr("forven.vectordb.store_backtest_result", lambda **_kwargs: None)
+    monkeypatch.setattr("forven.quant_skills_extractor.record_backtest_for_learning", lambda **_kwargs: None)
 
     with patch("forven.api_core.kv_get", return_value={"remote_engine_enabled": False}), patch.dict(
         sys.modules,
@@ -494,7 +494,7 @@ def test_post_backtesting_run_local_sanitizes_nonfinite_metrics_for_json_respons
 
     monkeypatch.setattr("forven.api_core._write_backtest_result_artifacts", lambda *args, **kwargs: None)
     monkeypatch.setattr("forven.api_core.auto_assign_best_symbol", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr("forven.vectordb.store_backtest_result", lambda **_kwargs: None)
+    monkeypatch.setattr("forven.quant_skills_extractor.record_backtest_for_learning", lambda **_kwargs: None)
 
     with patch("forven.api_core.kv_get", return_value={"remote_engine_enabled": False}), patch.dict(
         sys.modules,

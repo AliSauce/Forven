@@ -1,8 +1,8 @@
 """Quant Skills — self-learning knowledge store for strategy development.
 
-Stores curated quant insights in agentskills.io-compatible SKILL.md format,
-backed by ChromaDB for semantic search.  Insights are extracted from backtest
-results and consumed by Brain ideation and external agents (Hermes).
+Stores curated quant insights in agentskills.io-compatible SKILL.md format
+on disk.  Insights are extracted from backtest results and consumed by Brain
+ideation and external agents (Hermes).
 
 Skill taxonomy:
   regime-{regime}-{indicator}   What works in a specific regime

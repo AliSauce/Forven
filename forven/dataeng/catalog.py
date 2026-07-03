@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import threading
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import timezone
 from pathlib import Path
@@ -53,14 +56,42 @@ class CoverageRow:
     row_count: int
 
 
+# DuckDB is SINGLE-WRITER per database file, and every Catalog method opens a
+# fresh connection — two concurrent operations (a UI /universe read racing the
+# catch-up's registry refresh, or the seed thread) collide with "file is being
+# used by another process", killing whichever came second. One process-wide
+# lock serializes in-process access; a short retry absorbs the rare
+# cross-process race (scripts touching the catalog while the backend runs).
+_catalog_io_lock = threading.Lock()
+_CATALOG_OPEN_RETRIES = 4
+_CATALOG_RETRY_SLEEP_SECONDS = 0.3
+
+
 class Catalog:
     def __init__(self, path: str | Path | None = None) -> None:
         self.path = Path(path) if path is not None else default_catalog_path()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
 
-    def connect(self) -> duckdb.DuckDBPyConnection:
-        return duckdb.connect(str(self.path))
+    @contextmanager
+    def connect(self):
+        with _catalog_io_lock:
+            last_exc: Exception | None = None
+            for attempt in range(_CATALOG_OPEN_RETRIES):
+                try:
+                    con = duckdb.connect(str(self.path))
+                    break
+                except Exception as exc:  # duckdb.IOException on file lock
+                    last_exc = exc
+                    if "being used by another process" not in str(exc) and "Could not set lock" not in str(exc):
+                        raise
+                    time.sleep(_CATALOG_RETRY_SLEEP_SECONDS * (attempt + 1))
+            else:
+                raise last_exc  # type: ignore[misc]
+            try:
+                yield con
+            finally:
+                con.close()
 
     def _initialize(self) -> None:
         with self.connect() as con:
@@ -144,6 +175,19 @@ class Catalog:
             )
             con.execute(
                 """
+                CREATE TABLE IF NOT EXISTS symbol_registry (
+                    symbol VARCHAR PRIMARY KEY,          -- filesystem form (BTC-USDT)
+                    market VARCHAR NOT NULL,             -- perp / spot
+                    status VARCHAR NOT NULL,             -- active / delisted
+                    inception_ts TIMESTAMPTZ,            -- venue onboard date / first bar
+                    delist_ts TIMESTAMPTZ,               -- last bar when no active market remains
+                    quote_volume_24h DOUBLE,             -- liquidity rank input
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+                """
+            )
+            con.execute(
+                """
                 INSERT OR REPLACE INTO meta (key, value)
                 VALUES ('schema_version', ?)
                 """,
@@ -201,17 +245,66 @@ class Catalog:
             self.upsert_series_coverage(row)
         return rows
 
+    def upsert_symbol_registry(
+        self,
+        symbol: str,
+        *,
+        market: str,
+        status: str,
+        inception_ts: str | None = None,
+        delist_ts: str | None = None,
+        quote_volume_24h: float | None = None,
+    ) -> None:
+        with self.connect() as con:
+            con.execute(
+                """
+                INSERT OR REPLACE INTO symbol_registry (
+                    symbol, market, status, inception_ts, delist_ts,
+                    quote_volume_24h, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, now())
+                """,
+                [symbol, market, status, inception_ts, delist_ts, quote_volume_24h],
+            )
+
+    def list_symbol_registry(self) -> list[dict[str, Any]]:
+        with self.connect() as con:
+            rows = con.execute(
+                """
+                SELECT symbol, market, status, inception_ts, delist_ts, quote_volume_24h
+                FROM symbol_registry
+                ORDER BY symbol
+                """
+            ).fetchall()
+        keys = ["symbol", "market", "status", "inception_ts", "delist_ts", "quote_volume_24h"]
+        result: list[dict[str, Any]] = []
+        for values in rows:
+            row = dict(zip(keys, values, strict=True))
+            row["inception_ts"] = _utc_iso(row["inception_ts"])
+            row["delist_ts"] = _utc_iso(row["delist_ts"])
+            row["quote_volume_24h"] = float(row["quote_volume_24h"]) if row["quote_volume_24h"] is not None else None
+            result.append(row)
+        return result
+
 
 def _read_parquet_bounds(path: Path) -> tuple[str | None, str | None, int]:
+    # Include the series' tail sidecar (recent appends live there until
+    # compaction). A cold-only end_ts would make the catch-up planner re-plan
+    # bars that are already stored — every cycle, forever — and mark healthy
+    # series as stalled when the re-fetch yields zero new rows.
+    paths = [str(path)]
+    tail = Path(str(path) + ".tail")
+    if tail.exists():
+        paths.append(str(tail))
     with duckdb.connect(":memory:") as con:
         row = con.execute(
             """
             SELECT min(timestamp) AS start_ts,
                    max(timestamp) AS end_ts,
-                   count(*) AS row_count
+                   count(DISTINCT timestamp) AS row_count
             FROM read_parquet(?)
             """,
-            [str(path)],
+            [paths],
         ).fetchone()
     if row is None:
         return None, None, 0

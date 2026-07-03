@@ -7,7 +7,6 @@ from datetime import datetime, timedelta, timezone
 from forven.db import get_db, init_db
 from forven.ai import call_ai
 from forven.workspace import append_workspace
-from forven.vectordb import store_hypothesis
 from forven.reporter import post_daily_summary
 
 log = logging.getLogger("forven.jobs.daily_learning")
@@ -76,10 +75,7 @@ async def run_daily_learning():
 
         # Post to Discord
         await post_daily_summary(summary)
-
-        # Store a chunk in ChromaDB representing today's structural takeaway
-        store_hypothesis(f"daily-eval-{now.strftime('%Y-%m-%d')}", summary, {"source": "daily_learning"})
-        log.info("Daily learning synthesis complete and persisted to memory.")
+        log.info("Daily learning synthesis complete and persisted to LESSONS.md.")
 
     except Exception as exc:
         log.error("Failed to execute daily learning job: %s", exc)

@@ -791,6 +791,30 @@ def _brain_response_text(response: object) -> str:
     return text
 
 
+def _record_brain_spend(provider: str, model: str | None, response: object) -> None:
+    """Persist Brain-cycle token usage into the daily spend rollup.
+
+    Worker agent tasks account every call in agent_tasks/agent_spend_daily, but
+    the Brain loop discarded its usage tuple — its (large, memory-heavy) context
+    cost was invisible everywhere. Best-effort, never the critical path.
+    """
+    usage = response[1] if isinstance(response, tuple) and len(response) > 1 else None
+    if not isinstance(usage, dict):
+        return
+    try:
+        from forven.cost_pricing import estimate_cost_usd
+        from forven.db import record_agent_spend
+
+        record_agent_spend(
+            "brain",
+            cost_usd=estimate_cost_usd(provider, model, usage),
+            input_tokens=usage.get("input_tokens", 0),
+            output_tokens=usage.get("output_tokens", 0),
+        )
+    except Exception:
+        log.debug("brain spend accounting skipped", exc_info=True)
+
+
 async def _run_agent_task(agent: dict, task: dict) -> dict:
     payload = _parse_agent_task_input_data(task)
     if _is_crucible_planner_backtest_task(agent, task, payload):
@@ -899,20 +923,13 @@ async def _run_brain_task(task: dict) -> None:
         finally:
             reset_tool_context(tool_tokens)
 
+        _record_brain_spend(provider, model, response)
         response_text = _brain_response_text(response)
         with get_db() as conn:
             conn.execute(
                 "UPDATE tasks SET status='done', completed_at=?, result=? WHERE id=?",
                 (datetime.now(timezone.utc).isoformat(), json.dumps({"response": response_text}), task["id"]),
             )
-
-        # Persist the exchange for long-term recall — best-effort, never blocks.
-        try:
-            from forven.context import store_conversation
-
-            await store_conversation(None, message, response_text, source="ui_chat")
-        except Exception:
-            log.debug("UI chat conversation store skipped", exc_info=True)
         return
 
     ui_context = str(payload.get("context") or "").strip()
@@ -983,9 +1000,37 @@ async def _run_brain_task(task: dict) -> None:
         AGENT_TOOLS + BRAIN_TOOLS + BACKTESTING_TOOLS, "brain", brain_tools_context
     )
 
+    # P1-T06 (wired to the LIVE path): record a brain_decisions row for every
+    # autonomous cycle. brain.invoke was the only writer before, but production
+    # runs THIS tool loop — so the decision ledger sat at 0 rows and the
+    # Decisions/Lessons UI was removed as "orphaned". assign_agent_task links
+    # any tasks it creates to this decision via the active-decision ContextVar;
+    # action_taken is filled in after the loop from the tool audit.
+    from forven.brain_decisions import (
+        record_decision,
+        reset_active_decision_id,
+        set_active_decision_id,
+        update_action_taken,
+    )
+
+    decision_id = 0
+    try:
+        decision_id = record_decision(
+            cycle_id=f"B{int(task['id']):04d}",
+            situation_summary=(
+                f"[{source or 'headless'}] {message[:500]}"
+                + (f" | reviewing {len(review_ids)} completed agent task(s)" if review_ids else "")
+                + (f" | {len(post_mortems)} pending post-mortem(s)" if post_mortems else "")
+            ),
+            decision_json={"source": source or "headless", "tools_context": brain_tools_context},
+        )
+    except Exception:
+        log.debug("brain_decisions: record_decision failed for task %s", task.get("id"), exc_info=True)
+
     tool_tokens = set_tool_context(
         "brain", f"B{int(task['id']):04d}", tools_context=brain_tools_context
     )
+    decision_token = set_active_decision_id(decision_id or None)
     brain_trace: list[dict] = []
     try:
         response = await _call_with_tools(
@@ -998,7 +1043,25 @@ async def _run_brain_task(task: dict) -> None:
             trace=brain_trace,
         )
     finally:
+        reset_active_decision_id(decision_token)
         reset_tool_context(tool_tokens)
+
+    _record_brain_spend(provider, model, response)
+
+    if decision_id:
+        try:
+            from forven.db import get_task_tool_calls
+
+            calls = get_task_tool_calls(f"B{int(task['id']):04d}")
+            update_action_taken(decision_id, {
+                "tool_calls": [
+                    {"tool": c.get("tool_name"), "summary": str(c.get("output_summary") or "")[:160]}
+                    for c in calls
+                ],
+                "response": _brain_response_text(response)[:1500],
+            })
+        except Exception:
+            log.debug("brain_decisions: update_action_taken failed for task %s", task.get("id"), exc_info=True)
 
     if review_ids:
         mark_agent_tasks_reviewed(review_ids)
@@ -1028,15 +1091,50 @@ async def _run_brain_task(task: dict) -> None:
             ),
         )
 
-    try:
-        from forven.vectordb import store_narrative
+    # Deliver the response to Discord when the payload names a channel
+    # (routines and generic scheduled brain jobs). The bot task-worker path
+    # posts payload.channel itself, but THIS is the API fallback worker —
+    # without this, routine responses silently stop at tasks.result whenever
+    # the gateway isn't consuming the queue. send_sync is Discord REST, so it
+    # works from this process; run it in a thread to keep the loop unblocked.
+    delivery_channel = str(payload.get("channel") or "").strip()
+    if delivery_channel:
+        routine_id = payload.get("routine_id")
 
-        store_narrative(
-            f"[Brain] {str(response)[:500]}",
-            metadata={"type": "brain_cycle", "source": "forven"},
-        )
-    except Exception:
-        log.debug("Skipping Chroma narrative storage for brain task %s", task.get("id"), exc_info=True)
+        def _record_run(status: str, error: str | None = None) -> None:
+            if routine_id is None:
+                return
+            try:
+                from forven.control_plane.routines import record_routine_run
+
+                record_routine_run(int(routine_id), status=status, error=error)
+            except Exception:
+                log.debug("record_routine_run failed for routine %s", routine_id, exc_info=True)
+
+        def _post_to_discord() -> bool:
+            from forven.bot import (
+                _render_operational_discord_reply,
+                _sanitize_response,
+                send_sync,
+            )
+
+            outbound = _render_operational_discord_reply(
+                _sanitize_response(_brain_response_text(response)),
+                source=source,
+                task_message=message,
+            )
+            return bool(send_sync(delivery_channel, outbound))
+
+        try:
+            if not await asyncio.to_thread(_post_to_discord):
+                raise RuntimeError("send returned false (channel circuit open or missing access)")
+            _record_run("ok")
+        except Exception as exc:
+            log.warning(
+                "Brain task %s: Discord delivery to %r failed: %s",
+                task.get("id"), delivery_channel, exc,
+            )
+            _record_run("error", f"Discord delivery failed: {exc}")
 
 
 def acquire_runtime_worker_lock(lock_name: str = "api_runtime_worker.lock") -> bool:

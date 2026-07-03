@@ -12,7 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from forven.quant_skills import (
     QuantSkill,
-    read_skill,
+    list_skills,
     store_hypothesis,
     update_skill,
     PROMOTION_THRESHOLD,
@@ -182,27 +182,64 @@ def maybe_extract(backtest_result: dict) -> None:
     _executor.submit(_extract_and_store, backtest_result)
 
 
+def record_backtest_for_learning(
+    strategy_id: str, asset: str, strategy_type: str,
+    params: dict, metrics: dict, fitness: float,
+    *,
+    strategy_name: str | None = None,
+    config: dict | None = None,
+    **_ignored,
+) -> None:
+    """Feed a completed backtest into the quant learning loop.
+
+    This used to ride along inside vectordb.store_backtest_result; when the
+    ChromaDB layer was removed (2026-07-02, it had been disabled in production
+    for months) this trigger became the entry point. Signature stays compatible
+    with the old store call so call sites are a rename. Best-effort, never the
+    critical path.
+    """
+    try:
+        regime = ""
+        if isinstance(config, dict):
+            regime = str(config.get("regime", ""))
+        maybe_extract({
+            "strategy_id": strategy_id,
+            "strategy_name": str(strategy_name or strategy_id or ""),
+            "strategy_type": strategy_type,
+            "asset": asset,
+            "params": params,
+            "metrics": metrics,
+            "regime": regime,
+        })
+    except Exception as exc:
+        log.debug("Quant skill extraction skipped: %s", exc)
+
+
+def _relevant_skills(strategy_type: str, regime: str, limit: int = 5) -> list[QuantSkill]:
+    """Disk-based replacement for the old Chroma similarity match: rank the
+    (≤100-entry) skills KB by token overlap with the backtest's type/regime,
+    preferring higher-confidence skills on ties.
+    """
+    terms = {t for t in f"{strategy_type} {regime}".lower().replace("-", " ").split() if t}
+    scored: list[tuple[float, QuantSkill]] = []
+    for skill in list_skills():
+        haystack = f"{skill.name} {skill.description} {skill.regime}".lower().replace("-", " ")
+        overlap = sum(1 for t in terms if t in haystack)
+        if overlap or not terms:
+            scored.append((overlap + float(skill.confidence or 0.0), skill))
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    return [skill for _, skill in scored[:limit]]
+
+
 def _extract_and_store(backtest_result: dict) -> None:
     """Background worker: extract insight and store it."""
     try:
-        from forven.vectordb import search_quant_skills, upsert_quant_skill
-
         metrics = backtest_result.get("metrics", backtest_result)
         strategy_type = backtest_result.get("strategy_type", "")
         regime = backtest_result.get("regime", "")
 
-        # Find relevant existing skills
-        query = f"{strategy_type} {regime}".strip() or "trading strategy"
-        chroma_results = search_quant_skills(query, n_results=5)
-
-        # Load full skill objects for matches
-        existing_skills: list[QuantSkill] = []
-        for r in chroma_results:
-            name = r.get("metadata", {}).get("name", "")
-            if name:
-                skill = read_skill(name)
-                if skill:
-                    existing_skills.append(skill)
+        # Find relevant existing skills (disk KB, token-overlap ranked)
+        existing_skills = _relevant_skills(strategy_type, regime, limit=5)
 
         # Extract insight
         insight = extract_insight(backtest_result, existing_skills)
@@ -231,7 +268,6 @@ def _extract_and_store(backtest_result: dict) -> None:
                 },
             )
             if updated:
-                upsert_quant_skill(updated)
                 log.info("Updated skill %s from backtest", updated.name)
 
         elif insight["action"] == "new_hypothesis":
@@ -243,9 +279,7 @@ def _extract_and_store(backtest_result: dict) -> None:
             # Auto-promote if threshold reached
             if h.count >= PROMOTION_THRESHOLD:
                 from forven.quant_skills import promote_hypothesis
-                promoted = promote_hypothesis(h.id)
-                if promoted:
-                    upsert_quant_skill(promoted)
+                promote_hypothesis(h.id)
 
     except Exception as exc:
         log.warning("Quant insight extraction/storage failed: %s", exc)

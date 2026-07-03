@@ -8,18 +8,37 @@ loop ("Claude session #7: 4 strategies, 2 survived") queryable.
 Sessions are intentionally simple: a single row in ai_dropzone_sessions,
 status active|closed, and tags on downstream rows. No authentication, no
 ownership semantics — the operator layer above already gates access.
+
+Lifecycle: sessions track last_activity_at (touched by every tagged
+registration/backtest). Sessions idle beyond the TTL are auto-closed by an
+opportunistic sweep (run from list/create) so abandoned MCP sessions never
+accumulate as 'active'. The MCP server additionally closes its own session
+when the client disconnects; this sweep is the backstop.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timezone
+import os
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from forven.db import get_db
 
 log = logging.getLogger(__name__)
+
+# Sessions with no tagged activity for this long get auto-closed by the sweep.
+# Active work touches the session on every register/backtest, so a genuinely
+# in-flight agent loop never trips this.
+DEFAULT_IDLE_TTL_HOURS = 6.0
+
+
+def _idle_ttl_hours() -> float:
+    try:
+        return max(0.25, float(os.environ.get("FORVEN_DROPZONE_IDLE_TTL_HOURS") or DEFAULT_IDLE_TTL_HOURS))
+    except (TypeError, ValueError):
+        return DEFAULT_IDLE_TTL_HOURS
 
 
 def _now_iso() -> str:
@@ -58,6 +77,7 @@ def create_session(
     metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Create a new active session and return its row as a dict."""
+    close_idle_sessions()
     clean_label = str(label or "").strip()[:200]
     clean_actor = str(actor or "").strip()[:80]
     clean_objective = str(objective or "").strip()[:500]
@@ -70,9 +90,9 @@ def create_session(
             clean_label = f"{session_id} ({suffix})"
         conn.execute(
             "INSERT INTO ai_dropzone_sessions "
-            "(id, label, actor, objective, status, metadata_json, started_at) "
-            "VALUES (?, ?, ?, ?, 'active', ?, ?)",
-            (session_id, clean_label, clean_actor, clean_objective, meta_json, started),
+            "(id, label, actor, objective, status, metadata_json, started_at, last_activity_at) "
+            "VALUES (?, ?, ?, ?, 'active', ?, ?, ?)",
+            (session_id, clean_label, clean_actor, clean_objective, meta_json, started, started),
         )
         row = conn.execute(
             "SELECT * FROM ai_dropzone_sessions WHERE id = ?", (session_id,)
@@ -94,7 +114,63 @@ def get_session(session_id: str) -> dict[str, Any] | None:
     return _row_to_dict(row) if row else None
 
 
+def touch_session(session_id: str | None, conn=None) -> None:
+    """Record activity on a session (best-effort; never raises).
+
+    Called whenever a strategy registration or backtest run is tagged with the
+    session, so the idle sweep only closes genuinely abandoned sessions.
+    """
+    sid = str(session_id or "").strip()
+    if not sid:
+        return
+    stamp = _now_iso()
+    try:
+        if conn is not None:
+            conn.execute(
+                "UPDATE ai_dropzone_sessions SET last_activity_at = ? WHERE id = ?",
+                (stamp, sid),
+            )
+        else:
+            with get_db() as own_conn:
+                own_conn.execute(
+                    "UPDATE ai_dropzone_sessions SET last_activity_at = ? WHERE id = ?",
+                    (stamp, sid),
+                )
+    except Exception as exc:  # activity stamping must never break the tagged write
+        log.debug("touch_session(%s) failed: %s", sid, exc)
+
+
+def close_idle_sessions(idle_hours: float | None = None) -> int:
+    """Auto-close active sessions with no tagged activity beyond the TTL.
+
+    Returns the number of sessions closed. Best-effort: failures are logged,
+    never raised, so the list/create callers that sweep opportunistically are
+    unaffected.
+    """
+    hours = idle_hours if idle_hours is not None else _idle_ttl_hours()
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    now = _now_iso()
+    try:
+        with get_db() as conn:
+            cur = conn.execute(
+                "UPDATE ai_dropzone_sessions "
+                "SET status = 'closed', ended_at = ?, "
+                "    metadata_json = json_set(COALESCE(metadata_json, '{}'), '$.auto_closed', 'idle') "
+                "WHERE status = 'active' "
+                "  AND COALESCE(last_activity_at, started_at) < ?",
+                (now, cutoff),
+            )
+            closed = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+        if closed:
+            log.info("AI Drop Zone idle sweep: auto-closed %d session(s) idle > %.1fh", closed, hours)
+        return closed
+    except Exception as exc:
+        log.warning("AI Drop Zone idle sweep failed: %s", exc)
+        return 0
+
+
 def list_sessions(limit: int = 20, include_closed: bool = True) -> list[dict[str, Any]]:
+    close_idle_sessions()
     capped = max(1, min(int(limit or 20), 100))
     with get_db() as conn:
         if include_closed:
@@ -244,6 +320,7 @@ def record_strategy_in_session(
         "WHERE id = ? AND (dropzone_session_id IS NULL OR dropzone_session_id = '')",
         (sid, stid),
     )
+    touch_session(sid, conn=conn)
 
 
 def session_exists(session_id: str) -> bool:
@@ -262,7 +339,9 @@ __all__ = [
     "get_session",
     "list_sessions",
     "close_session",
+    "close_idle_sessions",
     "get_session_detail",
     "record_strategy_in_session",
     "session_exists",
+    "touch_session",
 ]

@@ -87,6 +87,37 @@ def test_shared_pipeline_matches_backtest_walk(label, cls, params, ec, regime_ga
     )
 
 
+def test_isolated_worker_threads_symbol_into_the_kernel_path():
+    """Regression (8a68eb7): symbol/timeframe were wired into the kernel call
+    inside _run_signal_walk using names that did not exist in that scope, so
+    EVERY signal-walk backtest died with `NameError: name 'asset' is not
+    defined` before the kernel even ran. Drive the isolated worker end-to-end
+    with the same positional argument order backtest_strategy submits."""
+    df = _frame()
+    result = bt._isolated_backtest_worker(
+        "S-regress-asset",
+        "stochastic",
+        "stochastic",
+        {"k_period": 14, "d_period": 3, "k_oversold": 25, "k_overbought": 75},
+        df,
+        LEVERAGE,
+        FEE_BPS,
+        SLIP_BPS,
+        True,       # regime_gate
+        WARMUP,
+        "1h",       # resolved_timeframe
+        "both",     # trade_mode
+        False,      # include_funding (skip data-file lookups)
+        None,       # execution_controls
+        10000.0,    # initial_capital
+        "ETH/BTC",  # asset — must reach run_strategy_execution as symbol=
+    )
+
+    assert "error" not in result, result.get("error")
+    assert isinstance(result["is_trades"], list)
+    assert isinstance(result["oos_trades"], list)
+
+
 def test_profile_is_threaded_from_params_when_no_explicit_controls():
     """Phase 3: a strategy carrying an execution_profile must be sized/stopped by the
     gauntlet path (which passes execution_controls=None) IDENTICALLY to passing the

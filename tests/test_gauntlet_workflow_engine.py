@@ -229,8 +229,31 @@ def test_tick_isolates_per_workflow_failures(forven_db):
     assert detail["steps"][0]["status"] == "passed"
 
 
+def test_drain_worker_resolution_precedence(forven_db, monkeypatch):
+    """Env override > pytest-serial default > runtime setting > production default 3."""
+    from forven.gauntlet.engine import _resolve_gauntlet_drain_workers
+
+    # Under pytest with nothing configured: serial, so engine tests stay deterministic.
+    monkeypatch.delenv("FORVEN_GAUNTLET_DRAIN_WORKERS", raising=False)
+    assert _resolve_gauntlet_drain_workers() == 1
+    # Env override wins and is hard-capped at 8.
+    monkeypatch.setenv("FORVEN_GAUNTLET_DRAIN_WORKERS", "5")
+    assert _resolve_gauntlet_drain_workers() == 5
+    monkeypatch.setenv("FORVEN_GAUNTLET_DRAIN_WORKERS", "99")
+    assert _resolve_gauntlet_drain_workers() == 8
+    # Production path (no pytest marker): runtime setting, else default 3.
+    import forven.db as db
+
+    monkeypatch.delenv("FORVEN_GAUNTLET_DRAIN_WORKERS", raising=False)
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.setattr(db, "kv_get", lambda key, default=None: {"gauntlet_drain_workers": 6})
+    assert _resolve_gauntlet_drain_workers() == 6
+    monkeypatch.setattr(db, "kv_get", lambda key, default=None: {})
+    assert _resolve_gauntlet_drain_workers() == 3
+
+
 def test_tick_parallel_drain_advances_all_and_isolates_failures(forven_db, monkeypatch):
-    """Opt-in bounded parallel drain (FORVEN_GAUNTLET_DRAIN_WORKERS) advances every
+    """Bounded parallel drain (FORVEN_GAUNTLET_DRAIN_WORKERS) advances every
     workflow and isolates per-workflow failures, exactly like the serial path."""
     monkeypatch.setenv("FORVEN_GAUNTLET_DRAIN_WORKERS", "3")
     workflows = [

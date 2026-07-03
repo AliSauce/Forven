@@ -254,6 +254,30 @@ def _kill_executor_processes(executor):
         pass
 
 
+def _describe_signal_walk_error(exc: Exception) -> str:
+    """Human-actionable one-liner for a signal-walk crash.
+
+    A common AI-authored bug is a per-bar ``generate_signal`` that reads
+    ``self.position`` / ``self.entry_price`` / ``self.position_size`` etc. — state
+    the engine OWNS and never injects — so the read raises ``AttributeError`` on
+    the first fall-through bar and kills the whole backtest. The raw
+    ``'X' object has no attribute 'position'`` message reads like an engine wiring
+    fault (it has misled bug-triage before); name the real cause instead.
+    """
+    msg = str(exc)
+    if isinstance(exc, (AttributeError, NameError)) and (
+        "has no attribute" in msg or "is not defined" in msg
+    ):
+        return (
+            f"{msg} — the strategy read engine-owned state that generate_signal "
+            "is not given. generate_signal must be STATELESS: the engine tracks "
+            "position/entry externally, so do NOT read self.position / "
+            "self.entry_price / self.position_size. Gate exits on indicator "
+            "conditions only."
+        )
+    return msg
+
+
 def _resolve_worker_strategy_class(original_strategy_type: str, family_strategy_type: str):
     """Resolve a strategy class inside an isolated worker, importing the MINIMUM
     registry slice needed.
@@ -297,6 +321,7 @@ def _isolated_backtest_worker(
     include_funding: bool = True,
     execution_controls: dict | None = None,
     initial_capital: float = 10000.0,
+    asset: str | None = None,
 ) -> dict:
     """Run IS/OOS signal walks in an isolated child process.
 
@@ -340,9 +365,10 @@ def _isolated_backtest_worker(
             fee_bps=fee_bps, slippage_bps=slippage_bps, regime_gate=regime_gate,
             trade_mode=trade_mode,
             execution_controls=execution_controls, initial_capital=initial_capital,
+            asset=asset, resolved_timeframe=resolved_timeframe,
         )
     except Exception as e:
-        return {"error": f"Indicator execution failed during in-sample: {e}"}
+        return {"error": f"Indicator execution failed during in-sample: {_describe_signal_walk_error(e)}"}
 
     if include_funding:
         is_trades, _ = _apply_funding_to_trades(is_trades, is_df, leverage, resolved_timeframe)
@@ -361,11 +387,12 @@ def _isolated_backtest_worker(
                 fee_bps=fee_bps, slippage_bps=slippage_bps, regime_gate=regime_gate,
                 trade_mode=trade_mode,
                 execution_controls=execution_controls, initial_capital=initial_capital,
+                asset=asset, resolved_timeframe=resolved_timeframe,
             ),
             oos_start_timestamp,
         )
     except Exception as e:
-        return {"error": f"Indicator execution failed during out-of-sample: {e}"}
+        return {"error": f"Indicator execution failed during out-of-sample: {_describe_signal_walk_error(e)}"}
 
     if include_funding:
         # entry_bar indexes into oos_context_df (the warmup-padded slice the walk
@@ -404,6 +431,7 @@ def _isolated_walk_forward_worker(
     include_funding: bool = True,
     execution_controls: dict | None = None,
     initial_capital: float = 10000.0,
+    asset: str | None = None,
 ) -> dict:
     """Run walk-forward splits in an isolated child process.
 
@@ -452,6 +480,7 @@ def _isolated_walk_forward_worker(
                 fee_bps=fee_bps, slippage_bps=slippage_bps, regime_gate=regime_gate,
                 trade_mode=trade_mode,
                 execution_controls=execution_controls, initial_capital=initial_capital,
+                asset=asset, resolved_timeframe=resolved_timeframe,
             )
             if include_funding:
                 is_trades, _ = _apply_funding_to_trades(
@@ -476,6 +505,7 @@ def _isolated_walk_forward_worker(
                     fee_bps=fee_bps, slippage_bps=slippage_bps, regime_gate=regime_gate,
                     trade_mode=trade_mode,
                     execution_controls=execution_controls, initial_capital=initial_capital,
+                    asset=asset, resolved_timeframe=resolved_timeframe,
                 ),
                 oos_boundary,
             )
@@ -7172,6 +7202,76 @@ def _force_isolated_exec(strategy_obj) -> bool:
     return bool(getattr(strategy_obj, "sandbox_only", False))
 
 
+def _intrabar_resolution_enabled() -> bool:
+    """Operator flag for 1m sub-bar arbitration of both-touched bars.
+    Default OFF: turning it on changes fill outcomes (fewer pessimistic
+    stop-first calls) and therefore requires a re-baseline."""
+    try:
+        from forven.api_core import get_settings
+
+        return bool(get_settings().get("kernel_intrabar_resolution", False))
+    except Exception:
+        return False
+
+
+def _build_intrabar_resolver(symbol: str, timeframe: str, index: "pd.Index"):
+    """Resolver(bar_ts, direction, stop, tp) -> "stop" | "tp" | None, built
+    from the stored 1m series covering the frame's window.
+
+    Walks the 1m sub-bars inside the parent bar in order; the first level
+    touched wins. A 1m bar touching BOTH levels stays ambiguous -> None
+    (pessimistic). Returns None (no resolver) when the 1m series is absent —
+    the kernel then behaves exactly as without the flag.
+    """
+    try:
+        from forven.data import _timeframe_to_ms
+        from forven.dataeng.hub import DataHub
+
+        if len(index) == 0:
+            return None
+        tf_ms = _timeframe_to_ms(timeframe)
+        start = pd.Timestamp(index[0])
+        end = pd.Timestamp(index[-1]) + pd.Timedelta(milliseconds=tf_ms)
+        m1 = DataHub().candles(symbol, "1m", start=start, end=end)
+        if m1 is None or m1.empty:
+            return None
+        ts_ms = (pd.to_datetime(m1["timestamp"], utc=True).astype("int64") // 1_000_000).to_numpy()
+        m1_high = m1["high"].astype(float).to_numpy()
+        m1_low = m1["low"].astype(float).to_numpy()
+    except Exception as exc:
+        log.debug("intrabar resolver unavailable for %s %s: %s", symbol, timeframe, exc)
+        return None
+
+    import numpy as _np
+
+    def _resolve(bar_ts, direction: str, stop: float, tp: float) -> str | None:
+        try:
+            bar_start = pd.Timestamp(bar_ts)
+            if bar_start.tzinfo is None:
+                bar_start = bar_start.tz_localize("UTC")
+            start_ms = int(bar_start.timestamp() * 1000)
+            end_ms = start_ms + tf_ms
+            lo = int(_np.searchsorted(ts_ms, start_ms, side="left"))
+            hi = int(_np.searchsorted(ts_ms, end_ms, side="left"))
+            if hi <= lo:
+                return None
+            is_long = direction == "long"
+            for i in range(lo, hi):
+                stop_hit = (m1_low[i] <= stop) if is_long else (m1_high[i] >= stop)
+                tp_hit = (m1_high[i] >= tp) if is_long else (m1_low[i] <= tp)
+                if stop_hit and tp_hit:
+                    return None  # ambiguous within one minute -> pessimistic
+                if stop_hit:
+                    return "stop"
+                if tp_hit:
+                    return "tp"
+            return None
+        except Exception:
+            return None
+
+    return _resolve
+
+
 def run_strategy_execution(
     df: "pd.DataFrame",
     strategy_obj,
@@ -7186,6 +7286,8 @@ def run_strategy_execution(
     execution_controls: dict | None = None,
     initial_capital: float = 10000.0,
     strategy_type: str | None = None,
+    symbol: str | None = None,
+    timeframe: str | None = None,
 ) -> "_kernel.KernelResult | None":
     """The ONE signals→regime-mask→kernel pipeline, shared by the backtest's
     vectorized walk and the live/paper scanner so paper reproduces the backtest by
@@ -7284,10 +7386,17 @@ def run_strategy_execution(
         # Falls back to the default 1% fraction sizing when the strategy has none.
         ec = _normalize_execution_controls(execution_controls_from_params(params)) or _sizing.default_controls()
     drag = _kernel.round_trip_drag(fee_bps, slippage_bps, leverage)
+    # 1m sub-bar arbitration for both-touched bars (flagged, default OFF).
+    # Built HERE — the shared driver — so backtest, paper replay, and chart
+    # triggers all resolve identically for the same lake state (parity).
+    intrabar_resolver = None
+    if symbol and timeframe and str(timeframe) != "1m" and _intrabar_resolution_enabled():
+        intrabar_resolver = _build_intrabar_resolver(symbol, str(timeframe), d.index)
     return _kernel.simulate(
         d, signals, warmup, leverage,
         regimes=regime_series, round_trip_drag=drag, trade_mode=trade_mode,
         allowed_modes=_allowed_modes_for(trade_mode), ec=ec, initial_capital=initial_capital,
+        intrabar_resolver=intrabar_resolver,
     )
 
 
@@ -7757,6 +7866,8 @@ def backtest_strategy(
     initial_capital: float | None = None,
 
     execution_controls: dict | None = None,
+
+    as_of: str | None = None,
 
 ) -> dict:
 
@@ -8295,6 +8406,28 @@ def backtest_strategy(
         log.warning("Data preflight warning for %s: %s", strategy_id, data_preflight)
 
 
+    # Pre-flight: enrichment-feed availability. Blocks the run (rather than
+    # silently zero-filling) when a strategy depends on a data feed that is
+    # unavailable and not auto-downloadable; auto-fetches fetchable feeds first.
+    try:
+        from forven.strategies.data_availability import evaluate_data_availability
+
+        _avail = evaluate_data_availability(
+            original_strategy_type, asset, resolved_timeframe, strategy_id=strategy_id
+        )
+    except Exception as _avail_exc:  # defensive: never let the guard brick a backtest
+        log.warning("data-availability precheck raised (skipping): %s", _avail_exc)
+        _avail = None
+    if _avail is not None and _avail.blocked:
+        log.warning("Data availability BLOCK for %s: %s", strategy_id, _avail.error)
+        return {
+            "error": _avail.error,
+            "trades": [],
+            "metrics": {},
+            "data_availability": _avail.to_dict(),
+        }
+
+
 
 
 
@@ -8323,12 +8456,15 @@ def backtest_strategy(
         # load_backtest_candles loads ``warmup_bars`` before ``start_date`` so
         # indicators are valid from the first in-window bar. Without start/end it
         # falls back to the most-recent ``bars`` (legacy/autonomous behaviour).
+        # ``as_of`` pins point-in-time reconstruction (gauntlet candidates pin
+        # their creation time so every stage scores identical data).
         df = load_backtest_candles(
             asset=asset,
             bars=bars,
             timeframe=resolved_timeframe,
             start_date=start_date,
             end_date=end_date,
+            as_of=as_of,
         )
 
 
@@ -8436,7 +8572,13 @@ def backtest_strategy(
         n_bars = len(df)
         backtest_timeout = _resolve_backtest_timeout(n_bars)
         log.info("Submitting backtest %s to isolated worker (timeout=%ds, bars=%d)", strategy_id, backtest_timeout, n_bars)
-        with concurrent.futures.ProcessPoolExecutor(
+        # Process-wide subprocess budget: concurrent callers (gauntlet drain, grid
+        # combos, jitter reruns) queue here so peak child-process memory stays
+        # bounded regardless of how the parallel levers stack. The worker timeout
+        # starts AFTER the slot is acquired, so queueing never eats into it.
+        from forven.strategies.concurrency import backtest_subprocess_slot
+
+        with backtest_subprocess_slot("backtest"), concurrent.futures.ProcessPoolExecutor(
             max_workers=1,
             mp_context=multiprocessing.get_context("spawn"),
         ) as executor:
@@ -8457,6 +8599,7 @@ def backtest_strategy(
                 resolved_include_funding,
                 execution_controls,
                 resolved_initial_capital,
+                asset,
             )
             try:
                 worker_result = future.result(timeout=backtest_timeout)
@@ -8498,6 +8641,7 @@ def backtest_strategy(
                             resolved_include_funding,
                             execution_controls,
                             resolved_initial_capital,
+                            asset,
                         )
                         worker_result = future.result(timeout=backtest_timeout)
                 except Exception as retry_e:
@@ -8524,6 +8668,7 @@ def backtest_strategy(
             resolved_include_funding,
             execution_controls,
             resolved_initial_capital,
+            asset,
         )
 
     if "error" in worker_result:
@@ -8987,7 +9132,7 @@ def backtest_strategy(
 
 
 
-    # Auto-store in ChromaDB for future recall (fire-and-forget)
+    # Feed the quant-skills learning loop (fire-and-forget)
 
 
     if run_id:
@@ -8996,7 +9141,7 @@ def backtest_strategy(
         try:
 
 
-            from forven.vectordb import store_backtest_result
+            from forven.quant_skills_extractor import record_backtest_for_learning
 
 
             from forven.strategies.fitness import compute_fitness_score
@@ -9047,7 +9192,7 @@ def backtest_strategy(
 
 
 
-            store_backtest_result(
+            record_backtest_for_learning(
 
 
                 strategy_id=strategy_id,
@@ -9090,7 +9235,7 @@ def backtest_strategy(
 
 
             log.warning(
-                "ChromaDB store failed for strategy=%s run_id=%s: %s",
+                "Quant-learning record failed for strategy=%s run_id=%s: %s",
                 strategy_id,
                 run_id,
                 e,
@@ -10530,7 +10675,11 @@ def walk_forward(
         n_bars = len(df)
         walk_forward_timeout = _resolve_walk_forward_timeout(n_bars)
         log.info("Submitting walk-forward %s to isolated worker (timeout=%ds, bars=%d)", strategy_id, walk_forward_timeout, n_bars)
-        with concurrent.futures.ProcessPoolExecutor(
+        # All folds run inside ONE subprocess, so the whole WFA holds one slot of
+        # the process-wide subprocess budget (see strategies/concurrency.py).
+        from forven.strategies.concurrency import backtest_subprocess_slot
+
+        with backtest_subprocess_slot("walk_forward"), concurrent.futures.ProcessPoolExecutor(
             max_workers=1,
             mp_context=multiprocessing.get_context("spawn"),
         ) as executor:
@@ -10553,6 +10702,7 @@ def walk_forward(
                 resolved_include_funding,
                 normalized_ec,
                 float(initial_capital),
+                asset,
             )
             try:
                 worker_result = future.result(timeout=walk_forward_timeout)
@@ -10589,6 +10739,7 @@ def walk_forward(
             resolved_include_funding,
             normalized_ec,
             float(initial_capital),
+            asset,
         )
 
     if "error" in worker_result:
@@ -10811,7 +10962,11 @@ def _run_signal_walk(checker, df, params: dict, warmup: int, leverage: float,
 
                      execution_controls: dict | None = None,
 
-                     initial_capital: float = 10000.0) -> list[dict]:
+                     initial_capital: float = 10000.0,
+
+                     asset: str | None = None,
+
+                     resolved_timeframe: str | None = None) -> list[dict]:
 
 
     """Run signal checker across a dataframe window and collect trades.
@@ -10845,6 +11000,7 @@ def _run_signal_walk(checker, df, params: dict, warmup: int, leverage: float,
             fee_bps=fee_bps, slippage_bps=slippage_bps, regime_gate=regime_gate,
             trade_mode=trade_mode, execution_controls=execution_controls,
             initial_capital=initial_capital, strategy_type=strategy_type,
+            symbol=asset, timeframe=resolved_timeframe,
         )
     except RuntimeError as exc:
         if _VECTORIZED_PATH_UNAVAILABLE not in str(exc):
@@ -10978,6 +11134,8 @@ def _run_signal_walk(checker, df, params: dict, warmup: int, leverage: float,
             trade_mode="long_only",
             execution_controls=execution_controls,
             initial_capital=initial_capital,
+            asset=asset,
+            resolved_timeframe=resolved_timeframe,
         )
         short_trades = _run_signal_walk(
             checker, df, params, warmup, leverage,
@@ -10989,6 +11147,8 @@ def _run_signal_walk(checker, df, params: dict, warmup: int, leverage: float,
             trade_mode="short_only",
             execution_controls=execution_controls,
             initial_capital=initial_capital,
+            asset=asset,
+            resolved_timeframe=resolved_timeframe,
         )
         merged = sorted(long_trades + short_trades, key=lambda t: t.get("entry_bar", 0))
         for t in merged:
@@ -11358,6 +11518,7 @@ def preview_strategy_signals(
             strategy_obj=strategy_obj, strategy_type=family_type,
             fee_bps=0.0, slippage_bps=0.0, regime_gate=False,
             trade_mode=trade_mode or "long_only",
+            asset=asset, resolved_timeframe=timeframe or "1h",
         )
     except Exception as exc:  # noqa: BLE001
         warnings.append(f"Signal generation failed: {exc}")

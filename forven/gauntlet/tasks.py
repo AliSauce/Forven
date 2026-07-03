@@ -152,6 +152,58 @@ def _submit_backtest(body, *, skip_auto_trash: bool = True) -> dict[str, Any]:
     return post_backtest_submit(body, skip_auto_trash=skip_auto_trash)
 
 
+def _workflow_as_of(workflow: dict[str, Any]) -> str | None:
+    """Point-in-time pin for this candidate's stage backtests.
+
+    When ``gauntlet_as_of_pin`` is enabled (default), every stage scores the
+    data as it was known at the workflow's creation — vendor restatements or
+    lake rebuilds landing MID-GAUNTLET can no longer make stage N and stage
+    N+1 judge different data for the same candidate."""
+    try:
+        from forven.dataeng.settings import load_data_engine_settings
+
+        if not getattr(load_data_engine_settings(), "gauntlet_as_of_pin", False):
+            return None
+    except Exception:
+        return None
+    created = str(workflow.get("created_at") or "").strip()
+    return created or None
+
+
+def _data_quality_block(symbol: str, timeframe: str, required_days: int) -> dict[str, Any] | None:
+    """Fail-closed data-quality precondition for scoring a verdict.
+
+    Returns the blocked_data payload when the series is unfit (gap inside the
+    eval window, incomplete, stale), or None when scoring may proceed. Uses
+    the same drain-exempt reason code as the coverage gate: quality failures
+    are self-healing (completeness-aware catch-up + keep-alive), so the step
+    retries until the data is repaired instead of failing the strategy."""
+    try:
+        import pandas as pd
+
+        from forven.dataeng.quality_gate import check_series_quality
+
+        now = pd.Timestamp.now(tz="UTC")
+        verdict = check_series_quality(
+            symbol,
+            timeframe,
+            window_start=now - pd.Timedelta(days=max(int(required_days), 1)),
+            window_end=now,
+        )
+    except Exception as exc:  # the gate itself must never break the pipeline
+        log.warning("data-quality gate errored for %s %s: %s", symbol, timeframe, exc)
+        return None
+    if verdict.ok:
+        return None
+    return {
+        "status": "blocked_data",
+        "message": f"data quality unfit for {symbol} {timeframe}: " + "; ".join(verdict.reasons),
+        "retryable": True,
+        "reason_code": "awaiting_data_backfill",
+        "quality": verdict.as_dict(),
+    }
+
+
 def _submit_optimization(body) -> dict[str, Any]:
     from forven.api_core import post_optimization_submit
 
@@ -303,6 +355,13 @@ def run_quick_screen(workflow: dict[str, Any], step: dict[str, Any]) -> dict[str
         if symbol != raw_symbol:
             _persist_strategy_symbol(str(row["id"]), symbol)
 
+        # Coverage says "enough history exists" — the quality gate additionally
+        # refuses to SCORE on a defective series (gap inside the eval window,
+        # incomplete, stale). Fail closed; self-healing repair retries the step.
+        quality_block = _data_quality_block(symbol, timeframe, required_days)
+        if quality_block is not None:
+            return quality_block
+
         response = _submit_backtest(
             BacktestSubmitBody(
                 strategy_id=row["id"],
@@ -311,6 +370,7 @@ def run_quick_screen(workflow: dict[str, Any], step: dict[str, Any]) -> dict[str
                 timeframe=timeframe,
                 params=params,
                 duration_days=required_days,
+                as_of=_workflow_as_of(workflow),
             ),
             skip_auto_trash=True,
         )
@@ -525,6 +585,7 @@ def run_timeframe_sweep(workflow: dict[str, Any], step: dict[str, Any]) -> dict[
                     timeframe=tf,
                     params=params,
                     duration_days=sweep_duration_days,
+                    as_of=_workflow_as_of(workflow),
                 ),
                 skip_auto_trash=True,
             )
@@ -898,6 +959,7 @@ def run_confirmation_backtest(workflow: dict[str, Any], step: dict[str, Any]) ->
                 timeframe=row.get("timeframe") or "1h",
                 params=params,
                 duration_days=stage_backtest_duration_days("confirmation"),
+                as_of=_workflow_as_of(workflow),
             ),
             skip_auto_trash=True,
         )
@@ -1375,9 +1437,47 @@ def run_paper_promotion_gate(workflow: dict[str, Any], step: dict[str, Any]) -> 
 
     missing = status.get("missing_required") if isinstance(status.get("missing_required"), list) else []
     if missing:
+        # A required test can be "missing" for two very different reasons, and only
+        # one of them is a verdict about the strategy:
+        #   * MERIT: the test ran and recorded an explicit FAIL — failed_gate is correct.
+        #   * ABSENCE: the test errored, is stale (params or engine version), never
+        #     ran, or is still in flight. There is NO verdict; treating absence as
+        #     failed_gate archived strategies on evidence that does not exist (the
+        #     wrongly-archived cluster). Block retryably instead — the reason codes
+        #     are counter-exempt and in engine._NO_DRAIN_REASON_CODES, and the
+        #     un-promotable hygiene backstop still catches genuine deadlocks.
+        tests_map = status.get("tests") if isinstance(status.get("tests"), dict) else {}
+        merit_missing: list[str] = []
+        stale_engine_missing: list[str] = []
+        absent_missing: list[str] = []
+        for item in missing:
+            payload = tests_map.get(str(item)) if isinstance(tests_map.get(str(item)), dict) else {}
+            verdict = str(payload.get("verdict") or "").strip().upper()
+            if payload.get("stale_engine"):
+                stale_engine_missing.append(str(item))
+            elif verdict == "FAIL":
+                merit_missing.append(str(item))
+            else:
+                absent_missing.append(str(item))
+        if merit_missing:
+            return {
+                "status": "failed_gate",
+                "message": f"required robustness tests failed: {', '.join(merit_missing)}",
+                "gauntlet_status": status,
+            }
+        reason_code = (
+            "stale_engine_artifacts"
+            if stale_engine_missing and not absent_missing
+            else "artifacts_pending"
+        )
         return {
-            "status": "failed_gate",
-            "message": f"missing required robustness tests: {', '.join(str(item) for item in missing)}",
+            "status": "blocked_runtime",
+            "message": (
+                "required robustness tests have no current verdict "
+                f"(pending re-validation, not a merit failure): {', '.join(str(item) for item in missing)}"
+            ),
+            "retryable": True,
+            "reason_code": reason_code,
             "gauntlet_status": status,
         }
 
@@ -1441,10 +1541,12 @@ def run_paper_promotion_gate(workflow: dict[str, Any], step: dict[str, Any]) -> 
         transition.get("blocked_reason") or transition.get("reason") or transition.get("message") or ""
     ).lower()
     if (
-        reason_code in {"stale_validation", "artifacts_pending"}
+        reason_code in {"stale_validation", "artifacts_pending", "stale_engine_artifacts", "validation_in_flight"}
         or "ordering violation" in _blocked_text
         or "re-run after optimization" in _blocked_text
         or "stale validation" in _blocked_text
+        or "engine version" in _blocked_text
+        or "validation in flight" in _blocked_text
     ):
         # PENDING RE-VALIDATION, not a merit failure. The gauntlet gate's artifact-
         # ordering / freshness check fails when a validation (walk_forward) is older
@@ -1457,6 +1559,17 @@ def run_paper_promotion_gate(workflow: dict[str, Any], step: dict[str, Any]) -> 
         # reason_code is in engine._NO_DRAIN_REASON_CODES so requeue retries it on the
         # bounded cadence; the 2-day un-promotable hygiene backstop catches any genuine
         # deadlock where the validation truly never re-runs.
+        # Persist the TAXONOMY code (counter-exempt in engine._NO_DRAIN_REASON_CODES),
+        # not the transition's generic 'gate_failure' motion: the requeue sweep reads
+        # this top-level code to decide attempt-budget exemption, and 'gate_failure'
+        # would burn the budget on a self-resolving block and drain to failed_gate.
+        if reason_code not in {"stale_validation", "artifacts_pending", "stale_engine_artifacts", "validation_in_flight"}:
+            if "validation in flight" in _blocked_text:
+                reason_code = "validation_in_flight"
+            elif "engine version" in _blocked_text:
+                reason_code = "stale_engine_artifacts"
+            else:
+                reason_code = "stale_validation"
         return {
             "status": "blocked_runtime",
             "message": str(
@@ -1466,7 +1579,7 @@ def run_paper_promotion_gate(workflow: dict[str, Any], step: dict[str, Any]) -> 
                 or "validation pending re-run after optimization"
             ),
             "retryable": True,
-            "reason_code": reason_code or "stale_validation",
+            "reason_code": reason_code,
             "transition": transition,
             "gauntlet_status": status,
         }

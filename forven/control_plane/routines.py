@@ -3,13 +3,17 @@
 Routines are scheduler entries authored either by the operator (directly via
 the /routines page) or by the Brain (via the ``create_routine`` tool, gated
 through the approval queue). On scheduler tick, an enabled routine fires
-``brain_invoke`` with its NL prompt + skills + tools_context payload.
+``brain_invoke`` with its NL prompt + tools_context payload. An optional
+``channel`` names a Discord channel alias (or raw channel id) the bot posts
+the Brain's final response to — the same ``payload.channel`` delivery the
+generic ``brain_invoke`` scheduler jobs already use.
 
 Schema lives in ``forven/db.py`` (table ``brain_routines``, schema v28).
+The legacy ``skills_json`` column is dormant: it was written but never
+consumed at invoke time, so it is no longer part of the CRUD surface.
 """
 from __future__ import annotations
 
-import json
 import logging
 from typing import Any, Mapping
 
@@ -45,29 +49,17 @@ def _validate_context(tools_context: str) -> None:
         )
 
 
-def _serialize_skills(skills: Any) -> str | None:
-    if skills is None:
-        return None
-    if isinstance(skills, str):
-        return skills
-    try:
-        return json.dumps(list(skills) if not isinstance(skills, list) else skills)
-    except Exception:
-        return None
+def _normalize_channel(channel: Any) -> str | None:
+    """A Discord channel alias (e.g. 'ops') or raw channel id; empty -> None."""
+    normalized = str(channel or "").strip()
+    return normalized or None
 
 
 def _row_to_dict(row: Mapping[str, Any] | None) -> dict[str, Any] | None:
     if row is None:
         return None
     out = dict(row)
-    skills_raw = out.get("skills_json")
-    if isinstance(skills_raw, str) and skills_raw:
-        try:
-            out["skills"] = json.loads(skills_raw)
-        except Exception:
-            out["skills"] = []
-    else:
-        out["skills"] = []
+    out.pop("skills_json", None)  # dormant column — not part of the API surface
     return out
 
 
@@ -111,7 +103,7 @@ def create_routine(
     prompt: str,
     cron_expr: str,
     tools_context: str = "scheduled",
-    skills: Any = None,
+    channel: Any = None,
     enabled: bool = True,
     created_by: str = "operator",
     approval_id: int | None = None,
@@ -124,12 +116,11 @@ def create_routine(
     _validate_cron(cron_expr)
     _validate_context(tools_context)
 
-    skills_json = _serialize_skills(skills)
     with get_db() as conn:
         cur = conn.execute(
             """
             INSERT INTO brain_routines
-            (name, prompt, cron_expr, tools_context, skills_json, enabled, created_by, approval_id)
+            (name, prompt, cron_expr, tools_context, channel, enabled, created_by, approval_id)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
@@ -137,7 +128,7 @@ def create_routine(
                 str(prompt),
                 str(cron_expr).strip(),
                 tools_context,
-                skills_json,
+                _normalize_channel(channel),
                 1 if enabled else 0,
                 str(created_by or "operator"),
                 int(approval_id) if approval_id is not None else None,
@@ -150,9 +141,10 @@ def create_routine(
 
 def update_routine(routine_id: int, **fields: Any) -> dict[str, Any] | None:
     """Update mutable fields of a routine. Allowed: name, prompt, cron_expr,
-    tools_context, skills, enabled. Triggers scheduler dirty flag.
+    tools_context, channel, enabled. Triggers scheduler dirty flag.
+    Pass ``channel=""`` to clear the Discord delivery channel.
     """
-    allowed = {"name", "prompt", "cron_expr", "tools_context", "skills", "enabled"}
+    allowed = {"name", "prompt", "cron_expr", "tools_context", "channel", "enabled"}
     updates: dict[str, Any] = {}
     for key, value in fields.items():
         if key not in allowed:
@@ -163,8 +155,8 @@ def update_routine(routine_id: int, **fields: Any) -> dict[str, Any] | None:
         elif key == "tools_context":
             _validate_context(value)
             updates[key] = value
-        elif key == "skills":
-            updates["skills_json"] = _serialize_skills(value)
+        elif key == "channel":
+            updates["channel"] = _normalize_channel(value)
         elif key == "enabled":
             updates[key] = 1 if value else 0
         elif key == "name":
@@ -250,7 +242,7 @@ def dispatch_routine_now(routine_id: int) -> dict[str, Any]:
         "routine_id": int(routine_id),
         "routine_name": routine.get("name"),
         "tools_context": routine.get("tools_context") or "scheduled",
-        "skills": routine.get("skills") or [],
+        "channel": routine.get("channel") or None,
         "message": message,
     }
     with get_db() as conn:

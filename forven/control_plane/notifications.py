@@ -4,6 +4,7 @@ from forven.notifications import (
     acknowledge_notification,
     acknowledge_notifications,
     create_notification_repair_task,
+    filter_actionable_notifications,
     get_notification_preferences,
     get_notification_stats,
     list_notification_deliveries,
@@ -42,6 +43,7 @@ def get_notifications_list(
     event_type: str | None = None,
     group_key: str | None = None,
     before_id: int | None = None,
+    actionable: bool = False,
 ) -> dict[str, object]:
     items = list_notifications(
         limit=limit,
@@ -52,6 +54,10 @@ def get_notifications_list(
         group_key=group_key,
         before_id=before_id,
     )
+    if actionable:
+        # Same filter (and same page of rows) as the nav-badge summary, so the
+        # inbox always shows exactly what the badge counted.
+        items = filter_actionable_notifications(items)
     return {
         "items": items,
         "stats": get_notification_stats(),

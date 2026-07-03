@@ -11,6 +11,8 @@ from forven.db import get_db
 DEFAULT_RECENT_LIMIT = 80
 DEFAULT_SATURATION_THRESHOLD = 0.35
 DEFAULT_HARD_SATURATION_THRESHOLD = 0.55
+DEFAULT_OUTCOME_WINDOW_DAYS = 90
+DEAD_FAMILY_MIN_ATTEMPTS = 8
 
 FAMILY_LABELS = {
     "rsi": "RSI / oscillator momentum",
@@ -151,34 +153,146 @@ def saturated_strategy_families(
     return saturated
 
 
+def family_outcome_stats(days: int = DEFAULT_OUTCOME_WINDOW_DAYS) -> dict[str, dict[str, int]]:
+    """Per-family generation outcomes over a recent window.
+
+    attempts = strategies created in the window; survivors = those that reached
+    the paper stage (or beyond) at least once. This is the survivor signal that
+    lets the diversity guard steer by OUTCOME (dead vs live regions of the
+    search space), not just by generation frequency.
+    """
+    window = -abs(int(days or DEFAULT_OUTCOME_WINDOW_DAYS))
+    try:
+        with get_db() as conn:
+            rows = conn.execute(
+                """
+                SELECT s.id, s.display_id, s.name, s.type, s.runtime_type,
+                       s.params, s.metrics, s.notes,
+                       MAX(CASE WHEN e.to_state IN ('paper', 'live_graduated')
+                                  OR s.stage IN ('paper', 'live_graduated')
+                            THEN 1 ELSE 0 END) AS survived
+                FROM strategies s
+                LEFT JOIN strategy_events e ON e.strategy_id = s.id
+                WHERE datetime(COALESCE(s.created_at, '1970-01-01T00:00:00+00:00'))
+                      > datetime('now', ? || ' days')
+                GROUP BY s.id
+                """,
+                (str(window),),
+            ).fetchall()
+    except Exception:
+        return {}
+
+    stats: dict[str, dict[str, int]] = {}
+    for row in rows:
+        family = _row_family(row)
+        entry = stats.setdefault(family, {"attempts": 0, "survivors": 0})
+        entry["attempts"] += 1
+        if row["survived"]:
+            entry["survivors"] += 1
+    return stats
+
+
 def render_strategy_diversity_guard(
     *,
     task_description: str = "",
     limit: int = DEFAULT_RECENT_LIMIT,
     threshold: float = DEFAULT_SATURATION_THRESHOLD,
+    outcome_window_days: int = DEFAULT_OUTCOME_WINDOW_DAYS,
 ) -> str:
     saturated = saturated_strategy_families(limit=limit, threshold=threshold)
-    if not saturated:
+    outcomes = family_outcome_stats(days=outcome_window_days)
+    dead = sorted(
+        (
+            (family, stats)
+            for family, stats in outcomes.items()
+            if family != "other"
+            and stats["attempts"] >= DEAD_FAMILY_MIN_ATTEMPTS
+            and stats["survivors"] == 0
+        ),
+        key=lambda item: item[1]["attempts"],
+        reverse=True,
+    )
+    alive = sorted(
+        ((family, stats) for family, stats in outcomes.items() if stats["survivors"] > 0),
+        key=lambda item: item[1]["survivors"],
+        reverse=True,
+    )
+    if not saturated and not dead and not alive:
         return ""
 
     lines = ["# STRATEGY DIVERSITY GUARD"]
-    lines.append(
-        "Recent strategy memory is family-skewed. Treat saturated families as overrepresented prior art, not inspiration."
-    )
-    for item in saturated[:4]:
-        pct = round(float(item["share"]) * 100)
-        lines.append(f"- {item['label']}: {item['count']}/{item['total']} recent strategies ({pct}%).")
+    if saturated:
+        lines.append(
+            "Recent strategy memory is family-skewed. Treat saturated families as overrepresented prior art, not inspiration."
+        )
+        for item in saturated[:4]:
+            pct = round(float(item["share"]) * 100)
+            lines.append(f"- {item['label']}: {item['count']}/{item['total']} recent strategies ({pct}%).")
 
-    # Family-agnostic guidance: steer away from whichever families are saturated on
-    # THIS instance. (The old RSI-specific carve-out was a fossil from a past RSI
-    # flood and unfairly singled out one family — removed so every family is treated
-    # the same, driven purely by this instance's own saturation.)
-    labels = [str(item["label"]) for item in saturated[:3]]
-    lines.append("- Prefer families outside the saturated set: " + ", ".join(labels) + ".")
+        # Family-agnostic guidance: steer away from whichever families are saturated on
+        # THIS instance. (The old RSI-specific carve-out was a fossil from a past RSI
+        # flood and unfairly singled out one family — removed so every family is treated
+        # the same, driven purely by this instance's own saturation.)
+        labels = [str(item["label"]) for item in saturated[:3]]
+        lines.append("- Prefer families outside the saturated set: " + ", ".join(labels) + ".")
+
+    # Outcome steering: frequency alone can't distinguish an over-mined dead
+    # region from a productive one, so surface where recent attempts actually
+    # went (reached paper) vs where the pipeline keeps rejecting everything.
+    if dead:
+        lines.append(
+            f"Proven-dead regions (last {int(outcome_window_days)}d, ≥{DEAD_FAMILY_MIN_ATTEMPTS} attempts, zero reached paper):"
+        )
+        for family, stats in dead[:4]:
+            label = FAMILY_LABELS.get(family, family.replace("_", " "))
+            lines.append(
+                f"- {label}: {stats['attempts']} candidates, 0 survivors. "
+                "Do not propose more of these without a structurally different mechanism."
+            )
+    if alive:
+        parts = [
+            f"{FAMILY_LABELS.get(family, family.replace('_', ' '))} ({stats['survivors']}/{stats['attempts']} reached paper)"
+            for family, stats in alive[:4]
+        ]
+        lines.append("Families with recent survivors (evidence of a live region): " + ", ".join(parts) + ".")
 
     if _normalize_text(task_description):
         lines.append(f"- Apply this guard while working on: {_normalize_text(task_description)[:240]}")
 
+    return "\n".join(lines)
+
+
+def render_failure_taxonomy(*, days: int = 30, limit: int = 8) -> str:
+    """Render the structured gate-rejection taxonomy for generation steering.
+
+    Surfaces the top (family × gate × reason × regime) rejection clusters from
+    `gate_rejections` so ideation designs away from regions the pipeline has
+    already rejected instead of re-mining them.
+    """
+    try:
+        from forven.db import query_failure_taxonomy
+
+        rows = query_failure_taxonomy(days=days)
+    except Exception:
+        return ""
+    if not rows:
+        return ""
+
+    lines = [
+        f"# FAILURE TAXONOMY (last {int(days)}d)",
+        "Top structured rejection patterns from the promotion gates. Treat each as a disproven region: "
+        "do not re-propose the same family/mechanism into the same failure mode without explicitly addressing it.",
+    ]
+    for row in rows[:limit]:
+        gate = _normalize_text(row.get("gate")) or "?"
+        reason = _normalize_text(row.get("reason_code")) or "unspecified"
+        strategy_type = _normalize_text(row.get("strategy_type")) or "unknown family"
+        regime = _normalize_text(row.get("regime_context")) or "any regime"
+        try:
+            count = int(row.get("count") or 0)
+        except (TypeError, ValueError):
+            count = 0
+        lines.append(f"- {strategy_type} @ {gate}: {reason} ×{count} ({regime})")
     return "\n".join(lines)
 
 

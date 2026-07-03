@@ -192,3 +192,9 @@ packaging/dist/
 
 # Local scratch data files
 btc_4h.csv
+
+# Session scratch / one-off dumps (not source)
+notes/
+Python/
+_my_hunks.patch
+h01421_section.txt

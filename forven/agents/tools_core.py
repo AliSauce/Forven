@@ -1,4 +1,4 @@
-"""Core shared agent tool handlers (shell, files, memory, chroma)."""
+"""Core shared agent tool handlers (shell, files, datasets)."""
 
 import asyncio
 import json
@@ -9,7 +9,11 @@ import subprocess
 
 from forven.security.env_allowlist import build_subprocess_env
 from forven.workspace import append_workspace, read_workspace
-from .context import _normalize_legacy_paths
+from .context import (
+    _current_agent_id_var,
+    _current_task_display_id_var,
+    _normalize_legacy_paths,
+)
 from .tool_registry import register_tool
 
 
@@ -193,7 +197,7 @@ async def _tool_run_shell(command: str) -> str:
             "Blocked: the run_shell tool is disabled by default. Set "
             "FORVEN_ENABLE_SHELL_TOOL=1 to enable it (at your own risk; consider "
             "also FORVEN_SHELL_STRICT_ALLOWLIST=1). Use structured tools "
-            "(read_file, write_file, search_memory, etc.) instead."
+            "(read_file, write_file, etc.) instead."
         )
     command = command.replace("\n", " ").strip()
     command = _normalize_legacy_paths(command)
@@ -252,7 +256,7 @@ async def _tool_run_shell(command: str) -> str:
     if _windows_command_uses_unix_head(command):
         return (
             "Blocked: Unix `head` pipelines leak subprocesses on Windows in this runtime. "
-            "Use PowerShell `Select-Object -First N` or structured tools like `search_memory` instead."
+            "Use PowerShell `Select-Object -First N` or a structured tool instead."
         )
 
     # H-S3: optional strict allowlist mode. Off by default for backward
@@ -396,114 +400,6 @@ def _tool_write_file(path: str, content: str, append: bool = True) -> str:
         return f"Wrote {path}"
 
 @register_tool(
-    name="search_memory",
-    description="Search narrative memory for relevant long-term memories. Returns up to 5 results.",
-    input_schema={
-        "type": "object",
-        "properties": {
-            "query": {"type": "string", "description": "Search query"},
-        },
-        "required": ["query"],
-    },
-    is_async=True,
-)
-async def _tool_search_memory(query: str) -> str:
-    """Search agent narratives (ChromaDB)."""
-    from forven.vectordb import search_narratives
-    results = search_narratives(query, n_results=5)
-    if not results:
-        return "No relevant memories found."
-    parts = []
-    for r in results:
-        content = r.get("document", "")
-        if content:
-            parts.append(f"- {content[:400]}")
-    return "\n".join(parts) if parts else "No relevant memories found."
-
-@register_tool(
-    name="store_memory",
-    description="Store a finding or insight in narrative memory for long-term recall.",
-    input_schema={
-        "type": "object",
-        "properties": {
-            "content": {"type": "string", "description": "The memory to store"},
-            "category": {"type": "string", "description": "Category: research, strategy, trade, lesson, observation"},
-        },
-        "required": ["content"],
-    },
-    is_async=True,
-)
-async def _tool_store_memory(content: str, category: str | None = None) -> str:
-    """Store an agent narrative in ChromaDB."""
-    from forven.vectordb import _in_process_chroma_disabled, store_narrative
-    if _in_process_chroma_disabled():
-        # Be honest instead of reporting false success: the vector store is off,
-        # so nothing is persisted. (This tool is also gated out of the advertised
-        # toolset while disabled; this guard covers any direct-dispatch path.)
-        return "Memory store is disabled (vector layer off) — nothing was saved."
-    store_narrative(content, metadata={"type": category or "agent_finding", "source": "forven_agent"})
-    return "Stored in memory."
-
-@register_tool(
-    name="search_chroma",
-    description="Search the local ChromaDB vector store for past experiments, backtests, post-mortems, or hypotheses.",
-    input_schema={
-        "type": "object",
-        "properties": {
-            "query": {"type": "string", "description": "Semantic search query"},
-            "collection": {"type": "string", "description": "Collection: backtest_results, trade_post_mortems, research_hypotheses, or execution_slippage"},
-            "n_results": {"type": "integer", "description": "Max results (default 5)"},
-        },
-        "required": ["query", "collection"],
-    },
-)
-def _tool_search_chroma(query: str, collection: str, n_results: int = 5) -> str:
-    """Search ChromaDB vector store."""
-    from forven import vectordb
-    search_fn = {
-        "backtest_results": vectordb.search_backtest_results,
-        "trade_post_mortems": vectordb.search_post_mortems,
-        "research_hypotheses": vectordb.search_hypotheses,
-        "execution_slippage": vectordb.search_slippage_samples,
-    }.get(collection)
-    if not search_fn:
-        return f"Unknown collection: {collection}. Use: backtest_results, trade_post_mortems, research_hypotheses, execution_slippage"
-    results = search_fn(query, n_results=n_results)
-    if not results:
-        return "No results found."
-    parts = []
-    for r in results:
-        doc = r.get("document", "")[:400]
-        meta = r.get("metadata", {})
-        parts.append(f"- [{r['id']}] {doc}\n  Metadata: {json.dumps(meta)}")
-    return "\n".join(parts)
-
-@register_tool(
-    name="store_chroma",
-    description="Store data in the local ChromaDB vector store.",
-    input_schema={
-        "type": "object",
-        "properties": {
-            "collection": {"type": "string", "description": "Collection: backtest_results, trade_post_mortems, research_hypotheses, or execution_slippage"},
-            "doc_id": {"type": "string", "description": "Unique document ID"},
-            "content": {"type": "string", "description": "Document content to store"},
-            "metadata": {"type": "object", "description": "Optional metadata dict"},
-        },
-        "required": ["collection", "doc_id", "content"],
-    },
-)
-def _tool_store_chroma(collection: str, doc_id: str, content: str, metadata: dict | None = None) -> str:
-    """Store data in ChromaDB (uses subprocess isolation for safety)."""
-    from forven.vectordb import _in_process_chroma_disabled, _upsert
-    if _in_process_chroma_disabled():
-        return f"ChromaDB is disabled (vector layer off) — {doc_id} was NOT stored."
-    try:
-        _upsert(collection, [doc_id], [content], [metadata or {}])
-        return f"Stored in {collection}: {doc_id}"
-    except Exception as exc:
-        return f"ChromaDB store failed: {exc}"
-
-@register_tool(
     name="list_local_datasets",
     description="List OHLCV datasets available in the local Forven storage. Returns symbol, timeframe, and row count.",
     input_schema={
@@ -620,3 +516,68 @@ def _tool_get_local_ohlcv(symbol: str, timeframe: str, limit: int = 100) -> str:
         return f"Dataset not found: {symbol} {timeframe}. Use list_local_datasets to see what is available."
     except Exception as e:
         return f"Error loading OHLCV: {e}"
+
+
+@register_tool(
+    name="request_fix",
+    description=(
+        "Report a code-level bug you cannot resolve to the operator's triage queue. "
+        "Use this when you encounter a bug, broken import, API error, or infrastructure issue "
+        "that you cannot resolve with your own tools. It records the bug for human / Claude-Code "
+        "review (a notification + the review log) — NO autonomous code change is made; the system "
+        "is fixed through the normal dev workflow. Provide a clear description of the problem, what "
+        "you tried, and what files/systems are affected."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "title": {"type": "string", "description": "Short summary of the problem (shown in the operator triage queue)"},
+            "description": {
+                "type": "string",
+                "description": "Detailed problem description: what failed, error messages, what you already tried, affected files/systems",
+            },
+            "severity": {
+                "type": "string",
+                "enum": ["low", "medium", "high", "critical"],
+                "description": "Impact severity. Default: medium",
+            },
+            "context": {"type": "object", "description": "Optional context: error traces, file paths, strategy_id, etc."},
+        },
+        "required": ["title", "description"],
+    },
+)
+def _tool_request_fix(params: dict) -> str:
+    """Report a code-level problem to the operator bug-triage queue (report-only)."""
+    title = str(params.get("title", "")).strip()
+    description = str(params.get("description", "")).strip()
+    if not title or not description:
+        return "Error: both 'title' and 'description' are required."
+
+    severity = str(params.get("severity", "medium")).strip().lower()
+    if severity not in ("low", "medium", "high", "critical"):
+        severity = "medium"
+
+    context = params.get("context") or {}
+    requesting_agent = _current_agent_id_var.get()
+    requesting_task = _current_task_display_id_var.get()
+
+    try:
+        from forven.brain import escalate_to_engineer
+        result = escalate_to_engineer(
+            title=title,
+            description=description,
+            requesting_agent=requesting_agent,
+            requesting_task_id=requesting_task,
+            severity=severity,
+            context=context if isinstance(context, dict) else {},
+        )
+        return json.dumps({
+            "status": result.get("status", "reported"),
+            "queue": result.get("queue", "operator_triage"),
+            "message": (
+                f"Bug reported to the operator triage queue (severity={severity}). "
+                f"No autonomous code change is made; it will be fixed via the normal dev workflow."
+            ),
+        })
+    except Exception as e:
+        return f"Bug report failed: {e}"

@@ -16,17 +16,8 @@ PIPELINE_AUTO_HANDOFF_TASK_TYPES = {
     "gauntlet": {"backtest", "optimize", "optimization", "robustness", "verdict"},
 }
 
-BRAIN_AGENT_IDS = [
-    "quant-researcher",
-    "simulation-agent",
-    "risk-manager",
-    # execution-trader retired 2026-06-30 (execution is kernel-driven; no LLM
-    # order path) — removed from the assignable roster so the brain can't
-    # delegate trading tasks to it.
-    "strategy-developer",
-    "full-stack-engineer",
-    "brain",
-]
+# The Brain's assignable roster lives in forven.roster (single source of truth).
+from forven.roster import BRAIN_AGENT_IDS as BRAIN_AGENT_IDS  # noqa: PLC0414 - re-export
 
 # ---------------------------------------------------------------------------
 # Backward-compatible list exports
@@ -37,10 +28,6 @@ BRAIN_AGENT_IDS = [
 # ---------------------------------------------------------------------------
 
 _BRAIN_PERM_NAMES = {"assign_agent_task", "promote_strategy", "create_strategy", "factory_reset"}
-_EXCHANGE_PERM_NAMES = {
-    "place_order", "close_position", "get_exchange_positions",
-    "get_account_info", "cancel_orders", "update_trade",
-}
 _BACKTESTING_PERM_NAMES = {
     "forven_list_datasets", "forven_create_strategy", "forven_run_backtest",
     "forven_run_optimization", "forven_run_verdict", "forven_get_results",
@@ -52,23 +39,22 @@ def _ensure_tools_imported():
     # These imports are idempotent (Python caches modules).
     import forven.agents.tools_core        # noqa: F401
     import forven.agents.tools_brain       # noqa: F401
-    import forven.agents.tools_exchange    # noqa: F401
     import forven.agents.tools_backtesting # noqa: F401
     import forven.agents.tools_research    # noqa: F401
     import forven.agents.tools_assistant   # noqa: F401
+    import forven.agents.tools_deepdive    # noqa: F401
     # Phase 5 / P5-T05: assign default categories by name pattern.
     from forven.agents.tool_registry import apply_default_categorization
     apply_default_categorization()
 
 
-def _build_lists() -> tuple[list[dict], list[dict], list[dict], list[dict]]:
-    """Build the four backward-compatible tool definition lists from the registry."""
+def _build_lists() -> tuple[list[dict], list[dict], list[dict]]:
+    """Build the three backward-compatible tool definition lists from the registry."""
     _ensure_tools_imported()
     from .tool_registry import _REGISTRY
 
     agent_tools: list[dict] = []
     brain_tools: list[dict] = []
-    exchange_tools: list[dict] = []
     backtesting_tools: list[dict] = []
 
     for tool in _REGISTRY.values():
@@ -79,14 +65,12 @@ def _build_lists() -> tuple[list[dict], list[dict], list[dict], list[dict]]:
         }
         if tool.name in _BRAIN_PERM_NAMES:
             brain_tools.append(entry)
-        elif tool.name in _EXCHANGE_PERM_NAMES:
-            exchange_tools.append(entry)
         elif tool.name in _BACKTESTING_PERM_NAMES:
             backtesting_tools.append(entry)
         else:
             agent_tools.append(entry)
 
-    return agent_tools, brain_tools, exchange_tools, backtesting_tools
+    return agent_tools, brain_tools, backtesting_tools
 
 
 class _LazyToolList:
@@ -99,12 +83,11 @@ class _LazyToolList:
     def _resolve(self) -> list[dict]:
         if self._cached is None:
             lists = _build_lists()
-            # Cache all four at once to avoid redundant rebuilds.
-            global AGENT_TOOLS, BRAIN_TOOLS, EXCHANGE_TOOLS, BACKTESTING_TOOLS
+            # Cache all three at once to avoid redundant rebuilds.
+            global AGENT_TOOLS, BRAIN_TOOLS, BACKTESTING_TOOLS
             AGENT_TOOLS = lists[0]
             BRAIN_TOOLS = lists[1]
-            EXCHANGE_TOOLS = lists[2]
-            BACKTESTING_TOOLS = lists[3]
+            BACKTESTING_TOOLS = lists[2]
             self._cached = lists[self._index]
         return self._cached
 
@@ -135,11 +118,9 @@ class _LazyToolList:
 # themselves with plain lists via _LazyToolList._resolve().
 AGENT_TOOLS = _LazyToolList(0)
 BRAIN_TOOLS = _LazyToolList(1)
-EXCHANGE_TOOLS = _LazyToolList(2)
-BACKTESTING_TOOLS = _LazyToolList(3)
+BACKTESTING_TOOLS = _LazyToolList(2)
 
 _BRAIN_TOOL_NAMES = _BRAIN_PERM_NAMES
-_EXCHANGE_TOOL_NAMES = _EXCHANGE_PERM_NAMES
 _BACKTESTING_TOOL_NAMES = _BACKTESTING_PERM_NAMES
 
 
@@ -163,8 +144,6 @@ _BACKTESTING_TOOL_NAMES = _BACKTESTING_PERM_NAMES
 # shell, or mutates state (no write_file/run_shell/store_*/register_strategy).
 CHAT_ASK_TOOL_NAMES: frozenset[str] = frozenset({
     "read_file",            # inspect strategy code / workspace files
-    "search_memory",        # operator-facing memory recall
-    "search_chroma",        # vector recall over narratives/research
     "recall_similar_situation",  # Brain's situational recall
     "list_local_datasets",  # what OHLCV data is on disk
     "get_local_ohlcv",      # read cached candles
@@ -197,12 +176,24 @@ CHAT_ACT_TOOL_NAMES: frozenset[str] = CHAT_ASK_TOOL_NAMES | frozenset({
 # ---------------------------------------------------------------------------
 
 # Read-only grounding tools auto-offered even in read-only chat (allow_actions
-# False). NOTHING here writes/creates/registers/mutates.
+# False). NOTHING here writes/creates/registers/mutates. (open_app_page only
+# navigates the operator's own browser — no server-side state changes.)
 CHAT_AUTO_READONLY_TOOL_NAMES: frozenset[str] = CHAT_ASK_TOOL_NAMES | frozenset({
     "get_portfolio_status",
     "get_pipeline_status",
     "get_market_regime",
     "get_strategy_detail",
+    "get_app_guide",
+    "open_app_page",
+    "list_strategies",
+    "get_gate_report",
+    "get_recent_trades",
+    "get_settings_overview",
+    "get_ops_overview",
+    "list_hypotheses",
+    "list_bots",
+    "list_routines",
+    "list_agent_tasks",
 })
 
 # Auto-executed WRITE tools — only offered when allow_actions is True. They

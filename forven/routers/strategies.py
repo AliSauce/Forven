@@ -1,7 +1,7 @@
 import asyncio
 import logging
 
-from fastapi import APIRouter, Body, Depends
+from fastapi import APIRouter, Body, Depends, HTTPException
 from fastapi.responses import ORJSONResponse
 from pydantic import BaseModel, Field
 from forven import api_core as core
@@ -299,18 +299,38 @@ def get_ai_dropzone_context():
             "session_list": {"method": "GET", "path": "/api/ai-dropzone/sessions", "description": "List recent sessions with strategy counts"},
             "session_detail": {"method": "GET", "path": "/api/ai-dropzone/sessions/{id}", "description": "Session detail: tagged strategies and recent runs"},
             "session_close": {"method": "POST", "path": "/api/ai-dropzone/sessions/{id}/close", "description": "Close a session (idempotent)"},
+            "robustness_walk_forward": {"method": "POST", "path": "/api/robustness/walk-forward/submit", "description": "PERSISTED walk-forward analysis. Body: {strategy_id, symbol, timeframe}. Returns {job_id, result_id}; poll /api/robustness/results/{result_id}."},
+            "robustness_cost_stress": {"method": "POST", "path": "/api/robustness/cost-stress/submit", "description": "PERSISTED cost-stress (2x fees/slippage). Body: {strategy_id, symbol, timeframe}."},
+            "robustness_param_jitter": {"method": "POST", "path": "/api/robustness/param-jitter/submit", "description": "PERSISTED parameter-jitter stability. Body: {strategy_id, result_id} where result_id is a baseline backtest result."},
+            "robustness_result": {"method": "GET", "path": "/api/robustness/results/{result_id}", "description": "Poll a submitted robustness run: status + verdict scorecard."},
+            "readiness": {"method": "GET", "path": "/api/lifecycle/strategies/{id}/readiness", "description": "Structured promotion checklist: per-gate pass/fail + actionable next step."},
+            "promote": {"method": "POST", "path": "/api/strategies/{id}/promote", "description": "Attempt a lifecycle promotion. Body: {to_status, reason, force:false}. Never pass force=true to skip gates."},
         },
         "workflow": [
-            "1. Read this context to understand the system.",
-            "2. (optional) POST /api/ai-dropzone/sessions to open a session — tag subsequent registrations and backtests with the returned session_id to group your work.",
-            "3. GET /api/quant-skills — load domain knowledge before designing. Use regime param for current market conditions.",
-            "4. Design a novel strategy approach — be creative, but build on proven insights.",
-            "5. Generate a .py file extending BaseStrategy with generate_signal().",
-            "6. Write it to the file_location directory.",
-            "7. POST /api/strategies/intake/register-file with {\"file_path\": \"<absolute path>\", \"session_id\": \"<optional>\"} to register only the file you created. Response includes strategy_id and stage (quick_screen if certified, research_only otherwise).",
-            "8. POST /api/backtesting/run to backtest. Include \"session_id\" in the body to tag the run.",
-            "9. Check results — if poor, iterate with a revised strategy.",
-            "10. (optional) POST /api/ai-dropzone/sessions/{id}/close when the session is complete.",
+            "1. Read this context (it is sectioned — fetch only what you need).",
+            "2. GET /api/quant-skills — load priors before designing; use them to avoid known dead ends.",
+            "3. Design a strategy and write a .py file extending BaseStrategy into file_location. Read the gotchas list FIRST — it encodes every registration/gate trap.",
+            "4. POST /api/strategies/intake/register-file with {\"file_path\": \"<absolute path>\", \"session_id\": \"<optional>\"} → strategy_id + stage (quick_screen if certified, research_only otherwise).",
+            "5. POST /api/backtesting/run {strategy_id, dataset_id, session_id?} — iterate on the design until out-of-sample metrics look genuinely good (PF > ~1.05, positive Sharpe, MaxDD < 30%, >= 15 trades).",
+            "6. POST /api/backtesting/optimize — parameter search. Then BAKE the winning params into the file's default_params (gates judge the registered file's defaults, not your run overrides).",
+            "7. Submit the PERSISTED robustness suite (walk-forward, cost-stress, param-jitter via /api/robustness/*/submit) — these write the validation artifacts the paper gate reads. Poll /api/robustness/results/{result_id} until done.",
+            "8. GET /api/lifecycle/strategies/{id}/readiness — every gate green? POST /api/strategies/{id}/promote with force=false.",
+            "9. Report honest failures — gates rejecting a weak strategy is the system working. Never force a pass.",
+        ],
+        "gotchas": [
+            "TYPE_NAME must be globally unique snake_case and must not reuse a registered family name — duplicates are rejected at registration. certified:false ('no runtime class registered') is NORMAL for novel families and does not block backtests.",
+            "Declare '_timeframe' in default_params (e.g. '4h') matching the dataset you validate on — intake defaults to 1h and the gates evaluate on the stored timeframe, so a 4h-only edge dies at a 1h quick_screen.",
+            "Gates judge the REGISTERED file's default_params, not backtest parameter overrides. Bake winning params into the file BEFORE running validation.",
+            "Re-registering the same TYPE_NAME/file is rejected ('already registered as Sxxxxx'). Logic edits take effect on the next backtest without re-registering (code loads live from the file), but the default_params snapshot does NOT refresh — changing defaults means a new file + new TYPE_NAME.",
+            "Implement vectorized generate_signals() (return the 4-tuple long_entry/long_exit/short_entry/short_exit for dual-side) and keep it STATELESS — the engine owns position state. Without it the per-bar fallback is O(N^2) and can hit the timeout kill.",
+            "generate_signal/generate_signals are STATELESS: the engine does NOT inject a current position. Reading self.position / self.entry_price / self.position_size / self.position_manager (any per-trade state) raises AttributeError and the run is rejected at registration (execution smoke probe) — and would otherwise crash every backtest. Gate exits on indicator conditions (e.g. z reverting past a threshold), never on a tracked position side.",
+            "Never read future bars (.shift(-1) etc.). Registration runs a lookahead probe and routes leaky strategies to research_only; implausible metrics (e.g. Sharpe > 10) auto-reject.",
+            "Banned imports: the 'ta' library and os/subprocess/socket/eval/etc. — the AST security scan rejects the file. Compute indicators in native pandas/numpy.",
+            "Do not put risk_pct/risk_per_trade or stop_loss_pct/take_profit_pct in default_params — sizing/risk is engine-owned. Bound drawdown with logic-based exits using your own param names.",
+            "A TYPE_NAME containing a mean-reversion token (reversion, stochastic, williams, zscore, bb_fade, funding, gap_fill, pivot_point, connors_rsi) gets an automatic ADX cap (~25). Set adx_max explicitly in default_params to control regime gating yourself.",
+            "Derivatives enrichment columns (funding_rate, open_interest, ls_ratio, taker_buy_sell_ratio, ...) join only when collected and may have shallow in-sample history. Guard `if col in df.columns` and probe that in_sample.total_trades > 0 before committing to a flow-based design.",
+            "Rare-entry designs starve the gates: you need >= 15 trades total and enough out-of-sample trades for walk-forward folds (~1y window, ~70/30 IS/OOS split).",
+            "Transient verdict probes do NOT count toward promotion. Only the persisted robustness endpoints (/api/robustness/*/submit) write the validation artifacts the paper gate reads.",
         ],
         "sessions": {
             "purpose": "A session is a lightweight grouping token. Tag registrations and backtests with session_id to make 'what did I try in iteration #7' queryable.",
@@ -320,6 +340,7 @@ def get_ai_dropzone_context():
             "list": "GET /api/ai-dropzone/sessions?limit=20",
             "detail": "GET /api/ai-dropzone/sessions/{id} — returns strategies + recent runs tagged to this session.",
             "close": "POST /api/ai-dropzone/sessions/{id}/close",
+            "lifecycle": "Sessions idle beyond the TTL (default 6h, FORVEN_DROPZONE_IDLE_TTL_HOURS) are auto-closed; the MCP server also closes its own sessions on disconnect. Activity on a tagged session keeps it open.",
         },
     }
 
@@ -371,6 +392,49 @@ def get_strategy_container(strategy_id: str, result_limit: int = 200, trade_limi
     result_limit = max(1, min(int(result_limit), 1000))
     trade_limit = max(1, min(int(trade_limit), 20000))
     return lifecycle.get_strategy_container(strategy_id, result_limit=result_limit, trade_limit=trade_limit)
+
+
+@router.get("/api/strategies/{strategy_id}/execution-growth")
+def get_strategy_execution_growth(strategy_id: str):
+    """Minimal rows for the FULL realized-growth curve of a strategy.
+
+    The container payload caps execution trades (most-recent-first), which would
+    silently truncate a long-lived strategy's growth chart. This returns every
+    CLOSED trade's (closed_at, pnl, execution_type) ascending — tiny rows, no cap.
+    """
+    clean = str(strategy_id or "").strip()
+    if not clean:
+        raise core.HTTPException(status_code=400, detail="strategy_id is required")
+    from forven.db import get_db
+
+    with get_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT closed_at, opened_at, pnl_usd, pnl, execution_type
+            FROM trades
+            WHERE (strategy_id = ? OR strategy = ?)
+              AND UPPER(COALESCE(status, '')) = 'CLOSED'
+              AND TRIM(COALESCE(closed_at, '')) != ''
+            ORDER BY datetime(closed_at) ASC, id ASC
+            """,
+            (clean, clean),
+        ).fetchall()
+    import math
+
+    trades = []
+    for row in rows:
+        pnl = row["pnl_usd"] if row["pnl_usd"] is not None else row["pnl"]
+        if pnl is None or not math.isfinite(float(pnl)):
+            continue
+        trades.append(
+            {
+                "closed_at": row["closed_at"],
+                "opened_at": row["opened_at"],
+                "pnl": float(pnl),
+                "execution_type": row["execution_type"],
+            }
+        )
+    return {"ok": True, "strategy_id": clean, "trades": trades}
 
 
 @router.get("/api/strategies/{strategy_id}/export")
@@ -451,6 +515,35 @@ def batch_transition_strategies(body: BatchTransitionBody):
 @router.post("/api/strategies/{strategy_id}/promote")
 def promote_strategy(strategy_id: str, body: lifecycle.StrategyPromoteBody):
     return lifecycle.promote_strategy(strategy_id, body)
+
+
+class LiveCeilingBody(BaseModel):
+    # None clears the ceiling (the account-wide budget caps still apply).
+    ceiling_usd: float | None = Field(default=None, gt=0)
+
+
+@router.put("/api/strategies/{strategy_id}/live-ceiling")
+def update_strategy_live_ceiling(strategy_id: str, body: LiveCeilingBody):
+    """GO-LIVE-1: set or clear a strategy's per-asset live notional ceiling.
+
+    The ceiling is normally set at the go-live confirmation; this lets the
+    operator adjust it afterwards (or add one to a strategy that went live
+    before ceilings existed). Enforced per order on every live open path."""
+    from forven.db import get_db
+    from forven.exchange.risk import set_live_notional_ceiling
+
+    sid = strategy_id.strip()
+    with get_db() as conn:
+        row = conn.execute("SELECT id, symbol FROM strategies WHERE id = ?", (sid,)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Strategy not found")
+    try:
+        entry = set_live_notional_ceiling(
+            sid, body.ceiling_usd, asset=row["symbol"], actor="ui",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, "strategy_id": sid, "ceiling": entry or None}
 
 @router.patch("/api/lifecycle/strategies/{strategy_id}/params")
 def update_strategy_default_params(strategy_id: str, body: PatchResultParamsBody):

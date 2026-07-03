@@ -123,7 +123,6 @@ FORVEN_LAB_DB = FORVEN_HOME / "forven_lab.db"
 AUTH_FILE = FORVEN_HOME / "auth.json"
 CONFIG_FILE = FORVEN_HOME / "config.json"
 WORKSPACE_DIR = FORVEN_HOME / "workspace"
-CHROMA_DIR = FORVEN_HOME / "chromadb"
 LEGACY_WORKSPACE_DIR = LEGACY_FORVEN_HOME / "workspace"
 
 # OpenClaw paths (for migration)

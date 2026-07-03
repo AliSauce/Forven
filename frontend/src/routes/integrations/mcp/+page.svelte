@@ -177,13 +177,17 @@
 <div class="p-4 text-gray-200">
 	<div class="flex items-center justify-between mb-4">
 		<div>
-			<h1 class="text-xl font-semibold">MCP Servers</h1>
-			<p class="text-xs text-gray-500 mt-0.5">
-				Model Context Protocol servers expose tools that granted agents can call.
+			<h1 class="text-xl font-semibold">Agent Tool Servers</h1>
+			<p class="text-xs text-gray-500 mt-0.5 max-w-2xl">
+				The <span class="text-gray-300">outbound</span> direction: register an external MCP server
+				(a filesystem server, web search, a ticker API, …) and its tools become callable by
+				<span class="text-gray-300">Forven's own internal agents</span> — scoped per agent via
+				grants on each agent's page. Connecting an outside assistant <em>into</em> Forven is the
+				other tab (AI Clients); most setups never need anything here.
 			</p>
 		</div>
 		<button
-			class="px-3 py-1.5 bg-blue-700 hover:bg-blue-600 text-white text-sm rounded"
+			class="terminal-button-primary text-sm"
 			on:click={() => {
 				resetCreate();
 				showCreate = !showCreate;
@@ -245,7 +249,7 @@
 						{/each}
 						<button
 							type="button"
-							class="self-start text-[11px] text-blue-400 hover:text-blue-300"
+							class="self-start text-[11px] text-[#888] hover:text-white"
 							on:click={() => (createArgs = [...createArgs, ''])}
 						>
 							+ Add arg
@@ -286,7 +290,7 @@
 						{/each}
 						<button
 							type="button"
-							class="self-start text-[11px] text-blue-400 hover:text-blue-300"
+							class="self-start text-[11px] text-[#888] hover:text-white"
 							on:click={() => (createHeaders = [...createHeaders, { key: '', value: '' }])}
 						>
 							+ Add header
@@ -319,7 +323,7 @@
 					{/each}
 					<button
 						type="button"
-						class="self-start text-[11px] text-blue-400 hover:text-blue-300"
+						class="self-start text-[11px] text-[#888] hover:text-white"
 						on:click={() => (createEnv = [...createEnv, { key: '', value: '' }])}
 					>
 						+ Add env var
@@ -358,7 +362,7 @@
 					Cancel
 				</button>
 				<button
-					class="px-3 py-1.5 bg-blue-700 hover:bg-blue-600 text-white text-xs rounded disabled:opacity-50"
+					class="terminal-button-primary text-xs disabled:opacity-50"
 					on:click={handleCreate}
 					disabled={creating}
 				>
@@ -389,9 +393,10 @@
 		<div class="text-xs text-red-400">{loadError}</div>
 	{:else if servers.length === 0}
 		<div class="bg-[#0d0d0d] border border-[#222] rounded p-6 text-center">
-			<p class="text-sm text-gray-400">No MCP servers configured yet.</p>
+			<p class="text-sm text-gray-400">No agent tool servers configured — that's the normal state.</p>
 			<p class="text-xs text-gray-500 mt-1">
-				Add a server to expose external tools to your agents.
+				Add one only when a Forven agent needs an external tool (e.g. web search during research).
+				To connect Claude/Cursor/Codex into Forven, use the AI Clients tab instead.
 			</p>
 		</div>
 	{:else}
@@ -413,7 +418,7 @@
 							<td class="px-3 py-2 font-mono">
 								<a
 									href={`/integrations/mcp/${encodeURIComponent(s.name)}`}
-									class="text-blue-400 hover:underline"
+									class="text-white hover:underline"
 								>
 									{s.name}
 								</a>
@@ -437,7 +442,7 @@
 							</td>
 							<td class="px-3 py-2 text-right">
 								<button
-									class="px-2 py-0.5 text-[11px] text-blue-400 hover:text-blue-300 disabled:opacity-50"
+									class="px-2 py-0.5 text-[11px] text-[#888] hover:text-white disabled:opacity-50"
 									on:click={() => handleTest(s.name)}
 									disabled={busyName === s.name}
 								>

@@ -39,6 +39,7 @@ _PRICING: dict[tuple[str, str], tuple[float, float]] = {
     ("openai", "gpt-5.2-mini"): (0.30, 1.20),
     ("openai", "gpt-5.4"): (5.00, 15.00),
     ("openai", "gpt-5.4-mini"): (0.30, 1.20),
+    ("openai", "gpt-5.5"): (5.00, 15.00),
     ("openai", "o1"): (15.00, 60.00),
     ("openai", "o1-mini"): (3.00, 12.00),
     ("openai", "o1-preview"): (15.00, 60.00),

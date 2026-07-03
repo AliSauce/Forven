@@ -127,7 +127,7 @@
 				<span>Memory</span>
 				<strong>{overview.memory.char_count}/{overview.memory.cap}</strong>
 			</a>
-			<a class="stat" href="/tasks">
+			<a class="stat" href="/agents?tab=tasks">
 				<span>Active Work</span>
 				<strong>{overview.stats.active_tasks}</strong>
 			</a>
@@ -138,10 +138,6 @@
 			<a class="stat" href="/brain?tab=decisions">
 				<span>Decisions</span>
 				<strong>{overview.stats.decisions}</strong>
-			</a>
-			<a class="stat" href="/brain?tab=lessons">
-				<span>Lessons</span>
-				<strong>{overview.stats.lessons}</strong>
 			</a>
 		</section>
 
@@ -188,7 +184,7 @@
 		<section class="panel">
 			<header>
 				<h3>Active Brain-Assigned Work</h3>
-				<a href="/tasks">Open Tasks</a>
+				<a href="/agents?tab=tasks">Open Tasks</a>
 			</header>
 			{#if overview.active_tasks.length === 0}
 				<p class="empty-inline">No pending, running, blocked, or failed Brain-assigned tasks.</p>
@@ -277,14 +273,14 @@
 		justify-content: space-between;
 		gap: 1rem;
 		padding: 1rem;
-		background: #0d0d0d;
-		border: 1px solid #2a2a2a;
-		border-radius: 4px;
+		background: #050505;
+		border: 1px solid #222;
+		border-radius: 0;
 	}
 
 	.kicker {
 		margin: 0 0 0.25rem;
-		color: #7aa2f7;
+		color: #888;
 		font-size: 0.75rem;
 		font-weight: 600;
 		text-transform: uppercase;
@@ -307,7 +303,7 @@
 	button,
 	.panel a,
 	.stat {
-		color: #93c5fd;
+		color: #888;
 		text-decoration: none;
 	}
 
@@ -316,7 +312,7 @@
 		border: 1px solid #333;
 		color: #ddd;
 		padding: 0.5rem 0.875rem;
-		border-radius: 4px;
+		border-radius: 0;
 		cursor: pointer;
 		font-size: 0.875rem;
 	}
@@ -342,14 +338,14 @@
 		flex-direction: column;
 		gap: 0.35rem;
 		padding: 0.875rem;
-		background: #0d0d0d;
-		border: 1px solid #2a2a2a;
-		border-radius: 4px;
+		background: #050505;
+		border: 1px solid #222;
+		border-radius: 0;
 	}
 
 	.stat:hover {
-		border-color: #3f5b8f;
-		background: #111923;
+		border-color: #555;
+		background: #111;
 	}
 
 	.stat span {
@@ -372,9 +368,9 @@
 	}
 
 	.panel {
-		background: #0d0d0d;
-		border: 1px solid #2a2a2a;
-		border-radius: 4px;
+		background: #050505;
+		border: 1px solid #222;
+		border-radius: 0;
 		padding: 0.875rem;
 	}
 
@@ -400,7 +396,7 @@
 	}
 
 	.panel header a:hover {
-		color: #93c5fd;
+		color: #888;
 		text-decoration: underline;
 	}
 
@@ -413,8 +409,8 @@
 	.empty {
 		padding: 1rem;
 		text-align: center;
-		border: 1px dashed #2a2a2a;
-		border-radius: 4px;
+		border: 1px dashed #222;
+		border-radius: 0;
 	}
 
 	.error-banner {
@@ -422,7 +418,7 @@
 		border: 1px solid #5a2020;
 		color: #f8c0c0;
 		padding: 0.625rem 0.875rem;
-		border-radius: 4px;
+		border-radius: 0;
 		font-size: 0.875rem;
 	}
 
@@ -455,8 +451,8 @@
 		justify-content: space-between;
 		gap: 0.75rem;
 		padding: 0.625rem 0.75rem;
-		border-radius: 4px;
-		border: 1px solid #2a2a2a;
+		border-radius: 0;
+		border: 1px solid #222;
 		background: #050505;
 	}
 
@@ -471,8 +467,8 @@
 	}
 
 	.attention.info {
-		border-color: #1e3a5f;
-		background: #0d1320;
+		border-color: #1a1a1a;
+		background: #050505;
 	}
 
 	.attention strong {
@@ -512,8 +508,8 @@
 	.activity-list li {
 		padding: 0.625rem 0.75rem;
 		background: #050505;
-		border: 1px solid #1f1f1f;
-		border-radius: 4px;
+		border: 1px solid #1a1a1a;
+		border-radius: 0;
 	}
 
 	.task-head,
@@ -529,14 +525,14 @@
 
 	.task-head a {
 		font-family: 'JetBrains Mono', 'Consolas', monospace;
-		color: #93c5fd;
+		color: #888;
 	}
 
 	.status,
 	.type,
 	.level {
 		padding: 0.0625rem 0.4rem;
-		border-radius: 999px;
+		border-radius: 0;
 		background: #1f1f1f;
 		color: #aaa;
 		text-transform: uppercase;
@@ -555,8 +551,8 @@
 	}
 
 	.status.running {
-		background: #1e3a5f;
-		color: #93c5fd;
+		background: #0f3d28;
+		color: #34d399;
 	}
 
 	.status.done {
@@ -602,8 +598,8 @@
 		gap: 1rem;
 		padding: 0.625rem 0.75rem;
 		background: #050505;
-		border: 1px solid #1f1f1f;
-		border-radius: 4px;
+		border: 1px solid #1a1a1a;
+		border-radius: 0;
 	}
 
 	.failure-list span {

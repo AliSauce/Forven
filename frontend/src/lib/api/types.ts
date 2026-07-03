@@ -32,6 +32,9 @@ export interface Dataset {
 	row_count: number;
 	asset_class?: 'crypto' | 'stock' | 'etf' | 'forex' | 'index' | string;
 	market_type?: 'crypto' | 'equity' | 'forex' | 'index' | string;
+	// Venue identity stamped by the write path (forven_market parquet metadata):
+	// 'perp' | 'spot' | 'unknown' | 'unstamped' (legacy pre-stamping file).
+	market?: string;
 }
 
 export interface Job {

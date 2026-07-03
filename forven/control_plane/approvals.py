@@ -348,6 +348,31 @@ def _apply_dethrone_recommendation(
     ).strip().lower()
     if not recommended_target:
         recommended_target = "gauntlet"
+    # GO-LIVE-1: a dethrone only ever moves a strategy DOWN. This apply path runs
+    # transition_stage with force=True off a stored payload, so a payload naming a
+    # stage at-or-above the strategy's current one would bypass the promotion
+    # gates and the go-live confirmation entirely. Refuse anything that isn't a
+    # demotion (live→paper and paper→gauntlet are the legitimate shapes).
+    _stage_rank = {"quick_screen": 0, "gauntlet": 1, "paper": 2, "live_graduated": 3}
+    if recommended_target in _stage_rank:
+        current_stage = ""
+        try:
+            with get_db() as conn:
+                row = conn.execute(
+                    "SELECT COALESCE(stage, status, '') AS stage FROM strategies WHERE id = ?",
+                    (strategy_id,),
+                ).fetchone()
+            current_stage = str(row["stage"] if row else "").strip().lower()
+        except Exception:
+            current_stage = ""
+        if _stage_rank[recommended_target] >= _stage_rank.get(current_stage, -1):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Dethrone recommendation must demote: '{recommended_target}' is not below "
+                    f"the strategy's current stage '{current_stage or 'unknown'}'"
+                ),
+            )
 
     reason = body.reason or f"Operator approved dethrone recommendation (approval #{approval['id']})"
     try:
@@ -443,6 +468,23 @@ def _apply_promotion_approval(
     if not recommended_target:
         raise HTTPException(status_code=400, detail="Promotion approval missing target stage")
 
+    # GO-LIVE-1: approving a promotion INTO live is never a bare click. The
+    # operator must type the confirmation phrase and set the strategy's initial
+    # per-asset notional ceiling; the ceiling is persisted BEFORE the transition
+    # so the strategy is never live-without-a-ceiling (a ceiling on a strategy
+    # that fails to promote is inert — it only binds live opens).
+    if recommended_target == "live_graduated":
+        from forven.exchange.risk import set_live_notional_ceiling, validate_go_live_confirmation
+
+        go_live_error = validate_go_live_confirmation(body.confirm, body.live_notional_ceiling_usd)
+        if go_live_error:
+            raise HTTPException(status_code=400, detail=go_live_error)
+        set_live_notional_ceiling(
+            strategy_id,
+            float(body.live_notional_ceiling_usd),
+            actor=body.actor or "ui",
+        )
+
     reason = body.reason or f"Operator approved promotion (approval #{approval['id']})"
     try:
         from forven.brain import transition_stage
@@ -490,12 +532,7 @@ def _apply_routine_create(
     prompt = str(payload.get("prompt") or "").strip()
     cron_expr = str(payload.get("cron_expr") or "").strip()
     tools_context = str(payload.get("tools_context") or "scheduled").strip() or "scheduled"
-    skills_raw = payload.get("skills") or []
-    skills = (
-        [str(s).strip() for s in skills_raw if str(s).strip()]
-        if isinstance(skills_raw, list)
-        else []
-    )
+    channel = str(payload.get("channel") or "").strip() or None
 
     if not name or not prompt or not cron_expr:
         raise HTTPException(
@@ -513,7 +550,7 @@ def _apply_routine_create(
             prompt=prompt,
             cron_expr=cron_expr,
             tools_context=tools_context,
-            skills=skills,
+            channel=channel,
             enabled=True,
             created_by="brain",
             approval_id=int(approval.get("id")) if approval.get("id") is not None else None,

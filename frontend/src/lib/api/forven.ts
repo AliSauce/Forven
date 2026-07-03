@@ -113,6 +113,76 @@ export interface ForvenRiskStatus {
 			net?: number;
 		}>;
 	};
+	/** PORT-1: the LIVE account-level budget (dollar risk-to-stop + net exposure vs equity). */
+	portfolio_budget_live?: {
+		enabled?: boolean;
+		equity_usd?: number | null;
+		equity_available?: boolean;
+		limits_pct?: Record<string, number>;
+		total_open_risk_usd?: number;
+		total_open_risk_limit_usd?: number | null;
+		total_open_risk_used_frac?: number | null;
+		stops_missing?: number;
+		per_asset?: Record<string, {
+			net_notional_usd?: number;
+			risk_usd?: number;
+			positions?: number;
+			group?: string;
+			limit_usd?: number | null;
+		}>;
+		per_group?: Record<string, {
+			net_notional_usd?: number;
+			risk_usd?: number;
+			positions?: number;
+			limit_usd?: number | null;
+		}>;
+		/** BOOK-BUDGET-1: per-wallet (direction book) capacity and usage. */
+		per_book?: Record<string, {
+			gross_notional_usd?: number;
+			risk_usd?: number;
+			positions?: number;
+			equity_usd?: number | null;
+			limit_usd?: number | null;
+		}>;
+		positions?: Array<{
+			trade_id?: string;
+			asset?: string;
+			direction?: string;
+			strategy_id?: string;
+			notional_usd?: number;
+			risk_usd?: number;
+			stop_price?: number | null;
+			group?: string;
+		}>;
+		groups?: Record<string, string[]>;
+		/** GO-LIVE-1: per-strategy notional ceilings accepted at go-live. */
+		strategy_ceilings?: Record<string, {
+			ceiling_usd?: number;
+			asset?: string | null;
+			set_by?: string;
+			set_at?: string;
+		}>;
+		/** Live-stage strategies with no go-live ceiling recorded (pre-existing lives). */
+		ceilings_missing?: string[];
+	};
+	/** LIQ-1: order-time liquidity guard (limits + recent admit/block decisions). */
+	liquidity_guard_live?: {
+		enabled?: boolean | null;
+		error?: string;
+		limits?: Record<string, number>;
+		recent_decisions?: Array<{
+			asset?: string;
+			side?: string;
+			allowed?: boolean;
+			reason?: string;
+			checked_at?: number;
+			order_notional_usd?: number;
+			day_volume_usd?: number;
+			spread_bps?: number;
+			near_depth_usd?: number;
+			est_impact_bps?: number;
+		}>;
+	};
 }
 
 export interface ForvenRegimeSnapshot {
@@ -893,6 +963,23 @@ export async function getForvenAgents(): Promise<ForvenAgent[]> {
 	return fetchApi('/forven/agents');
 }
 
+export interface ForvenAgentSpendTotal {
+	agent_id: string;
+	tasks: number;
+	cost_usd: number;
+	input_tokens: number;
+	output_tokens: number;
+}
+
+/** Per-agent daily spend rollup — survives run-row pruning. */
+export async function getForvenAgentSpend(days = 30): Promise<{
+	days: number;
+	daily: Array<Record<string, unknown>>;
+	totals: ForvenAgentSpendTotal[];
+}> {
+	return fetchApi(`/agents/spend?days=${days}`);
+}
+
 export async function getForvenAgentDocuments(agentId: string): Promise<ForvenAgentDocumentsResponse> {
 	return fetchApi(`/forven/agents/${encodeURIComponent(agentId)}/documents`);
 }
@@ -1061,6 +1148,8 @@ export async function getNotificationFeed(params: {
 	event_type?: string;
 	group_key?: string;
 	before_id?: number;
+	/** Server-side filter matching the nav-badge "actionable issues" rules. */
+	actionable?: boolean;
 } = {}): Promise<NotificationFeedResponse> {
 	const search = new URLSearchParams();
 	if (params.limit !== undefined) search.set('limit', String(params.limit));
@@ -1070,6 +1159,7 @@ export async function getNotificationFeed(params: {
 	if (params.event_type) search.set('event_type', params.event_type);
 	if (params.group_key) search.set('group_key', params.group_key);
 	if (params.before_id !== undefined) search.set('before_id', String(params.before_id));
+	if (params.actionable) search.set('actionable', 'true');
 	const query = search.toString();
 	return fetchApi(`/notifications${query ? `?${query}` : ''}`);
 }
@@ -1203,6 +1293,21 @@ export async function setSystemMode(mode: SystemMode): Promise<SystemModeRespons
 
 export async function resetTradingHalt(): Promise<TradingResetResponse> {
 	return fetchApi('/system/trading/reset', {
+		method: 'POST',
+		body: JSON.stringify({ confirm: true }),
+	});
+}
+
+/** EQ-BASIS-3: re-anchor HWM / daily start / last equity to a fresh books-aware live read. */
+export async function rebaselineEquityAnchors(): Promise<{
+	ok: boolean;
+	equity: number;
+	high_water_mark: number;
+	previous_high_water_mark: number;
+	daily_start_equity: number;
+	source: string;
+}> {
+	return fetchApi('/risk/equity/rebaseline', {
 		method: 'POST',
 		body: JSON.stringify({ confirm: true }),
 	});
@@ -1497,7 +1602,17 @@ export async function getNowWorking(): Promise<NowWorkingRow[]> {
 export async function promoteForvenStrategy(
 	strategyId: string,
 	toStatus: string,
-	options?: { fromStatus?: string; fromOwner?: string; reason?: string; force?: boolean; override?: boolean }
+	options?: {
+		fromStatus?: string;
+		fromOwner?: string;
+		reason?: string;
+		force?: boolean;
+		override?: boolean;
+		/** GO-LIVE-1: typed confirmation phrase ("GO LIVE") required to land in live_graduated. */
+		confirm?: string;
+		/** GO-LIVE-1: initial per-asset notional ceiling (USD), enforced per live order. */
+		liveNotionalCeilingUsd?: number;
+	}
 ): Promise<{
 	ok: boolean;
 	strategy_id: string;
@@ -1521,6 +1636,8 @@ export async function promoteForvenStrategy(
 			reason: options?.reason,
 			force: options?.force ?? false,
 			override: options?.override ?? false,
+			confirm: options?.confirm,
+			live_notional_ceiling_usd: options?.liveNotionalCeilingUsd,
 		}),
 	});
 	if (result?.ok === false) {
@@ -1536,6 +1653,17 @@ export async function promoteForvenStrategy(
 		to_status: String(result?.to_status ?? toStatus),
 		updated_at: String(result?.updated_at ?? new Date().toISOString()),
 	};
+}
+
+/** GO-LIVE-1: set (or clear, with null) a strategy's per-asset live notional ceiling. */
+export async function setLiveNotionalCeiling(
+	strategyId: string,
+	ceilingUsd: number | null
+): Promise<{ ok: boolean; strategy_id: string; ceiling: Record<string, unknown> | null }> {
+	return fetchApi(`/strategies/${encodeURIComponent(strategyId)}/live-ceiling`, {
+		method: 'PUT',
+		body: JSON.stringify({ ceiling_usd: ceilingUsd }),
+	});
 }
 
 export interface StrategyHandoffPayload {
@@ -1640,6 +1768,10 @@ export interface ApprovalDecisionPayload {
 	actor?: string;
 	feedback?: string;
 	reason?: string;
+	/** GO-LIVE-1: typed confirmation phrase ("GO LIVE"), required when approving a live promotion. */
+	confirm?: string;
+	/** GO-LIVE-1: initial per-asset notional ceiling (USD), required when approving a live promotion. */
+	live_notional_ceiling_usd?: number;
 }
 
 export interface ApprovalHandoffPayload {

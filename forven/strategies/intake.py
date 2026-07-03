@@ -313,7 +313,7 @@ def scan_custom_strategies(*, register: bool = False) -> dict:
         # GATE B: lookahead / data-leak probe (see register_custom_strategy_file).
         # A future-bar leak routes the strategy to research_only (inert) instead
         # of the quick_screen funnel.
-        from forven.strategies.lookahead_probe import detect_lookahead
+        from forven.strategies.lookahead_probe import detect_execution_crash, detect_lookahead
 
         lookahead_reason = detect_lookahead(probe)
         if lookahead_reason:
@@ -323,6 +323,20 @@ def scan_custom_strategies(*, register: bool = False) -> dict:
             log.warning(
                 "Intake: lookahead detected in %s (type=%s) — registering as research_only: %s",
                 modname, type_name, lookahead_reason,
+            )
+
+        # GATE C: execution smoke probe. Reject a strategy that crashes on a clean
+        # synthetic run (canonically a per-bar self.position read) here, rather
+        # than letting it die with a cryptic error three gates later. Downgrading
+        # certified routes it to research_only (initial_stage derives from it below).
+        crash_reason = detect_execution_crash(probe)
+        if crash_reason:
+            certified = False
+            if not cert_error:
+                cert_error = crash_reason
+            log.warning(
+                "Intake: execution smoke test failed for %s (type=%s) — registering as research_only: %s",
+                modname, type_name, crash_reason,
             )
 
         existing_strategy = _find_existing_strategy_container(
@@ -551,7 +565,7 @@ def register_custom_strategy_file(
     # vectorized generate_signals reads future bars (e.g. a `.shift(-1)`) is
     # routed to research_only — inert, since the gauntlet backfill only picks up
     # quick_screen/gauntlet — instead of entering the normal funnel toward paper.
-    from forven.strategies.lookahead_probe import detect_lookahead
+    from forven.strategies.lookahead_probe import detect_execution_crash, detect_lookahead
 
     lookahead_reason = detect_lookahead(probe)
     lookahead_blocked = bool(lookahead_reason)
@@ -566,7 +580,21 @@ def register_custom_strategy_file(
             modname, type_name, lookahead_reason,
         )
 
-    initial_stage = "research_only" if lookahead_blocked else "quick_screen"
+    # GATE C: execution smoke probe. A strategy that raises on a clean synthetic
+    # run (canonically: a per-bar generate_signal reading self.position, which the
+    # engine never injects) would crash every backtest with a cryptic error three
+    # gates later. Catch it here and route to research_only with the real reason.
+    crash_reason = detect_execution_crash(probe)
+    if crash_reason:
+        certified = False
+        if not cert_error:
+            cert_error = crash_reason
+        log.warning(
+            "Targeted intake: execution smoke test failed for %s (type=%s) — registering as research_only: %s",
+            modname, type_name, crash_reason,
+        )
+
+    initial_stage = "research_only" if (lookahead_blocked or crash_reason) else "quick_screen"
 
     existing_strategy = _find_existing_strategy_container(
         type_name=type_name,
@@ -734,7 +762,14 @@ def register_imported_strategy_file(
         certified = False
         if not cert_error:
             cert_error = meta.get("lookahead_reason")
-    initial_stage = "research_only" if (lookahead_blocked or not certified) else "quick_screen"
+    # Execution smoke probe ran in the worker (the untrusted class never reaches
+    # the parent). A crash on clean synthetic data → research_only with the reason.
+    execution_crash_reason = meta.get("execution_crash_reason")
+    if execution_crash_reason:
+        certified = False
+        if not cert_error:
+            cert_error = execution_crash_reason
+    initial_stage = "research_only" if (lookahead_blocked or execution_crash_reason or not certified) else "quick_screen"
     stored_params = (
         meta.get("canonical_params") if (certified and not lookahead_blocked) else meta.get("default_params")
     ) or {}

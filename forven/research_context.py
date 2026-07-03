@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any, Mapping, Sequence
 
 from forven.research_contract import ResearchContract, build_research_contract, default_research_settings
-from forven.strategy_diversity import render_strategy_diversity_guard
+from forven.strategy_diversity import render_failure_taxonomy, render_strategy_diversity_guard
 from forven.workspace import read_workspace
 
 
@@ -238,6 +238,13 @@ def build_research_context(
     if diversity_guard:
         sections.append(diversity_guard)
 
+    # Constraint-like outcome memory: structured gate-rejection patterns. Always
+    # injected (it steers AWAY from disproven regions rather than anchoring
+    # toward priors, so it doesn't conflict with novelty contracts).
+    failure_taxonomy = render_failure_taxonomy()
+    if failure_taxonomy:
+        sections.append(failure_taxonomy)
+
     inspiration_mode = contract.memory_mode.get("inspiration_memory")
     normalized_inspiration_mode = str(inspiration_mode).strip().lower() if inspiration_mode is not None else ""
     if inspiration_mode not in {None, False} and normalized_inspiration_mode not in {"", "off"}:
@@ -249,5 +256,18 @@ def build_research_context(
         )
         if inspiration_section:
             sections.append(inspiration_section)
+
+        # Learned quant skills are "what works" priors — inspiration-class, so
+        # they share the inspiration-memory gate. Ideation previously got only a
+        # 5-line LESSONS.md digest while the full outcome-weighted skill KB went
+        # exclusively to non-research agents.
+        try:
+            from forven.context import get_learned_skills_context
+
+            learned = get_learned_skills_context()
+        except Exception:
+            learned = ""
+        if learned:
+            sections.append(learned)
 
     return "\n\n---\n\n".join(section for section in sections if _clean_text(section))

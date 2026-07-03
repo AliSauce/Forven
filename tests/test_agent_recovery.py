@@ -9,10 +9,7 @@ from datetime import datetime, timedelta, timezone
 import httpx
 
 from forven.agents import runner
-from forven.agents.runner import (
-    _current_agent_id,
-    _recover_dangling_tasks,
-)
+from forven.agents.runner import _current_agent_id
 from forven.db import (
     get_db,
     reap_long_running_agent_tasks,
@@ -31,47 +28,6 @@ class TestAgentTaskRecovery:
             "INSERT OR IGNORE INTO agents (id, name, role, created_at) "
             "VALUES ('quant-researcher', 'Quant Researcher', 'researcher', datetime('now'))"
         )
-
-    def test_recovers_running_tasks(self, forven_db):
-        from forven.db import get_db
-
-        now = datetime.now(timezone.utc).isoformat()
-        with get_db() as conn:
-            self._ensure_agent(conn)
-            conn.execute(
-                "INSERT INTO agent_tasks (agent_id, type, title, description, status, created_at) "
-                "VALUES ('quant-researcher', 'research', 'Test task', 'desc', 'running', ?)",
-                (now,),
-            )
-
-        _recover_dangling_tasks()
-
-        with get_db() as conn:
-            row = conn.execute("SELECT status, error FROM agent_tasks LIMIT 1").fetchone()
-        assert row["status"] == "failed"
-        assert "crashed" in row["error"].lower() or "restarted" in row["error"].lower()
-
-    def test_no_op_when_no_dangling(self, forven_db):
-        # Should not raise
-        _recover_dangling_tasks()
-
-    def test_leaves_pending_tasks_alone(self, forven_db):
-        from forven.db import get_db
-
-        now = datetime.now(timezone.utc).isoformat()
-        with get_db() as conn:
-            self._ensure_agent(conn)
-            conn.execute(
-                "INSERT INTO agent_tasks (agent_id, type, title, description, status, created_at) "
-                "VALUES ('quant-researcher', 'research', 'Pending task', 'desc', 'pending', ?)",
-                (now,),
-            )
-
-        _recover_dangling_tasks()
-
-        with get_db() as conn:
-            row = conn.execute("SELECT status FROM agent_tasks LIMIT 1").fetchone()
-        assert row["status"] == "pending"
 
     def test_recover_stale_running_tasks_fails_execution_trader_by_default(self, forven_db):
         from forven.db import get_db

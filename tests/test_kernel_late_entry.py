@@ -308,7 +308,10 @@ def test_monitor_closes_short_at_reanchored_stop(forven_db):
         out = dict(c.execute(
             "SELECT status, closed_at, pnl_pct, fill_exit_price FROM trades WHERE id=?", (tid,)).fetchone())
     assert out["status"] == "CLOSED"
-    assert out["closed_at"] == "2026-06-27T14:00:00+00:00"        # the breach bar, not scan time
+    # The breach is INTRABAR on the 14:00 bar — stamped at that bar's CLOSE (15:00), the
+    # earliest moment a closed-candle engine can know it. Never the bar-open label
+    # (backdates to before the touch) and never the scan moment.
+    assert out["closed_at"] == "2026-06-27T15:00:00+00:00"
     assert out["fill_exit_price"] == pytest.approx(_expected_short_stop(1590.0), rel=1e-4)  # at the stop
     assert out["pnl_pct"] < 0                                      # short stopped out above entry → loss
 
@@ -332,8 +335,10 @@ def test_monitor_price_exit_also_charges_funding(forven_db):
     stop_price = _expected_short_stop(1590.0)
     drag = 2.0 * (4.5 + 2.0) / 10000.0 * 1.0
     price_leg = ((1590.0 - stop_price) / 1590.0 - drag) * 0.5
-    # window [12:00, 14:00) covers the 12:00 and 13:00 bars (0.02 total funding rate)
-    expected_funding = 0.02 * 1.0 * 1.0 * 0.5
+    # The intrabar breach closes at the 14:00 bar's CLOSE (15:00), so the funding window
+    # [12:00, 15:00) covers the 12:00, 13:00 AND 14:00 bars (0.03 total funding rate) —
+    # the position really was held through the breach bar's funding hour.
+    expected_funding = 0.03 * 1.0 * 1.0 * 0.5
     assert out["pnl_pct"] == pytest.approx(price_leg + expected_funding, rel=1e-4)
     assert json.loads(out["signal_data"])["funding_cost_pct"] == pytest.approx(expected_funding, rel=1e-4)
 
@@ -362,7 +367,7 @@ def test_monitor_closes_long_at_reanchored_stop(forven_db):
         out = dict(c.execute(
             "SELECT status, closed_at, pnl_pct, fill_exit_price FROM trades WHERE id=?", (tid,)).fetchone())
     assert out["status"] == "CLOSED"
-    assert out["closed_at"] == "2026-06-27T14:00:00+00:00"
+    assert out["closed_at"] == "2026-06-27T15:00:00+00:00"            # breach bar's CLOSE
     assert out["fill_exit_price"] == pytest.approx(1558.2, rel=1e-4)  # at the re-anchored stop, not 1470
     assert out["pnl_pct"] < 0
 
@@ -379,7 +384,7 @@ def test_monitor_closes_long_at_reanchored_target(forven_db):
         out = dict(c.execute(
             "SELECT status, closed_at, pnl_pct, fill_exit_price FROM trades WHERE id=?", (tid,)).fetchone())
     assert out["status"] == "CLOSED"
-    assert out["closed_at"] == "2026-06-27T14:00:00+00:00"
+    assert out["closed_at"] == "2026-06-27T15:00:00+00:00"         # breach bar's CLOSE
     assert out["fill_exit_price"] == pytest.approx(1653.6, rel=1e-4)
     assert out["pnl_pct"] > 0                                      # long hit its target → gain
 
@@ -563,7 +568,7 @@ def test_fill_now_close_keeps_kernel_price_for_price_exit_reason(forven_db):
         out = dict(c.execute(
             "SELECT closed_at, fill_exit_price, signal_data FROM trades WHERE id=?", (tid,)).fetchone())
     assert out["fill_exit_price"] == pytest.approx(1500.0)   # kernel's price-exit level, unchanged
-    assert out["closed_at"] == "2026-06-27T16:00:00+00:00"
+    assert out["closed_at"] == "2026-06-27T17:00:00+00:00"   # intrabar breach → exit bar's CLOSE
     assert json.loads(out["signal_data"]).get("close_fill_now") is False
 
 

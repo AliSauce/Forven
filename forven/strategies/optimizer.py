@@ -1,7 +1,6 @@
 """Strategy parameter optimizer — grid search over parameter space.
 
 Exhaustive grid search with WFA validation on best candidates.
-Results stored in ChromaDB for future recall.
 """
 
 import gc
@@ -782,10 +781,10 @@ def optimize_strategy(
 
     wfa_pass = wfa_result.get("verdict") == "PASS"
 
-    # Step 3: Store in ChromaDB
+    # Step 3: Feed the quant-skills learning loop
     try:
-        from forven.vectordb import store_backtest_result
-        store_backtest_result(
+        from forven.quant_skills_extractor import record_backtest_for_learning
+        record_backtest_for_learning(
             strategy_id=f"{strategy_id}-optimized",
             asset=asset,
             strategy_type=strategy_type,

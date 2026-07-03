@@ -21,6 +21,7 @@ operator UI.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import Any
@@ -143,33 +144,39 @@ def list_servers() -> dict:
 @router.post("/api/mcp/servers", status_code=201)
 async def create_server(body: MCPServerCreate) -> dict:
     _validate_create(body)
-    with get_db() as conn:
-        existing = conn.execute(
-            "SELECT name FROM mcp_servers WHERE name = ?", (body.name,)
-        ).fetchone()
-        if existing:
-            raise HTTPException(409, f"server {body.name!r} already exists")
-        conn.execute(
-            "INSERT INTO mcp_servers (name, transport, command, args_json, "
-            "env_json, url, headers_json, enabled, tools_include_json, "
-            "tools_exclude_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                body.name,
-                body.transport,
-                body.command,
-                json.dumps(body.args),
-                json.dumps(body.env),
-                body.url,
-                json.dumps(body.headers),
-                1 if body.enabled else 0,
-                json.dumps(body.tools_include) if body.tools_include is not None else None,
-                json.dumps(body.tools_exclude),
-            ),
-        )
-        conn.commit()
-        row = conn.execute(
-            "SELECT * FROM mcp_servers WHERE name = ?", (body.name,)
-        ).fetchone()
+
+    def _insert_sync():
+        with get_db() as conn:
+            existing = conn.execute(
+                "SELECT name FROM mcp_servers WHERE name = ?", (body.name,)
+            ).fetchone()
+            if existing:
+                raise HTTPException(409, f"server {body.name!r} already exists")
+            conn.execute(
+                "INSERT INTO mcp_servers (name, transport, command, args_json, "
+                "env_json, url, headers_json, enabled, tools_include_json, "
+                "tools_exclude_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    body.name,
+                    body.transport,
+                    body.command,
+                    json.dumps(body.args),
+                    json.dumps(body.env),
+                    body.url,
+                    json.dumps(body.headers),
+                    1 if body.enabled else 0,
+                    json.dumps(body.tools_include) if body.tools_include is not None else None,
+                    json.dumps(body.tools_exclude),
+                ),
+            )
+            conn.commit()
+            return conn.execute(
+                "SELECT * FROM mcp_servers WHERE name = ?", (body.name,)
+            ).fetchone()
+
+    # Off-loop: a SQLite write can wait up to the 60s busy timeout under
+    # contention — that must never stall the request loop (drops the live WS).
+    row = await asyncio.to_thread(_insert_sync)
 
     if body.enabled:
         try:
@@ -195,50 +202,54 @@ def get_server(name: str) -> dict:
 
 @router.put("/api/mcp/servers/{name}")
 async def update_server(name: str, body: MCPServerUpdate) -> dict:
-    with get_db() as conn:
-        row = conn.execute(
-            "SELECT * FROM mcp_servers WHERE name = ?", (name,)
-        ).fetchone()
-        if row is None:
-            raise HTTPException(404, f"server {name!r} not found")
-        was_enabled = bool(row["enabled"])
+    def _update_sync():
+        with get_db() as conn:
+            row = conn.execute(
+                "SELECT * FROM mcp_servers WHERE name = ?", (name,)
+            ).fetchone()
+            if row is None:
+                raise HTTPException(404, f"server {name!r} not found")
+            was_enabled = bool(row["enabled"])
 
-        sets: list[str] = []
-        params: list[Any] = []
-        if body.transport is not None:
-            if body.transport not in VALID_TRANSPORTS:
-                raise HTTPException(400, f"transport must be one of {sorted(VALID_TRANSPORTS)}")
-            sets.append("transport = ?"); params.append(body.transport)
-        if body.command is not None:
-            sets.append("command = ?"); params.append(body.command)
-        if body.args is not None:
-            sets.append("args_json = ?"); params.append(json.dumps(body.args))
-        if body.env is not None:
-            sets.append("env_json = ?"); params.append(json.dumps(body.env))
-        if body.url is not None:
-            sets.append("url = ?"); params.append(body.url)
-        if body.headers is not None:
-            sets.append("headers_json = ?"); params.append(json.dumps(body.headers))
-        if body.enabled is not None:
-            sets.append("enabled = ?"); params.append(1 if body.enabled else 0)
-        if body.tools_include is not None:
-            sets.append("tools_include_json = ?"); params.append(json.dumps(body.tools_include))
-        if body.tools_exclude is not None:
-            sets.append("tools_exclude_json = ?"); params.append(json.dumps(body.tools_exclude))
+            sets: list[str] = []
+            params: list[Any] = []
+            if body.transport is not None:
+                if body.transport not in VALID_TRANSPORTS:
+                    raise HTTPException(400, f"transport must be one of {sorted(VALID_TRANSPORTS)}")
+                sets.append("transport = ?"); params.append(body.transport)
+            if body.command is not None:
+                sets.append("command = ?"); params.append(body.command)
+            if body.args is not None:
+                sets.append("args_json = ?"); params.append(json.dumps(body.args))
+            if body.env is not None:
+                sets.append("env_json = ?"); params.append(json.dumps(body.env))
+            if body.url is not None:
+                sets.append("url = ?"); params.append(body.url)
+            if body.headers is not None:
+                sets.append("headers_json = ?"); params.append(json.dumps(body.headers))
+            if body.enabled is not None:
+                sets.append("enabled = ?"); params.append(1 if body.enabled else 0)
+            if body.tools_include is not None:
+                sets.append("tools_include_json = ?"); params.append(json.dumps(body.tools_include))
+            if body.tools_exclude is not None:
+                sets.append("tools_exclude_json = ?"); params.append(json.dumps(body.tools_exclude))
 
-        if sets:
-            sets.append("updated_at = strftime('%Y-%m-%dT%H:%M:%S+00:00', 'now')")
-            params.append(name)
-            conn.execute(
-                f"UPDATE mcp_servers SET {', '.join(sets)} WHERE name = ?",
-                params,
-            )
-            conn.commit()
+            if sets:
+                sets.append("updated_at = strftime('%Y-%m-%dT%H:%M:%S+00:00', 'now')")
+                params.append(name)
+                conn.execute(
+                    f"UPDATE mcp_servers SET {', '.join(sets)} WHERE name = ?",
+                    params,
+                )
+                conn.commit()
 
-        row = conn.execute(
-            "SELECT * FROM mcp_servers WHERE name = ?", (name,)
-        ).fetchone()
-        is_enabled = bool(row["enabled"])
+            row = conn.execute(
+                "SELECT * FROM mcp_servers WHERE name = ?", (name,)
+            ).fetchone()
+            return row, was_enabled, bool(row["enabled"])
+
+    # Off-loop: SQLite writes can wait on the busy timeout (see create_server).
+    row, was_enabled, is_enabled = await asyncio.to_thread(_update_sync)
 
     # Re-register on enable transitions or whenever an enabled server's
     # config changed (cheap to do — closes and re-lists).

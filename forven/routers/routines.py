@@ -34,7 +34,7 @@ class RoutineCreateBody(BaseModel):
     prompt: str = Field(..., min_length=1)
     cron_expr: str = Field(..., min_length=1, max_length=200)
     tools_context: str = "scheduled"
-    skills: list[str] | None = None
+    channel: str | None = Field(default=None, max_length=200)
     enabled: bool = True
 
 
@@ -43,7 +43,8 @@ class RoutineUpdateBody(BaseModel):
     prompt: str | None = None
     cron_expr: str | None = None
     tools_context: str | None = None
-    skills: list[str] | None = None
+    # Discord channel alias or raw id; send "" to clear the channel.
+    channel: str | None = Field(default=None, max_length=200)
     enabled: bool | None = None
 
 
@@ -57,6 +58,30 @@ def list_routines(enabled_only: bool = False) -> dict[str, Any]:
     return {"routines": control_plane_routines.list_routines(enabled_only=enabled_only)}
 
 
+# NOTE: registered before /api/routines/{routine_id} so "channels" is not
+# captured as a routine id.
+@router.get("/api/routines/channels")
+def list_routine_channels() -> dict[str, Any]:
+    """Discord channels the bot can deliver routine results to.
+
+    Prefers the live guild channel list the bot publishes on connect (works
+    on any user's server); falls back to the static alias map when the bot
+    has never connected.
+    """
+    from forven.discord_channels import available_channels, channel_aliases
+
+    live = available_channels()
+    if live:
+        return {
+            "channels": [{"id": c["id"], "label": f"#{c['name']}"} for c in live],
+            "source": "discord",
+        }
+    return {
+        "channels": [{"id": alias, "label": f"#{alias}"} for alias in channel_aliases()],
+        "source": "aliases",
+    }
+
+
 @router.post("/api/routines")
 def create_routine(body: RoutineCreateBody) -> dict[str, Any]:
     try:
@@ -65,7 +90,7 @@ def create_routine(body: RoutineCreateBody) -> dict[str, Any]:
             prompt=body.prompt,
             cron_expr=body.cron_expr,
             tools_context=body.tools_context,
-            skills=body.skills,
+            channel=body.channel,
             enabled=body.enabled,
             created_by="operator",
         )

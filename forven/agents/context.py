@@ -4,9 +4,6 @@ import os
 import re
 import shlex
 from contextvars import ContextVar, Token
-from datetime import datetime, timezone
-
-from forven.db import get_db
 
 _current_agent_id_var: ContextVar[str | None] = ContextVar("forven_current_agent_id", default=None)
 _current_task_display_id_var: ContextVar[str | None] = ContextVar("forven_current_task_display_id", default=None)
@@ -46,30 +43,6 @@ def reset_tool_context(tokens: tuple[Token, ...]) -> None:
     _current_strategy_id_var.reset(tokens[2])
     if len(tokens) > 3:
         _current_tools_context_var.reset(tokens[3])
-
-
-def _recover_dangling_tasks() -> int:
-    """Mark orphaned running agent tasks as failed after process restart.
-
-    This keeps legacy startup-recovery behavior available for tests and callers
-    that still import `_recover_dangling_tasks` from this module.
-    """
-    now = datetime.now(timezone.utc).isoformat()
-    note = "Recovered after process restarted; task was previously running."
-
-    with get_db() as conn:
-        rows = conn.execute(
-            "SELECT id FROM agent_tasks WHERE status = 'running'"
-        ).fetchall()
-        ids = [str(row["id"]) for row in rows]
-        if not ids:
-            return 0
-        placeholders = ",".join("?" for _ in ids)
-        conn.execute(
-            f"UPDATE agent_tasks SET status='failed', error=?, completed_at=? WHERE id IN ({placeholders})",
-            (note, now, *ids),
-        )
-    return len(ids)
 
 
 def _translate_find_command_for_windows(command: str) -> str:

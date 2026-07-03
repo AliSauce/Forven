@@ -77,11 +77,28 @@ class KernelResult:
     the live position and the backtest force-closes at the final bar. ``closed_gross`` is the
     chronological list of pre-size, leveraged, fee-netted gross returns (the kelly evidence
     series) — exposed so a caller force-closing an open position appends consistently.
+
+    ``pending_entries``/``pending_exits`` map direction -> the order the LAST closed bar's
+    signal decides for the NEXT (not-yet-closed) bar's open. The kernel itself cannot hold
+    that position/exit yet — the fill bar isn't in the frame — but the decision is already
+    deterministic (signals are functions of closed bars only). The scanner acts on these at
+    signal-bar close instead of waiting a full bar for the fill bar to close (the one-bar
+    entry/exit lag vs the validated backtest). The backtest ignores them (``force_close``
+    only touches ``open_positions``), so parity semantics are unchanged. Only open-tick
+    decisions are projected (entry signal, exit signal, time-stop); intrabar stop/TP levels
+    depend on the forming bar's unrealized high/low and stay with the existing machinery.
+
+    ``ec`` is the normalized execution-controls dict :func:`simulate` ran with — exposed so
+    the scanner can size/stop a pending entry at its actual fill mark with the exact same
+    controls (including the default_controls fallback resolved inside the pipeline).
     """
 
     closed_trades: list[dict] = field(default_factory=list)
     open_positions: dict[str, dict] = field(default_factory=dict)
     closed_gross: list[float] = field(default_factory=list)
+    pending_entries: dict[str, dict] = field(default_factory=dict)
+    pending_exits: dict[str, dict] = field(default_factory=dict)
+    ec: dict | None = None
 
 
 def finalize(
@@ -148,12 +165,22 @@ def simulate(
     allowed_modes: tuple[str, ...],
     ec: dict,
     initial_capital: float,
+    intrabar_resolver=None,
 ) -> KernelResult:
     """Walk the bars and produce closed trades + still-open positions (no force-close).
 
     Entries fill at the NEXT bar's open (no lookahead). Stops are evaluated intrabar
     against each subsequent bar's high/low; a position entered on bar *i* is first
     stop-checked on bar *i+1*. Per-trade ``size_fraction`` scales price PnL.
+
+    ``intrabar_resolver`` (optional): when a bar touches BOTH the stop and the
+    take-profit, the ordering is ambiguous from OHLC alone and the kernel
+    assumes stop-first (pessimistic). A resolver — built from the 1m sub-bar
+    path by the driver when ``kernel_intrabar_resolution`` is enabled — is
+    called as ``resolver(bar_ts, direction, stop_price, tp_price)`` and
+    returns ``"stop"`` / ``"tp"`` / ``None`` (None = stay pessimistic). It is
+    consulted ONLY in the both-touched case, so single-touch bars are
+    byte-identical with the resolver on or off.
     """
     opens = df["open"].astype(float).values
     highs = df["high"].astype(float).values
@@ -222,6 +249,25 @@ def simulate(
                     eff_stop = trail_level
                 else:
                     eff_stop = max(eff_stop, trail_level) if direction == "long" else min(eff_stop, trail_level)
+            tp = at.get("target_price")
+
+            # Both-touched arbitration: when THIS bar touches the stop AND the
+            # take-profit, OHLC alone can't order them — default is stop-first
+            # (pessimistic). With a sub-bar resolver, the ACTUAL 1m path
+            # decides which level traded first; None keeps the pessimistic
+            # default. Single-touch bars never reach the resolver.
+            if exit_price is None and intrabar_resolver is not None and eff_stop is not None and tp is not None:
+                stop_touched = (bar_low <= eff_stop) if direction == "long" else (bar_high >= eff_stop)
+                tp_touched = (bar_high >= tp) if direction == "long" else (bar_low <= tp)
+                if stop_touched and tp_touched:
+                    try:
+                        first = intrabar_resolver(df.index[idx], direction, float(eff_stop), float(tp))
+                    except Exception:
+                        first = None
+                    if first == "tp":
+                        exit_price, exit_reason = (tp, "take_profit")
+                    # "stop"/None fall through to the stop block below.
+
             if exit_price is None and eff_stop is not None:
                 if direction == "long" and bar_low <= eff_stop:
                     exit_price = min(fill_price, eff_stop)  # gap-through fills at open
@@ -230,7 +276,6 @@ def simulate(
                     exit_price = max(fill_price, eff_stop)
                     exit_reason = "trailing_stop" if (at.get("trail_pct") and (at.get("stop_price") is None or eff_stop < at["stop_price"])) else "stop_loss"
 
-            tp = at.get("target_price")
             if exit_price is None and tp is not None:
                 # Take-profit is a resting limit; model it conservatively as filling
                 # AT the target even on a gap-through (never crediting the more
@@ -276,8 +321,57 @@ def simulate(
                 "extreme": fill_price,
             }
 
+    # (3) Pending open-tick decisions for the NEXT (forming) bar. The main loop consumes
+    # signals only up to signal_idx = len(df)-2 — the LAST bar's signal decides an order
+    # that fills at a bar not yet in the frame. Project it here with the SAME conditions
+    # the loop will apply once that bar closes (exit checked before entry, so a same-bar
+    # exit frees the slot for a re-entry, exactly like sections (1)/(2)). Price-dependent
+    # fields (fill, stop level, size) are left to the caller: the fill is the caller's
+    # current mark, and the stop distance needs that mark (the ATR itself — the last
+    # CLOSED bar's, same no-lookahead convention as the loop — is exported).
+    pending_entries: dict[str, dict] = {}
+    pending_exits: dict[str, dict] = {}
+    last_idx = len(df) - 1
+    if last_idx >= max(int(warmup), 0):
+        last_time = str(df.index[last_idx])
+        for direction in allowed_modes:
+            at = active_trades.get(direction)
+            if at is not None:
+                pend_reason = None
+                if ec["time_stop_bars"] and (len(df) - int(at["entry_bar"])) >= ec["time_stop_bars"]:
+                    pend_reason = "time_stop"
+                else:
+                    exit_series = signals.long_exits if direction == "long" else signals.short_exits
+                    if bool(exit_series.iloc[last_idx]):
+                        pend_reason = "signal"
+                if pend_reason:
+                    pending_exits[direction] = {
+                        "direction": direction,
+                        "entry_time": str(at["entry_time"]),
+                        "entry_price": float(at["entry_price"]),
+                        "size_fraction": float(at.get("size_fraction", 1.0)),
+                        "exit_reason": pend_reason,
+                        "signal_time": last_time,
+                    }
+            entry_series = signals.long_entries if direction == "long" else signals.short_entries
+            if (at is None or direction in pending_exits) and bool(entry_series.iloc[last_idx]):
+                atr_value = (
+                    float(atr_vals[last_idx])
+                    if (ec["sizing_mode"] == "atr" and atr_vals is not None)
+                    else None
+                )
+                pending_entries[direction] = {
+                    "direction": direction,
+                    "signal_time": last_time,
+                    "atr_value": atr_value,
+                    "regime": regimes.iloc[last_idx] if regimes is not None and len(regimes) > last_idx else RANGE_BOUND,
+                }
+
     open_positions = {direction: at for direction, at in active_trades.items() if at is not None}
-    return KernelResult(closed_trades=trades, open_positions=open_positions, closed_gross=closed_gross)
+    return KernelResult(
+        closed_trades=trades, open_positions=open_positions, closed_gross=closed_gross,
+        pending_entries=pending_entries, pending_exits=pending_exits, ec=ec,
+    )
 
 
 def force_close(

@@ -21,6 +21,12 @@ vi.mock('$lib/stores/navMetrics', () => ({
 			return () => {};
 		},
 	},
+	navEventPulses: {
+		subscribe(callback: (value: Record<string, unknown>) => void) {
+			callback({});
+			return () => {};
+		},
+	},
 	markNavIndicatorSeen: vi.fn(),
 }));
 

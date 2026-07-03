@@ -1,4 +1,4 @@
-"""Chat-context grounding + conversation persistence tests."""
+"""Chat-context grounding tests."""
 from __future__ import annotations
 
 import asyncio
@@ -75,99 +75,10 @@ def test_pending_approvals_compact_caps_and_summarizes(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# store_conversation — source parameterization + Discord backward-compat
+# runtime_worker is_chat branch — CHAT_ACT toolset wiring
 # ---------------------------------------------------------------------------
 
-class _Captured:
-    def __init__(self):
-        self.summary = None
-        self.metadata = None
-
-
-def _patch_store_narrative(monkeypatch):
-    captured = _Captured()
-
-    def _fake_store_narrative(summary, metadata=None):
-        captured.summary = summary
-        captured.metadata = metadata
-
-    import forven.vectordb as vdb
-
-    monkeypatch.setattr(vdb, "store_narrative", _fake_store_narrative, raising=True)
-    return captured
-
-
-def test_store_conversation_default_source_is_ui_chat(monkeypatch):
-    captured = _patch_store_narrative(monkeypatch)
-    asyncio.run(
-        ctx.store_conversation(
-            user_msg="How is S00719 doing in the gauntlet?",
-            ai_response="It is mid-gauntlet with a Sharpe near 1.4 on the OOS window. — Forven",
-        )
-    )
-    assert captured.metadata is not None
-    assert captured.metadata["source"] == "ui_chat"
-    assert captured.summary.startswith("[ui_chat]")
-    assert "channel" not in captured.metadata
-
-
-def test_store_conversation_explicit_ui_chat_source(monkeypatch):
-    captured = _patch_store_narrative(monkeypatch)
-    asyncio.run(
-        ctx.store_conversation(
-            None,
-            "What is in the pipeline right now exactly?",
-            "Two candidates in gauntlet and one paper strategy. — Forven",
-            source="ui_chat",
-        )
-    )
-    assert captured.metadata["source"] == "ui_chat"
-    assert captured.summary.startswith("[ui_chat]")
-
-
-def test_store_conversation_discord_backward_compat(monkeypatch):
-    """The legacy Discord caller passes a channel_name and NO source — it must
-    still persist with the '[Discord #...]' prefix and source='discord'."""
-    captured = _patch_store_narrative(monkeypatch)
-    asyncio.run(
-        ctx.store_conversation(
-            "general",
-            "How are we doing today on the books?",
-            "Equity is flat, no open positions, regime is range-bound. — Forven",
-        )
-    )
-    assert captured.metadata["source"] == "discord"
-    assert captured.metadata["channel"] == "general"
-    assert captured.summary.startswith("[Discord #general]")
-
-
-def test_store_conversation_explicit_discord_source(monkeypatch):
-    captured = _patch_store_narrative(monkeypatch)
-    asyncio.run(
-        ctx.store_conversation(
-            "alerts",
-            "Did the kill switch trip overnight on the account?",
-            "No, drawdown stayed under 2% the whole session. — Forven",
-            source="discord",
-        )
-    )
-    assert captured.metadata["source"] == "discord"
-    assert captured.summary.startswith("[Discord #alerts]")
-
-
-def test_store_conversation_skips_trivial_exchanges(monkeypatch):
-    captured = _patch_store_narrative(monkeypatch)
-    asyncio.run(ctx.store_conversation(None, "hi", "ok", source="ui_chat"))
-    # Below the length threshold — nothing persisted.
-    assert captured.summary is None
-    assert captured.metadata is None
-
-
-# ---------------------------------------------------------------------------
-# runtime_worker is_chat branch — CHAT_ACT toolset wiring + persistence
-# ---------------------------------------------------------------------------
-
-def test_run_brain_task_chat_uses_act_toolset_and_persists(forven_db, monkeypatch):
+def test_run_brain_task_chat_uses_act_toolset(forven_db, monkeypatch):
     from forven import runtime_worker
     from forven.agents.tool_definitions import CHAT_ACT_TOOL_NAMES
 
@@ -178,16 +89,7 @@ def test_run_brain_task_chat_uses_act_toolset_and_persists(forven_db, monkeypatc
         captured["last_message"] = messages[-1]["content"]
         return ("Looks healthy. — Forven", {})
 
-    stored: dict = {}
-
-    async def _fake_store_conversation(channel_name=None, user_msg="", ai_response="", source=None):
-        stored["channel_name"] = channel_name
-        stored["user_msg"] = user_msg
-        stored["ai_response"] = ai_response
-        stored["source"] = source
-
     monkeypatch.setattr("forven.context.build_chat_context", lambda: "ctx")
-    monkeypatch.setattr("forven.context.store_conversation", _fake_store_conversation)
     monkeypatch.setattr("forven.brain.resolve_brain_provider_model", lambda p, m: ("openai", "gpt-5.2"))
     monkeypatch.setattr("forven.agents.runner._call_with_tools", _fake_call_with_tools)
     monkeypatch.setattr("forven.agents.runner.set_tool_context", lambda *a, **k: ())
@@ -211,8 +113,3 @@ def test_run_brain_task_chat_uses_act_toolset_and_persists(forven_db, monkeypatc
     assert tool_names <= CHAT_ACT_TOOL_NAMES, f"unexpected tools leaked: {tool_names - CHAT_ACT_TOOL_NAMES}"
     assert "assign_agent_task" in tool_names  # an action tool reachable in Command mode
     assert "read_file" in tool_names           # a grounding tool
-
-    # The exchange is persisted for recall with the ui_chat source.
-    assert stored["source"] == "ui_chat"
-    assert stored["user_msg"] == "How is S00719 doing in the gauntlet right now?"
-    assert "Forven" in stored["ai_response"]

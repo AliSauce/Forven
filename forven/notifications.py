@@ -500,15 +500,24 @@ def get_notification_stats(hours: int = 24) -> dict[str, Any]:
     }
 
 
-def get_actionable_notification_summary(*, limit: int = 50) -> dict[str, Any]:
-    """Return compact counts for unacknowledged actionable operator issues."""
-    items = list_notifications(limit=max(1, min(int(limit), 200)))
-    actionable = [
+def filter_actionable_notifications(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Unacknowledged notifications an operator should act on.
+
+    Single source of truth shared by the nav-badge summary and the Diagnostics
+    inbox, so the badge count and the list it links to can never disagree.
+    """
+    return [
         item
         for item in items
         if str(item.get("status") or "").strip().lower() != "acknowledged"
         and _notification_is_actionable(item)
     ]
+
+
+def get_actionable_notification_summary(*, limit: int = 50) -> dict[str, Any]:
+    """Return compact counts for unacknowledged actionable operator issues."""
+    items = list_notifications(limit=max(1, min(int(limit), 200)))
+    actionable = filter_actionable_notifications(items)
 
     severity_counts = {"warn": 0, "fail": 0, "critical": 0}
     statuses: dict[str, int] = {}
@@ -1147,18 +1156,16 @@ def _notification_is_actionable(notification: Mapping[str, Any]) -> bool:
     event_type = str(notification.get("event_type") or "").strip().lower()
     status = str(notification.get("status") or "").strip().lower()
     severity = str(notification.get("severity") or "").strip().lower()
-    delivery_error = str(notification.get("delivery_error") or "").strip().lower()
     if status == "suppressed":
         return False
     if event_type in {"system_degraded", "risk_critical", "agent_task_failed", "trade_failed"}:
         return True
-    if severity in {"warn", "fail", "critical"}:
-        return True
-    if status in {"failed", "dropped"}:
-        return True
-    if delivery_error and not delivery_error.startswith("duplicate of"):
-        return True
-    return False
+    # Actionability is about the CONTENT (key event types, warn+ severity), not
+    # the delivery. Failed/dropped Discord pushes used to count too — a flaky
+    # webhook then floods the operator inbox with info-level noise (379 failed
+    # health_recovery infos at one point). Warn+ items with failed delivery are
+    # already caught by the severity rule.
+    return severity in {"warn", "fail", "critical"}
 
 
 def _repair_task_priority(notification: Mapping[str, Any]) -> int:

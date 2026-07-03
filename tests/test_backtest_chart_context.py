@@ -135,9 +135,8 @@ def test_chart_context_returns_artifact_for_new_backtests(forven_db, _isolate_fo
 	strategy_id = _seed_strategy()
 
 	import forven.strategies.backtest as backtest_mod
-	import forven.vectordb as vectordb_mod
 
-	monkeypatch.setattr(vectordb_mod, "store_backtest_result", lambda **_kwargs: None)
+	monkeypatch.setattr("forven.quant_skills_extractor.record_backtest_for_learning", lambda **_kwargs: None)
 	monkeypatch.setattr(
 		backtest_mod,
 		"backtest_strategy",

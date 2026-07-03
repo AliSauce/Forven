@@ -247,6 +247,17 @@ Keep `generate_signal` stateless — do NOT track `self._position` or
 entry/exit signal streams; strategies that self-track position diverge from
 the vectorized path and break parity tests.
 
+**Reading engine-owned state is a hard error, not just a style nit.** The
+engine never injects a current position into your strategy, so reading
+`self.position` / `self.entry_price` / `self.position_size` /
+`self.position_manager` (or any per-trade state) raises
+`AttributeError: object has no attribute 'position'` on the first bar and
+kills the whole backtest. Registration runs an execution smoke probe that
+rejects this at intake. Write exits as pure functions of the indicators
+(e.g. exit long when the z-score reverts back above `-z_exit`); the engine
+only acts on your exit signal when a trade is actually open, so a position
+guard is both redundant and fatal.
+
 Parity test: see `tests/test_custom_strategy_vectorization.py` for the
 pattern that enforces `generate_signals(df).iloc[-1] ==
 generate_signal(df).{entry,exit}_signal`. Add your strategy to it.

@@ -364,13 +364,20 @@ def calculate_verdict_metrics(metrics: dict[str, Any] | None) -> dict[str, dict[
     }
 
 
-def get_overall_verdict(tests: dict[str, dict[str, Any]] | None) -> Literal["pass", "warn", "fail"]:
-    statuses = [str(payload.get("status", "fail")).strip().lower() for payload in (tests or {}).values()]
+def get_overall_verdict(tests: dict[str, dict[str, Any]] | None) -> Literal["pass", "warn", "fail", "pending"]:
+    # A test with NO recorded status has not produced a verdict — that is
+    # ABSENCE of evidence, never a merit failure. It must not count as "fail"
+    # (the old default), and it must not let the verdict "pass" on missing
+    # evidence either: any unresolved test makes the overall verdict "pending".
+    statuses = [str(payload.get("status") or "pending").strip().lower() for payload in (tests or {}).values()]
     fails = statuses.count("fail")
     warns = statuses.count("warn")
+    pending = sum(1 for status in statuses if status not in {"pass", "warn", "fail"})
 
     if fails > 0:
         return "fail"
+    if pending > 0:
+        return "pending"
     if warns > 2:
         return "warn"
     return "pass"
@@ -384,6 +391,8 @@ def build_verdict_result(
     tests: Iterable[str] | None = None,
     result_id: str | None = None,
 ) -> dict[str, Any]:
+    from forven.engine_provenance import BACKTEST_ENGINE_VERSION
+
     requested_tests = set(normalize_requested_tests(tests))
     all_tests = calculate_verdict_metrics(metrics)
     filtered_tests = {
@@ -394,11 +403,13 @@ def build_verdict_result(
     return {
         "result_id": result_id or f"verdict-{uuid.uuid4().hex[:12]}",
         "status": overall,
+        "engine_version": BACKTEST_ENGINE_VERSION,
         "tests": filtered_tests,
         "summary": {
             "strategy_id": strategy_id,
             "dataset_id": dataset_id,
             "overall": overall,
+            "engine_version": BACKTEST_ENGINE_VERSION,
             "pass_count": sum(1 for payload in filtered_tests.values() if payload.get("status") == "pass"),
             "warn_count": sum(1 for payload in filtered_tests.values() if payload.get("status") == "warn"),
             "fail_count": sum(1 for payload in filtered_tests.values() if payload.get("status") == "fail"),
@@ -407,6 +418,8 @@ def build_verdict_result(
 
 
 def build_strategy_verdict_blob(verdict_result: dict[str, Any] | None) -> tuple[dict[str, Any], dict[str, Any]]:
+    from forven.engine_provenance import BACKTEST_ENGINE_VERSION
+
     payload = verdict_result if isinstance(verdict_result, dict) else {}
     raw_tests = payload.get("tests") if isinstance(payload.get("tests"), dict) else {}
     normalized_tests = normalize_strategy_verdict_tests(raw_tests)
@@ -414,5 +427,9 @@ def build_strategy_verdict_blob(verdict_result: dict[str, Any] | None) -> tuple[
         "status": payload.get("status"),
         "summary": payload.get("summary"),
         "tests": normalized_tests,
+        # Provenance: which engine computed this verdict. A blob whose stamped
+        # version differs from the running engine is stale evidence and must not
+        # be compared against fresh numbers (see forven/engine_provenance.py).
+        "engine_version": payload.get("engine_version", BACKTEST_ENGINE_VERSION),
     }
     return normalized_tests, verdict_blob

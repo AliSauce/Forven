@@ -41,6 +41,7 @@ export type AssistantStreamEvent =
 	| { type: 'tool_call'; name: string; input: Record<string, unknown> }
 	| { type: 'tool_result'; name: string; output: string }
 	| { type: 'action_proposed'; action_id: string; name: string; input: Record<string, unknown>; summary: string }
+	| { type: 'navigate'; route: string }
 	| { type: 'done'; message_id: string }
 	| { type: 'error'; code: string; message: string };
 

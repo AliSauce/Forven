@@ -1133,18 +1133,52 @@ $script:WatchdogSentinel = Join-Path $localTemp "watchdog.pid"
 try {
     $watchdogClaim = Acquire-WatchdogOwnerLock -OwnerName "start_all"
     $watchdogStatus = $watchdogClaim.status
+
+    # FORCE_RESTART=1 means the operator wants a clean restart NOW. Deferring to a
+    # running watchdog owner made `start_all.bat` a no-op ("leaving services
+    # untouched") — the only way to restart was hand-killing every python process
+    # while the old watchdog raced to respawn them, often needing two runs. With
+    # force, TAKE OVER: stop the active owner (its PID is in the lock metadata),
+    # then re-claim as its file handle releases. The normal flow's
+    # Stop-AllForvenProcesses below then cleans up the orphaned children.
+    if (-not [bool]$watchdogClaim.claimed -and $forceRestart -eq "1") {
+        $takeoverName = if ($null -ne $watchdogStatus -and $null -ne $watchdogStatus.owner_name) { [string]$watchdogStatus.owner_name } else { "watchdog" }
+        $takeoverPid = if ($null -ne $watchdogStatus -and $null -ne $watchdogStatus.active_pid) { [int]$watchdogStatus.active_pid } else { 0 }
+        if ($takeoverPid -gt 0 -and $takeoverPid -ne $PID) {
+            Write-Info "FORCE_RESTART=1: taking over watchdog ownership from $takeoverName (PID $takeoverPid)..."
+            try {
+                Stop-Process -Id $takeoverPid -Force -ErrorAction Stop
+            } catch {
+                Write-WarnMessage "Could not stop watchdog owner PID ${takeoverPid}: $($_.Exception.Message) (it may already be exiting)"
+            }
+        } elseif ($null -ne $watchdogStatus -and [bool]$watchdogStatus.lock_held) {
+            Write-WarnMessage "FORCE_RESTART=1 but the lock holder's PID is unknown; waiting for the lock to release..."
+        }
+        # The lock releases when the old owner's handle closes — retry briefly
+        # instead of demanding a second start_all run.
+        $takeoverDeadline = (Get-Date).AddSeconds(15)
+        while (-not [bool]$watchdogClaim.claimed -and (Get-Date) -lt $takeoverDeadline) {
+            Start-Sleep -Milliseconds 500
+            $watchdogClaim = Acquire-WatchdogOwnerLock -OwnerName "start_all"
+        }
+        $watchdogStatus = $watchdogClaim.status
+        if ([bool]$watchdogClaim.claimed) {
+            Add-StartupSummary -Service "watchdog" -Action "taken_over" -Details "from=$takeoverName pid=$takeoverPid"
+        }
+    }
+
     if (-not [bool]$watchdogClaim.claimed) {
         $activeOwnerName = if ($null -ne $watchdogStatus -and $null -ne $watchdogStatus.owner_name) { [string]$watchdogStatus.owner_name } else { "watchdog" }
         $activeOwnerPid = if ($null -ne $watchdogStatus -and $null -ne $watchdogStatus.active_pid) { [int]$watchdogStatus.active_pid } else { 0 }
         if ($null -ne $watchdogStatus -and [bool]$watchdogStatus.other_process_active) {
-            Write-WarnMessage "Another Forven watchdog owner is already active ($activeOwnerName PID $activeOwnerPid); leaving services untouched."
+            Write-WarnMessage "Another Forven watchdog owner is already active ($activeOwnerName PID $activeOwnerPid); leaving services untouched. Set FORCE_RESTART=1 to take over and restart."
             Add-StartupSummary -Service "watchdog" -Action "skipped" -Details "owner=$activeOwnerName pid=$activeOwnerPid"
             Write-StartupSummary
             $startupCompleted = $true
             return
         }
         if ($null -ne $watchdogStatus -and [bool]$watchdogStatus.lock_held) {
-            Write-WarnMessage "Another Forven watchdog owner appears to be active, but its owner metadata is unavailable; leaving services untouched."
+            Write-WarnMessage "Another Forven watchdog owner appears to be active, but its owner metadata is unavailable; leaving services untouched. Set FORCE_RESTART=1 to take over and restart."
             Add-StartupSummary -Service "watchdog" -Action "skipped" -Details "owner=unknown pid=unknown"
             Write-StartupSummary
             $startupCompleted = $true

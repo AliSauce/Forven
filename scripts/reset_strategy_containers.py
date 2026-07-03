@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import re
-import shutil
 import sqlite3
 import sys
 from datetime import datetime, timezone
@@ -18,7 +17,6 @@ if str(REPO_ROOT) not in sys.path:
 
 from forven.config import FORVEN_DB, FORVEN_HOME, ensure_dirs  # noqa: E402
 from forven.db import get_db, init_db  # noqa: E402
-from forven.vectordb import CHROMA_DIR, wipe_collections  # noqa: E402
 
 
 RESET_TABLES = (
@@ -66,15 +64,8 @@ def backup_state(backup_dir: Path) -> dict[str, str | None]:
     db_backup_path = backup_dir / FORVEN_DB.name
     _backup_sqlite(FORVEN_DB, db_backup_path)
 
-    chroma_backup_path = backup_dir / CHROMA_DIR.name
-    if CHROMA_DIR.exists():
-        if chroma_backup_path.exists():
-            shutil.rmtree(chroma_backup_path, ignore_errors=True)
-        shutil.copytree(CHROMA_DIR, chroma_backup_path)
-
     return {
         "db_backup": str(db_backup_path) if db_backup_path.exists() else None,
-        "chroma_backup": str(chroma_backup_path) if chroma_backup_path.exists() else None,
     }
 
 
@@ -98,13 +89,9 @@ def reset_sqlite_tables() -> list[str]:
     return reset_applied
 
 
-def reset_chroma() -> None:
-    wipe_collections(["backtest_results"])
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Backup and reset strategy container data (SQLite + Chroma)."
+        description="Backup and reset strategy container data (SQLite)."
     )
     parser.add_argument(
         "--yes",
@@ -128,11 +115,9 @@ def main() -> int:
     backup_dir = (args.backup_dir or _default_backup_dir()).resolve()
     print("Container reset plan")
     print(f"- SQLite DB: {FORVEN_DB}")
-    print(f"- Chroma dir: {CHROMA_DIR}")
     print(f"- Backup dir: {backup_dir}")
     print(f"- Tables: {', '.join(RESET_TABLES)}")
     print("- Counter seeds: S=1, B=1, E=1, T=1")
-    print("- Chroma wipe: backtest_results")
 
     if not args.yes:
         print("\nDry run only. Re-run with --yes to execute.")
@@ -140,17 +125,13 @@ def main() -> int:
 
     backup_info = backup_state(backup_dir)
     reset_applied = reset_sqlite_tables()
-    reset_chroma()
 
     print("\nReset complete.")
     print(f"- DB backup: {backup_info['db_backup'] or 'not created (source missing)'}")
-    print(f"- Chroma backup: {backup_info['chroma_backup'] or 'not created (source missing)'}")
     print(f"- Truncated tables: {', '.join(reset_applied) if reset_applied else 'none'}")
     print("- Counters reseeded: S, B, E, T")
-    print("- Wiped Chroma collection: backtest_results")
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

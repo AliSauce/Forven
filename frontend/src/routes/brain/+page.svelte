@@ -4,13 +4,12 @@
 	import { page } from '$app/stores';
 	import BrainOverviewTab from '$lib/components/brain/BrainOverviewTab.svelte';
 	import BrainMemoryTab from '$lib/components/brain/BrainMemoryTab.svelte';
+	import BrainDecisionsTab from '$lib/components/brain/BrainDecisionsTab.svelte';
 
-	// Decisions / Recall / Lessons tabs were removed from the nav (2026-06-13):
-	// brain_decisions and brain_lessons are 0-row orphaned tables and Recall had
-	// degraded to thin keyword search over stale task titles. The tab components
-	// (BrainDecisionsTab / BrainRecallTab / BrainLessonsTab) remain in the
-	// codebase and can be re-linked here if those stores are ever populated.
-	type Tab = 'overview' | 'memory';
+	// Decisions re-linked (2026-07-02): the live brain worker now records a
+	// brain_decisions row per autonomous cycle (agent-overhaul), so the ledger
+	// populates again. brain_lessons was removed entirely (never gained a writer).
+	type Tab = 'overview' | 'decisions' | 'memory';
 
 	const TABS: { id: Tab; label: string; description: string }[] = [
 		{
@@ -19,9 +18,14 @@
 			description: 'Autonomy state, actions, blockers, and memory.'
 		},
 		{
+			id: 'decisions',
+			label: 'Decisions',
+			description: 'What the Brain saw, what it decided, the tasks it spawned, and how each decision turned out.'
+		},
+		{
 			id: 'memory',
 			label: 'Working Notes',
-			description: 'Short-term operational notes the Brain carries between cycles (distinct from the long-term Memory Bank store).'
+			description: 'Short-term operational notes the Brain carries between cycles.'
 		}
 	];
 
@@ -29,7 +33,7 @@
 
 	function tabFromUrl(searchParams: URLSearchParams): Tab {
 		const raw = searchParams.get('tab');
-		if (raw === 'overview' || raw === 'memory') return raw;
+		if (raw === 'overview' || raw === 'decisions' || raw === 'memory') return raw;
 		return 'overview';
 	}
 
@@ -77,6 +81,8 @@
 	<section class="tab-content">
 		{#if activeTab === 'overview'}
 			<BrainOverviewTab />
+		{:else if activeTab === 'decisions'}
+			<BrainDecisionsTab />
 		{:else if activeTab === 'memory'}
 			<BrainMemoryTab />
 		{/if}
@@ -99,9 +105,11 @@
 	}
 
 	.brain-header h1 {
-		font-size: 1.75rem;
-		font-weight: 600;
+		font-size: 1.125rem;
+		font-weight: 700;
 		margin: 0;
+		text-transform: uppercase;
+		letter-spacing: 0.15em;
 	}
 
 	.subtitle {
@@ -113,7 +121,7 @@
 	.tabs {
 		display: flex;
 		gap: 0;
-		border-bottom: 1px solid #2a2a2a;
+		border-bottom: 1px solid #222;
 		margin-bottom: 1.5rem;
 	}
 
@@ -134,7 +142,7 @@
 
 	.tabs button.active {
 		color: #fff;
-		border-bottom-color: #4f8df7;
+		border-bottom-color: #fff;
 	}
 
 	.tab-content {

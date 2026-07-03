@@ -98,3 +98,62 @@ def test_put_notifications_preferences_round_trips(forven_db):
     assert updated["agent_completion_to_discord"] is True
     assert updated["response_channels"] == ["chat"]
     assert control_plane_notifications.get_notifications_preferences()["response_channels"] == ["chat"]
+
+
+def test_get_notifications_list_actionable_matches_badge_summary(forven_db, monkeypatch):
+    monkeypatch.setattr("forven.bot.send_sync", lambda *args, **kwargs: True)
+
+    from forven.notifications import acknowledge_notification, get_actionable_notification_summary
+
+    critical = emit_notification(
+        "risk_critical",
+        source="daemon",
+        severity="critical",
+        title="Equity anomaly detected",
+        summary="Books-aggregate equity jumped 40%",
+    )
+    # Benign info item: not actionable, must not appear.
+    emit_notification(
+        "agent_task_completed",
+        source="agent:strategy-developer",
+        title="Strategy Developer: finished review",
+    )
+    # Actionable but already acknowledged: must not appear.
+    acked = emit_notification(
+        "trade_failed",
+        source="scanner",
+        severity="fail",
+        title="Order rejected by exchange",
+    )
+    acknowledge_notification(int(acked["id"]))
+
+    payload = control_plane_notifications.get_notifications_list(limit=50, actionable=True)
+    inbox_ids = [int(item["id"]) for item in payload["items"]]
+
+    assert inbox_ids == [int(critical["id"])]
+    # The inbox must show exactly what the nav badge counted.
+    summary = get_actionable_notification_summary(limit=50)
+    assert sorted(inbox_ids) == sorted(summary["notification_ids"])
+    assert summary["count"] == len(inbox_ids)
+
+
+def test_actionable_filter_is_about_content_not_delivery():
+    from forven.notifications import filter_actionable_notifications
+
+    items = [
+        # Info-level with failed Discord delivery: log material, NOT actionable
+        # (a flaky webhook must not flood the operator inbox).
+        {"id": 1, "event_type": "health_recovery", "severity": "info", "status": "failed",
+         "delivery_error": "Discord delivery returned false"},
+        # Warn+ severity stays actionable regardless of delivery state.
+        {"id": 2, "event_type": "health_warning", "severity": "warn", "status": "failed",
+         "delivery_error": "Discord delivery returned false"},
+        # Key event types are actionable even at info severity.
+        {"id": 3, "event_type": "trade_failed", "severity": "info", "status": "stored"},
+        # Suppressed never surfaces.
+        {"id": 4, "event_type": "risk_critical", "severity": "critical", "status": "suppressed"},
+        # Acknowledged never surfaces.
+        {"id": 5, "event_type": "bug_report", "severity": "fail", "status": "acknowledged"},
+    ]
+
+    assert [item["id"] for item in filter_actionable_notifications(items)] == [2, 3]

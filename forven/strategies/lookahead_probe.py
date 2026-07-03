@@ -194,4 +194,133 @@ def detect_lookahead(strategy_obj) -> str | None:
         return None
 
 
-__all__ = ["detect_lookahead"]
+# Exception types that, when raised from a strategy's OWN module on clean
+# synthetic data, are unambiguous authoring bugs rather than a data/engine
+# quirk. The canonical case: a per-bar ``generate_signal`` reads ``self.position``
+# (or ``self._position`` / ``self.entry_price``), which the engine never injects
+# because it owns position state -- so the read raises AttributeError on the
+# first fall-through bar and kills the whole backtest with a cryptic "Indicator
+# execution failed" three gates later. A correctly written stateless strategy
+# NEVER raises these on a valid frame, so blocking on them is near-zero false
+# positive. Other exception types (ZeroDivisionError, KeyError, ...) can have
+# benign synthetic-data causes, so they stay inconclusive (logged, not blocked).
+_CRASH_BLOCK_EXC_TYPES = (AttributeError, NameError)
+
+# Bars (from the end of the synthetic frame) at which to invoke the per-bar
+# ``generate_signal`` so both the entry and the fall-through/exit branches run.
+_EXEC_PROBE_STEPS = 16
+
+
+def _strategy_source_file(strategy_obj) -> str | None:
+    """Resolved path to the strategy class's source file, or None."""
+    import inspect
+    from pathlib import Path
+
+    try:
+        src = inspect.getsourcefile(type(strategy_obj)) or inspect.getfile(type(strategy_obj))
+    except (TypeError, OSError):
+        return None
+    if not src:
+        return None
+    try:
+        return str(Path(src).resolve())
+    except OSError:
+        return src
+
+
+def _raised_in_strategy_module(exc: BaseException, strategy_file: str | None) -> bool:
+    """True if ``exc``'s traceback terminates inside the strategy's own source file.
+
+    This distinguishes an authoring bug (the strategy's code raised) from an
+    engine/probe fault (which must never block a legitimate registration).
+    """
+    import traceback
+    from pathlib import Path
+
+    if not strategy_file:
+        return False
+    tb = exc.__traceback__
+    last_file = None
+    for frame, _lineno in traceback.walk_tb(tb):
+        last_file = frame.f_code.co_filename
+    if not last_file:
+        return False
+    try:
+        return Path(last_file).resolve() == Path(strategy_file).resolve()
+    except OSError:
+        return last_file == strategy_file
+
+
+def detect_execution_crash(strategy_obj) -> str | None:
+    """Return a rejection reason if ``strategy_obj`` crashes on a clean run, else None.
+
+    Exercises the per-bar ``generate_signal`` path (which ``detect_lookahead``
+    does NOT touch -- it only probes vectorized ``generate_signals``) plus a
+    single vectorized call, over a deterministic synthetic frame carrying every
+    enrichment column. If the strategy raises an :data:`_CRASH_BLOCK_EXC_TYPES`
+    error FROM ITS OWN MODULE, the run is a guaranteed crash on every real
+    backtest too, so we return a precise, actionable reason. The most common
+    trigger is a stateful read (``self.position``) the engine never provides.
+
+    Graceful by design: a probe-infrastructure fault, or any exception NOT
+    originating in the strategy's own file, returns ``None`` (inconclusive) so
+    the probe can never block a legitimate registration on its own bug.
+    """
+    if strategy_obj is None:
+        return None
+
+    strategy_file = _strategy_source_file(strategy_obj)
+
+    try:
+        df = _build_synthetic_ohlcv()
+    except Exception as exc:  # synthetic build should never fail; stay inconclusive
+        log.warning("Execution smoke probe setup error (treated as inconclusive): %s", exc)
+        return None
+
+    # 1) Vectorized path, if implemented. A crash here fails the shared kernel too.
+    if hasattr(strategy_obj, "generate_signals"):
+        try:
+            strategy_obj.generate_signals(df)
+        except _CRASH_BLOCK_EXC_TYPES as exc:
+            if _raised_in_strategy_module(exc, strategy_file):
+                return _format_crash_reason("generate_signals", exc)
+        except Exception:
+            pass  # non-targeted exception type: inconclusive, don't block
+
+    # 2) Per-bar path -- what the deterministic slow-path walk actually calls.
+    #    Step across the frame so both entry and fall-through/exit branches run.
+    if hasattr(strategy_obj, "generate_signal"):
+        n = len(df)
+        start = min(40, max(2, n // 4))
+        step = max(1, (n - start) // _EXEC_PROBE_STEPS)
+        for end in range(start, n + 1, step):
+            try:
+                strategy_obj.generate_signal(df.iloc[:end])
+            except _CRASH_BLOCK_EXC_TYPES as exc:
+                if _raised_in_strategy_module(exc, strategy_file):
+                    return _format_crash_reason("generate_signal", exc)
+            except Exception:
+                # Non-targeted exception (e.g. a benign synthetic-data edge):
+                # inconclusive. Keep walking -- a later bar may hit the real bug.
+                continue
+
+    return None
+
+
+def _format_crash_reason(entry_point: str, exc: BaseException) -> str:
+    msg = str(exc)
+    hint = ""
+    if isinstance(exc, AttributeError) and "has no attribute" in msg:
+        # e.g. "'X' object has no attribute 'position'"
+        hint = (
+            " -- generate_signal must be STATELESS: the engine owns position "
+            "state and does NOT inject self.position/self.entry_price. Gate "
+            "exits on indicator conditions, not on a tracked position."
+        )
+    return (
+        f"Execution smoke test failed: {type(exc).__name__} in {entry_point} "
+        f"on synthetic data ({msg}){hint}; rejected"
+    )
+
+
+__all__ = ["detect_lookahead", "detect_execution_crash"]

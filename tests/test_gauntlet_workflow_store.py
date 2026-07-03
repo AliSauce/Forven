@@ -61,4 +61,10 @@ def test_create_or_get_workflow_seeds_definition_steps(forven_db):
     assert [step["step_key"] for step in detail["steps"]] == ordered_step_keys()
     assert detail["steps"][0]["status"] == "queued"
     assert all(step["status"] == "pending" for step in detail["steps"][1:])
-    assert json.loads(detail["workflow"]["settings_snapshot_json"]) == {"quick_screen": {"enabled": True}}
+    # Engine provenance stamps every workflow snapshot at creation (engine_provenance.py).
+    from forven.engine_provenance import BACKTEST_ENGINE_VERSION
+
+    assert json.loads(detail["workflow"]["settings_snapshot_json"]) == {
+        "quick_screen": {"enabled": True},
+        "engine_version": BACKTEST_ENGINE_VERSION,
+    }

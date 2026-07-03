@@ -13,6 +13,8 @@ _enrich_with_market_data (replacement would mischarge funding ~8x).
 """
 from __future__ import annotations
 
+import contextlib
+
 from unittest.mock import patch
 
 import numpy as np
@@ -73,13 +75,22 @@ def _write_binance_funding(tmp_path, symbol: str = "BTC-USDT") -> None:
     _save_stream_parquet(df, tmp_path / "funding" / symbol / "history.parquet", "funding", symbol)
 
 
+@contextlib.contextmanager
 def _patch_dirs(tmp_path):
-    return (
-        patch("forven.data_manager.FUNDING_DIR", tmp_path / "funding"),
-        patch("forven.data_manager.OI_DIR", tmp_path / "oi"),
-        patch("forven.data_manager.DERIVATIVES_DIR", tmp_path / "derivatives"),
-        patch("forven.data_manager.MACRO_DIR", tmp_path / "macro"),
-    )
+    """Patch EVERY stream dir to tmp. Without full coverage the tests read the
+    REAL lakes once local collection has produced data (the basis/DVOL dirs
+    bit first: 'missing data returns unchanged' gained surprise columns)."""
+    with contextlib.ExitStack() as stack:
+        for name, sub in (
+            ("FUNDING_DIR", "funding"),
+            ("OI_DIR", "oi"),
+            ("DERIVATIVES_DIR", "derivatives"),
+            ("MACRO_DIR", "macro"),
+            ("BASIS_DIR", "basis"),
+            ("VOL_DIR", "volatility"),
+        ):
+            stack.enter_context(patch(f"forven.data_manager.{name}", tmp_path / sub))
+        yield
 
 
 # ---------------------------------------------------------------------------
@@ -154,8 +165,7 @@ def test_enrich_backtest_frame_gains_order_flow_columns(tmp_path):
     dm = DataManager()
     frame = _backtest_frame()
 
-    p1, p2, p3, p4 = _patch_dirs(tmp_path)
-    with p1, p2, p3, p4:
+    with _patch_dirs(tmp_path):
         out = dm.enrich(frame, "BTC-USDT", "1h", exclude_streams=("funding", "oi"))
 
     for col in ("ls_ratio", "taker_buy_sell_ratio", "long_liq_usd", "short_liq_usd", "liq_imbalance"):
@@ -178,8 +188,7 @@ def test_enrich_exclude_streams_never_replaces_hyperliquid_funding(tmp_path):
     frame = _backtest_frame()
     frame["funding_rate"] = 0.0001  # Hyperliquid hourly, set by _enrich_with_market_data
 
-    p1, p2, p3, p4 = _patch_dirs(tmp_path)
-    with p1, p2, p3, p4:
+    with _patch_dirs(tmp_path):
         out = dm.enrich(frame, "BTC-USDT", "1h", exclude_streams=("funding", "oi"))
 
     assert (out["funding_rate"] == 0.0001).all(), "Binance 8h funding replaced Hyperliquid hourly funding"
@@ -199,8 +208,7 @@ def test_enrich_without_exclusion_still_replaces_for_column_frames(tmp_path):
         }
     )
 
-    p1, p2, p3, p4 = _patch_dirs(tmp_path)
-    with p1, p2, p3, p4:
+    with _patch_dirs(tmp_path):
         out = dm.enrich(frame, "BTC-USDT", "1h")
 
     assert (out["funding_rate"] == 0.0008).all()
@@ -211,8 +219,7 @@ def test_enrich_backtest_frame_missing_data_returns_unchanged(tmp_path):
     dm = DataManager()
     frame = _backtest_frame()
 
-    p1, p2, p3, p4 = _patch_dirs(tmp_path)
-    with p1, p2, p3, p4:
+    with _patch_dirs(tmp_path):
         out = dm.enrich(frame, "BTC-USDT", "1h", exclude_streams=("funding", "oi"))
 
     assert list(out.columns) == list(frame.columns)
@@ -227,8 +234,7 @@ def test_enrich_stream_failure_logged_at_warning(tmp_path, caplog):
     dm = DataManager()
     frame = _backtest_frame()
 
-    p1, p2, p3, p4 = _patch_dirs(tmp_path)
-    with p1, p2, p3, p4, patch.object(dm, "_enrich_long_short_ratio", side_effect=RuntimeError("boom")):
+    with _patch_dirs(tmp_path), patch.object(dm, "_enrich_long_short_ratio", side_effect=RuntimeError("boom")):
         with caplog.at_level(logging.WARNING, logger="forven.data_manager"):
             out = dm.enrich(frame, "BTC-USDT", "1h", exclude_streams=("funding", "oi"))
 
@@ -265,8 +271,7 @@ def test_load_backtest_candles_gains_order_flow_columns(tmp_path, monkeypatch):
     monkeypatch.setattr(backtest_mod, "_dataset_symbol_candidates", lambda asset: ["BTC-USDT"])
     monkeypatch.setattr(backtest_mod, "_resolve_point_in_time_as_of", lambda: None)
 
-    p1, p2, p3, p4 = _patch_dirs(tmp_path)
-    with p1, p2, p3, p4:
+    with _patch_dirs(tmp_path):
         frame = backtest_mod.load_backtest_candles(
             "BTC-USDT", bars=48, timeframe="1h", enrich_market_data=False
         )

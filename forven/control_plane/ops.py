@@ -966,6 +966,39 @@ def post_kill_switch_reset(body: ConfirmBody) -> dict[str, object]:
     }
 
 
+def post_equity_rebaseline(body: ConfirmBody) -> dict[str, object]:
+    """EQ-BASIS-3: re-anchor HWM / daily start / last equity to a FRESH live read.
+
+    The confirmation path for a poisoned anchor (e.g. a latched garbage HWM) or a
+    genuine large deposit the fail-closed jump guard refuses. Takes the same
+    books-aware equity the risk cycle uses — never a caller-supplied number —
+    and fails closed (502) when a clean read is unavailable."""
+    if not body.confirm:
+        return {"error": "Confirmation required", "ok": False}
+
+    from forven.api_domains.trading import _resolve_exchange_testnet
+    from forven.daemon import _book_aware_account_value
+    from forven.exchange.risk import rebaseline_equity_anchors
+
+    acct = _book_aware_account_value(testnet=_resolve_exchange_testnet())
+    equity = float((acct or {}).get("accountValue") or 0.0) if isinstance(acct, dict) else 0.0
+    if equity <= 0:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Could not take a clean live equity reading (wallet reads degraded) — "
+                "refusing to re-baseline off unreliable data. Retry when the exchange reads recover."
+            ),
+        )
+    try:
+        result = rebaseline_equity_anchors(
+            equity, source=str(acct.get("source") or "exchange"), actor="ui",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, "equity": equity, **result}
+
+
 def post_kill_switch_toggle(body: dict) -> dict[str, object]:
     enabled = body.get("enabled")
     if enabled is None:

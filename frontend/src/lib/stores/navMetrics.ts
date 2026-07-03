@@ -14,7 +14,28 @@ export interface NavMetric {
 type NavMetricMap = Record<string, NavMetric>;
 
 const STORAGE_KEY = 'forven.nav.seen_v1';
-const NAV_HREFS = ['/', '/data', '/hypotheses', '/lab', '/risk', '/trading', '/agents', '/memory', '/tasks', '/approval', '/settings'];
+// Every sidebar route. Backend nav_indicators (control_plane/status.py) and the
+// heartbeat fallback only cover a subset; the rest still get event pulses.
+export const NAV_HREFS = [
+	'/',
+	'/data',
+	'/strategy-creator',
+	'/hypotheses',
+	'/backtest/new',
+	'/lab',
+	'/risk',
+	'/trading',
+	'/bot-factory',
+	'/agents',
+	'/brain',
+	'/tasks',
+	'/approval',
+	'/diagnostics',
+	'/pipeline',
+	'/routines',
+	'/integrations',
+	'/settings',
+];
 
 function createEmptyMetric(): NavMetric {
 	return {
@@ -88,9 +109,14 @@ export function setNavIndicators(indicators: Record<string, SystemNavIndicator> 
 }
 
 export function markNavIndicatorSeen(href: string): void {
+	clearNavPulse(href);
+
 	const current = get(navRouteMetrics);
 	const metric = current[href];
-	if (!metric) return;
+	// No-op when already seen: callers invoke this reactively (Sidebar re-marks
+	// the active route on every metric refresh), so an unconditional set would
+	// self-trigger forever.
+	if (!metric || metric.seen) return;
 
 	navRouteMetrics.set({
 		...current,
@@ -104,4 +130,45 @@ export function markNavIndicatorSeen(href: string): void {
 	const seenKeys = loadSeenKeys();
 	seenKeys[href] = metric.seenKey;
 	saveSeenKeys(seenKeys);
+}
+
+// ---------------------------------------------------------------------------
+// Event pulses — transient "this happened since you last looked" badges,
+// layered over the heartbeat state indicators above. Pushed by the
+// notification router on realtime events (trade open/close, approvals, risk)
+// and cleared when the route is visited. In-memory only: after a reload the
+// persistent state indicators still carry the standing facts.
+// ---------------------------------------------------------------------------
+
+export interface NavPulse {
+	count: number;
+	/** Severity of the most recent event — decides the badge color. */
+	severity: NavIndicatorSeverity;
+	summary: string;
+}
+
+export const navEventPulses = writable<Record<string, NavPulse>>({});
+
+export function addNavPulse(href: string, severity: NavIndicatorSeverity, summary: string): void {
+	if (!NAV_HREFS.includes(href)) return;
+	navEventPulses.update((current) => {
+		const existing = current[href];
+		return {
+			...current,
+			[href]: {
+				count: (existing?.count ?? 0) + 1,
+				severity,
+				summary,
+			},
+		};
+	});
+}
+
+export function clearNavPulse(href: string): void {
+	navEventPulses.update((current) => {
+		if (!(href in current)) return current;
+		const next = { ...current };
+		delete next[href];
+		return next;
+	});
 }

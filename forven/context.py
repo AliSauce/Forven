@@ -1,4 +1,4 @@
-"""Brain context builder — assembles workspace + SQLite + ChromaDB into system prompt."""
+"""Brain context builder — assembles workspace files + SQLite state into system prompts."""
 
 import json
 import logging
@@ -7,7 +7,7 @@ from datetime import date, datetime, timedelta, timezone
 log = logging.getLogger("forven.context")
 
 from forven.db import get_open_trades, get_recent_trades, get_strategies, kv_get, list_approvals
-from forven.strategy_diversity import filter_recall_records_for_diversity, render_strategy_diversity_guard
+from forven.strategy_diversity import render_failure_taxonomy, render_strategy_diversity_guard
 from forven.workspace import (
     read_operator_profile,
     read_workspace,
@@ -93,34 +93,23 @@ def _render_operator_profile() -> str | None:
     return "\n".join(lines)
 
 
-def _format_brain_lessons(limit: int = 10, min_confidence: float = 0.5) -> str:
-    """Inject the Brain's curated self-judgment lessons back into its context.
+# Daily memory logs are appended to all day and were injected WHOLE into every
+# Brain cycle (and bot chat) — a 149KB yesterday-log meant ~37K tokens re-read
+# per cycle, unmeasured. Keep the tail: newest entries carry today's state, the
+# head is the part that was already acted on.
+DAILY_LOG_MAX_CHARS = 16_000
 
-    The brain_lessons KB was write-only — the Brain recorded lessons but never
-    read them, so they influenced nothing. This surfaces the highest-confidence
-    lessons so the Brain actually reuses what it learned. Brain-only by design
-    (see brain_lessons.py / brain-only memory architecture) — never injected
-    into worker-agent context. Best-effort; never the critical path.
-    """
-    try:
-        from forven.brain_lessons import list_lessons
 
-        lessons = list_lessons(limit=limit, min_confidence=min_confidence)
-    except Exception:
-        return ""
-    if not lessons:
-        return ""
-
-    out = ["# BRAIN LESSONS (your curated self-judgments — apply them)"]
-    for lesson in lessons:
-        text = str(lesson.get("lesson_text") or "").strip()
-        if not text:
-            continue
-        pattern = str(lesson.get("situation_pattern") or "").strip()
-        conf = lesson.get("confidence")
-        conf_str = f" (confidence {conf:.0%})" if isinstance(conf, (int, float)) else ""
-        out.append(f"- When {pattern}: {text}{conf_str}" if pattern else f"- {text}{conf_str}")
-    return "\n".join(out) if len(out) > 1 else ""
+def _capped_daily_log(text: str) -> str:
+    if len(text) <= DAILY_LOG_MAX_CHARS:
+        return text
+    tail = text[-DAILY_LOG_MAX_CHARS:]
+    # Cut at the first newline so we don't start mid-line.
+    nl = tail.find("\n")
+    if 0 <= nl < 200:
+        tail = tail[nl + 1:]
+    omitted = len(text) - len(tail)
+    return f"[earlier {omitted:,} chars of this log omitted — newest entries follow]\n{tail}"
 
 
 def build_brain_context(session_type: str = "main") -> str:
@@ -144,19 +133,14 @@ def build_brain_context(session_type: str = "main") -> str:
     if identity:
         parts.append(f"# IDENTITY\n{identity}")
 
-    # Brain's own curated lessons (read-back of the brain_lessons KB).
-    lessons_block = _format_brain_lessons()
-    if lessons_block:
-        parts.append(lessons_block)
-
-    # Today + yesterday memory
+    # Today + yesterday memory (tail-capped — see DAILY_LOG_MAX_CHARS)
     today_mem = read_workspace(today_memory_path(), optional=True)
     if today_mem:
-        parts.append(f"# TODAY'S LOG\n{today_mem}")
+        parts.append(f"# TODAY'S LOG\n{_capped_daily_log(today_mem)}")
 
     yesterday_mem = read_workspace(yesterday_memory_path(), optional=True)
     if yesterday_mem:
-        parts.append(f"# YESTERDAY'S LOG\n{yesterday_mem}")
+        parts.append(f"# YESTERDAY'S LOG\n{_capped_daily_log(yesterday_mem)}")
 
     # Main sessions get long-term memory too
     if session_type == "main":
@@ -300,57 +284,6 @@ def _format_pending_approvals_compact(limit: int = 8) -> str:
     return "\n".join(out)
 
 
-_STORE_CONVERSATION_DEFAULT_SOURCE = object()  # sentinel: caller did not set source
-
-
-async def store_conversation(
-    channel_name: str | None = None,
-    user_msg: str = "",
-    ai_response: str = "",
-    source=_STORE_CONVERSATION_DEFAULT_SOURCE,
-):
-    """Store conversation highlights in ChromaDB after every response.
-
-    Fails silently — fire and forget.
-
-    Args:
-        channel_name: Discord channel name (used only to label Discord
-            conversations). UI-chat callers pass ``None``.
-        user_msg: The operator's message.
-        ai_response: Forven's reply.
-        source: Conversation origin. Defaults to ``'ui_chat'`` for the in-app
-            chat. Discord callers historically pass a ``channel_name`` and no
-            explicit source — those are treated as ``'discord'`` so the existing
-            ``forven/bot.py`` caller keeps working without an edit.
-    """
-    try:
-        from forven.vectordb import store_narrative
-
-        if len(user_msg) < 10 and len(ai_response) < 50:
-            return
-
-        # Resolve source. Backward-compat: a caller that supplied a channel_name
-        # but no explicit source is the Discord bot — keep its 'discord' source
-        # and "[Discord #...]" prefix exactly as before.
-        if source is _STORE_CONVERSATION_DEFAULT_SOURCE:
-            resolved_source = "discord" if channel_name else "ui_chat"
-        else:
-            resolved_source = str(source or "ui_chat")
-
-        if resolved_source == "discord":
-            prefix = f"[Discord #{channel_name}]"
-        else:
-            prefix = f"[{resolved_source}]"
-
-        summary = f"{prefix} Judder: {user_msg[:200]} | Forven: {ai_response[:300]}"
-        metadata = {"type": "conversation", "source": resolved_source}
-        if channel_name:
-            metadata["channel"] = channel_name
-        store_narrative(summary, metadata=metadata)
-    except Exception:
-        pass
-
-
 def _get_recent_task_context(agent_id: str, limit: int = 10) -> str:
     """Return recent task summaries from conversation_state when available."""
     try:
@@ -392,7 +325,7 @@ def build_agent_context(
     Args:
         agent_id: Agent identifier
         role_md: Agent's ROLE.md content
-        task_description: Current task description (used for ChromaDB recall)
+        task_description: Current task description (used for the diversity guard)
         include_daily_memory: Include today's and yesterday's agent chat logs
     """
     parts = []
@@ -439,11 +372,11 @@ def build_agent_context(
 
         today_mem = read_workspace(f"agents/{agent_id}/memory/{today}.md", optional=True)
         if today_mem:
-            parts.append(f"# TODAY'S LOG\n{today_mem}")
+            parts.append(f"# TODAY'S LOG\n{_capped_daily_log(today_mem)}")
 
         yesterday_mem = read_workspace(f"agents/{agent_id}/memory/{yesterday}.md", optional=True)
         if yesterday_mem:
-            parts.append(f"# YESTERDAY'S LOG\n{yesterday_mem}")
+            parts.append(f"# YESTERDAY'S LOG\n{_capped_daily_log(yesterday_mem)}")
 
     recent_task_context = _get_recent_task_context(agent_id)
     if recent_task_context:
@@ -453,27 +386,27 @@ def build_agent_context(
     if diversity_guard:
         parts.append(diversity_guard)
 
-    # ChromaDB recall — relevant prior research based on task
-    if task_description:
-        chroma_context = _get_chroma_recall(task_description)
-        if chroma_context:
-            parts.append(chroma_context)
+    # Structured failure taxonomy — gate_rejections aggregated by family × gate ×
+    # reason × regime. Written on every gate failure but never read back into any
+    # prompt (query_failure_taxonomy had zero callers), so generation kept
+    # re-mining regions the pipeline had already rejected.
+    failure_taxonomy = render_failure_taxonomy()
+    if failure_taxonomy:
+        parts.append(failure_taxonomy)
 
     # Learned quant skills — the curated, outcome-weighted "what works / what to
     # avoid" knowledge base. Previously extracted, versioned, and confidence-scored
     # but NEVER read back into any decision prompt (get_ideation_context had zero
     # callers), so the discovery loop couldn't reuse proven techniques or avoid
     # known anti-patterns. Injected here so every task-running agent sees it.
-    # NOTE: only quant SKILLS are injected — brain_lessons are Brain-only by design
-    # (brain_lessons.py docstring) and must not appear in worker-agent context.
-    learned = _get_learned_skills_context()
+    learned = get_learned_skills_context()
     if learned:
         parts.append(learned)
 
     return "\n\n---\n\n".join(parts)
 
 
-def _get_learned_skills_context() -> str:
+def get_learned_skills_context() -> str:
     """Inject the curated quant-skills KB (regime-aware), best-effort.
 
     Uses the cached regime for tracked assets (no network/heavy detect) so this
@@ -497,135 +430,31 @@ def _get_learned_skills_context() -> str:
 
         block = get_ideation_context(regime=regime)
         if block and block.strip():
-            return f"# LEARNED KNOWLEDGE (from past outcomes)\n{block}"
+            return (
+                "# LEARNED KNOWLEDGE (from past outcomes)\n"
+                "If a skill below informs a strategy you register, cite its name via "
+                "register_strategy's cited_skills parameter — real outcomes then adjust "
+                "that skill's confidence.\n"
+                f"{block}"
+            )
     except Exception:
         pass  # skills KB unavailable — continue without it.
-    return ""
-
-
-def get_brain_learning_injection(query: str = "", *, n_results: int = 6, n_lessons: int = 8) -> str:
-    """Compose the Brain's institutional memory for injection at decision time.
-
-    The Brain cycle (brain.invoke) previously built context purely from workspace
-    files + live SQLite state — it never read back its own learning, so it could
-    repeat judgment errors it had already recorded and ignore prior research on
-    the very strategy types it was deciding about. This composes two Brain-scoped
-    sources into one block:
-      - ChromaDB recall (prior backtests / post-mortems / slippage), keyed on the
-        in-flight pipeline query when one is supplied; and
-      - brain_lessons (the Brain's self-judgment KB) — allowed here because this
-        is the Brain's OWN context, not a worker agent's (the brain-only boundary
-        only excludes lessons from worker-agent context).
-
-    Quant SKILLS are intentionally NOT added here: build_brain_context already
-    injects them via _get_learned_skills_context(), so adding them again would
-    duplicate. Best-effort throughout — any failure returns what was gathered so
-    far (or "") and never blocks the cycle.
-    """
-    sections: list[str] = []
-
-    # 1) ChromaDB recall on the in-flight query (falls back to a generic query so
-    #    the Brain still gets recent research even with no specific focus).
-    try:
-        recall_query = (query or "recent strategy backtests post-mortems performance").strip()
-        recall = _get_chroma_recall(recall_query, n_results=n_results)
-        if recall:
-            sections.append(recall)
-    except Exception:
-        pass
-
-    # 2) brain_lessons — prefer query-relevant via FTS5 search, else the most
-    #    confident recent lessons.
-    try:
-        from forven import brain_lessons
-
-        lessons: list[dict] = []
-        if query.strip():
-            try:
-                lessons = brain_lessons.search_lessons(query, limit=n_lessons) or []
-            except Exception:
-                lessons = []
-        if not lessons:
-            lessons = brain_lessons.list_lessons(limit=n_lessons, min_confidence=0.5) or []
-        if lessons:
-            lines = ["# PRIOR LESSONS (your self-judgment KB — avoid repeating these)"]
-            for lesson in lessons[:n_lessons]:
-                situation = str(lesson.get("situation_pattern") or "").strip()
-                text = str(lesson.get("lesson_text") or "").strip()
-                conf = lesson.get("confidence")
-                try:
-                    conf_str = f" (confidence {float(conf):.0%})" if conf is not None else ""
-                except (TypeError, ValueError):
-                    conf_str = ""
-                if not text:
-                    continue
-                prefix = f"**{situation}**: " if situation else ""
-                lines.append(f"- {prefix}{text[:300]}{conf_str}")
-            if len(lines) > 1:
-                sections.append("\n".join(lines))
-    except Exception:
-        pass
-
-    return "\n\n---\n\n".join(sections)
-
-
-def _get_chroma_recall(query: str, n_results: int = 10) -> str:
-    """Query ChromaDB for relevant prior research and format for context.
-
-    Fails silently — ChromaDB is enhancement, not critical path.
-    """
-    try:
-        from forven.vectordb import (
-            search_backtest_results,
-            search_post_mortems,
-            search_slippage_samples,
-        )
-
-        lines = []
-
-        # Search backtest results
-        bt_results = filter_recall_records_for_diversity(
-            search_backtest_results(query, n_results=max(n_results * 3, n_results)),
-        )[:n_results]
-        if bt_results:
-            lines.append("## Backtest Results")
-            for r in bt_results:
-                doc = r.get("document", "")
-                lines.append(f"- {doc[:200]}")
-
-        # Search trade post-mortems
-        pm_results = search_post_mortems(query, n_results=n_results)
-        if pm_results:
-            lines.append("## Trade Post-Mortems")
-            for r in pm_results:
-                doc = r.get("document", "")
-                lines.append(f"- {doc[:200]}")
-
-        # Search execution slippage samples
-        slip_results = search_slippage_samples(query, n_results=n_results)
-        if slip_results:
-            lines.append("## Execution Slippage")
-            for r in slip_results:
-                doc = r.get("document", "")
-                lines.append(f"- {doc[:200]}")
-
-        if lines:
-            return "# RELEVANT PRIOR RESEARCH (from ChromaDB)\n" + "\n".join(lines)
-    except Exception as exc:
-        # Fix: surface recall failures for memory-health observability instead of
-        # swallowing them silently. ChromaDB is enhancement, not critical path, so
-        # we still return "" and let the Brain continue without recall.
-        log.warning("chroma recall failed: %s", exc)
-
     return ""
 
 
 def _format_recent_trades(limit: int = 20) -> str:
     """Format recent trades for context."""
     trades = get_recent_trades(limit)
-    # Bot Factory paper trades (source='bot:{id}') are a separate product, not
+    # Bot Factory PAPER trades (source='bot:{id}') are a separate product, not
     # part of the live/strategy book the Brain reasons over — keep them out.
-    trades = [t for t in trades if not str(t.get("source") or "").startswith("bot:")]
+    # A live-armed bot's LIVE trades are real account activity and stay visible.
+    trades = [
+        t for t in trades
+        if not (
+            str(t.get("source") or "").startswith("bot:")
+            and str(t.get("execution_type") or "").strip().lower() != "live"
+        )
+    ]
     if not trades:
         return ""
 

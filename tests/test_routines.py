@@ -5,7 +5,6 @@ Covers ``forven.control_plane.routines`` validation, round-trip, and the
 """
 from __future__ import annotations
 
-import json
 import re
 
 import pytest
@@ -61,7 +60,7 @@ def test_create_rejects_invalid_context(forven_db) -> None:
 
 def test_create_and_get_round_trip(forven_db) -> None:
     init_db()
-    routine_id = _make(skills=["recall", "post_mortem"])
+    routine_id = _make(channel="ops")
     fetched = r.get_routine(routine_id)
     assert fetched is not None
     assert fetched["name"] == "daily-roundup"
@@ -69,7 +68,10 @@ def test_create_and_get_round_trip(forven_db) -> None:
     assert fetched["cron_expr"] == "0 17 * * *"
     assert fetched["tools_context"] == "scheduled"
     assert fetched["enabled"] == 1
-    assert fetched["skills"] == ["recall", "post_mortem"]
+    assert fetched["channel"] == "ops"
+    # The dormant skills_json column is not part of the API surface.
+    assert "skills_json" not in fetched
+    assert "skills" not in fetched
 
 
 def test_get_routine_missing_returns_none(forven_db) -> None:
@@ -111,14 +113,14 @@ def test_update_routine_changes_fields(forven_db) -> None:
         prompt="new prompt",
         cron_expr="*/15 * * * *",
         tools_context="research",
-        skills=["recall"],
+        channel="alerts",
         ignored_field="should not apply",
     )
     assert updated is not None
     assert updated["prompt"] == "new prompt"
     assert updated["cron_expr"] == "*/15 * * * *"
     assert updated["tools_context"] == "research"
-    assert updated["skills"] == ["recall"]
+    assert updated["channel"] == "alerts"
 
 
 def test_update_routine_rejects_bad_cron(forven_db) -> None:
@@ -205,19 +207,27 @@ def test_preview_schedule_rejects_invalid_cron(forven_db) -> None:
         r.preview_schedule("not a cron")
 
 
-# --- skills serialization edge cases --------------------------------------
+# --- channel normalization edge cases --------------------------------------
 
-def test_skills_none_round_trip(forven_db) -> None:
+def test_channel_defaults_to_none(forven_db) -> None:
     init_db()
-    routine_id = _make(skills=None)
+    routine_id = _make()
     row = r.get_routine(routine_id)
     assert row is not None
-    assert row["skills"] == []
+    assert row["channel"] is None
 
 
-def test_skills_already_json_string_passthrough(forven_db) -> None:
+def test_channel_blank_normalizes_to_none(forven_db) -> None:
     init_db()
-    routine_id = _make(skills=json.dumps(["recall"]))
+    routine_id = _make(channel="   ")
     row = r.get_routine(routine_id)
     assert row is not None
-    assert row["skills"] == ["recall"]
+    assert row["channel"] is None
+
+
+def test_channel_cleared_by_empty_update(forven_db) -> None:
+    init_db()
+    routine_id = _make(channel="ops")
+    updated = r.update_routine(routine_id, channel="")
+    assert updated is not None
+    assert updated["channel"] is None

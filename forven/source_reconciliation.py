@@ -163,13 +163,27 @@ def reconcile_one(
     except Exception as exc:
         log.debug("source-reconciliation: lake read failed %s %s: %s", symbol, timeframe, exc)
 
+    # Prefer the STORED HL venue series (collected hourly by
+    # forven-data-hl-venue-collect): reconciliation then works from persisted,
+    # closed-bar data and survives venue-API hiccups. Fall back to a live
+    # fetch when the venue series doesn't exist/cover yet.
     live_frame = None
-    try:
-        live_frame = _ts_close_frame(
-            fetch_hyperliquid_candles(symbol, bars=int(lookback_bars), interval=timeframe)
-        )
-    except Exception as exc:
-        log.info("source-reconciliation: live fetch failed %s %s: %s", symbol, timeframe, exc)
+    if str(live_venue).strip().lower() == "hyperliquid":
+        try:
+            from forven.data import load_venue_frame
+
+            stored = load_venue_frame("hyperliquid", "perp", symbol, timeframe)
+            if stored is not None and len(stored) >= int(min_overlap_bars):
+                live_frame = _ts_close_frame(stored.tail(int(lookback_bars)))
+        except Exception as exc:
+            log.debug("source-reconciliation: venue series read failed %s %s: %s", symbol, timeframe, exc)
+    if live_frame is None:
+        try:
+            live_frame = _ts_close_frame(
+                fetch_hyperliquid_candles(symbol, bars=int(lookback_bars), interval=timeframe)
+            )
+        except Exception as exc:
+            log.info("source-reconciliation: live fetch failed %s %s: %s", symbol, timeframe, exc)
 
     if backtest_frame is None or live_frame is None:
         return {**base, "status": "fetch_error"}

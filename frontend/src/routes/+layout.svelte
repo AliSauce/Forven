@@ -8,6 +8,7 @@
 	import { bootstrapActiveProcesses } from '$lib/stores/processTracker';
 	import { startHeartbeat, stopHeartbeat } from '$lib/stores/heartbeat';
 	import { connectForvenWs, disconnectForvenWs, forvenWsConnected } from '$lib/stores/forvenWebSocket';
+	import { startNotificationRouter, stopNotificationRouter } from '$lib/stores/notificationRouter';
 	import { shouldMarkBackendDisconnected } from '$lib/utils/connectionHealth';
 	import Sidebar from '$lib/components/Sidebar.svelte';
 	import Toast from '$lib/components/Toast.svelte';
@@ -66,7 +67,6 @@
 		'/lab': 'The Forge',
 		'/hypotheses': 'Crucibles',
 		'/agents': 'Agents',
-		'/memory': 'Memory',
 		'/tasks': 'Tasks',
 		'/approval': 'Approvals',
 		'/diagnostics': 'Diagnostics',
@@ -84,7 +84,6 @@
 		'/lab': 'Build, scan, and run the 24/7 autopilot lifecycle for strategy development.',
 		'/hypotheses': 'Track market theses, linked strategies, source artifacts, and the missing data that blocks them.',
 		'/agents': 'Review agent health, workloads, and orchestration status.',
-		'/memory': 'Explore, curate, and audit cross-source AI memory across narrative, Chroma, and workspace logs.',
 		'/tasks': 'Inspect task containers, ownership, status transitions, and execution audit trails.',
 		'/approval': 'Review Brain proposals and approve, deny, or revise execution tasks.',
 		'/diagnostics': 'Health checks, cost rollups, and resumable tasks for the Forven runtime.',
@@ -224,6 +223,7 @@
 
 	onMount(() => {
 		startWsChannel();
+		startNotificationRouter();
 		attemptHealthCheck();
 		reloadWizardSettings().then(() => {
 			if (wizardSettings?.setup_wizard_completed_at == null) {
@@ -238,6 +238,7 @@
 	onDestroy(() => {
 		stopPollers();
 		stopWsChannel();
+		stopNotificationRouter();
 		if (healthRetryTimer !== null) {
 			clearTimeout(healthRetryTimer);
 			healthRetryTimer = null;
@@ -254,7 +255,14 @@
 	<meta name="description" content={pageDescription} />
 </svelte:head>
 
-<div class="flex h-screen bg-black text-white font-mono overflow-hidden selection:bg-white selection:text-black">
+<!-- When the assistant is open, the app shell pads right by the panel width so
+     the page pushes over and stays usable next to the chat (no dimming overlay).
+     min(440px, 92vw) mirrors the panel's w-[440px] max-w-[92vw]. -->
+<div
+	class="flex h-screen bg-black text-white font-mono overflow-hidden selection:bg-white selection:text-black"
+	style="transition: padding-right 250ms ease;"
+	style:padding-right={$assistantUI.open ? 'min(440px, 92vw)' : '0px'}
+>
 	<Sidebar {connectionStatus} />
 
 	<!-- Main Content -->
@@ -271,15 +279,22 @@
 	</main>
 </div>
 
-<PositionAlertWidget />
+<!-- Shared bottom-right notification stack: children must render plain flex items (no fixed positioning) so alerts and toasts stack instead of overlapping. Shifts left of the assistant panel when it's open. -->
+<div
+	class="fixed bottom-4 z-[9999] flex flex-col items-end gap-2 pointer-events-none"
+	style="transition: right 250ms ease;"
+	style:right={$assistantUI.open ? 'calc(1rem + min(440px, 92vw))' : '1rem'}
+>
+	<PositionAlertWidget />
+	<Toast />
+</div>
 
-<Toast />
-
-<!-- Floating Chat Button -->
+<!-- Floating Chat Button: slides left of the panel when it's open so it stays a toggle. -->
 <button
 	on:click={toggleAssistant}
-	class="fixed z-50 w-14 h-14 bg-cyan-600 hover:bg-cyan-500 rounded-full shadow-lg flex items-center justify-center transition-all duration-200 hover:scale-110 relative"
-	style="position: fixed; right: 1.5rem; bottom: 1.5rem; left: auto; top: auto;"
+	class="fixed z-50 w-14 h-14 border border-[#333] bg-black text-white hover:bg-white hover:text-black flex items-center justify-center relative"
+	style="position: fixed; bottom: 1.5rem; left: auto; top: auto; transition: right 250ms ease, background-color 150ms ease, color 150ms ease;"
+	style:right={$assistantUI.open ? 'calc(1.5rem + min(440px, 92vw))' : '1.5rem'}
 	aria-label="Open assistant"
 >
 	{#if $assistantUI.open}
@@ -293,9 +308,8 @@
 	{/if}
 
 	{#if !$assistantUI.open && $chatUnreadCount > 0}
-		<span class="absolute -top-1 -right-1 h-5 w-5 rounded-full bg-rose-400 animate-ping opacity-75" aria-hidden="true"></span>
 		<span
-			class="absolute -top-1 -right-1 min-w-[1.25rem] h-5 px-1 rounded-full bg-rose-500 text-[10px] font-bold text-white flex items-center justify-center ring-2 ring-black"
+			class="absolute -top-1 -right-1 min-w-[1.25rem] h-5 px-1 bg-red-500 text-[10px] font-bold text-white flex items-center justify-center"
 			aria-label={`${$chatUnreadCount} unread chat replies`}
 		>
 			{unreadChatCountLabel}

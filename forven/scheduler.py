@@ -14,6 +14,7 @@ import contextvars
 import functools
 import json
 import logging
+import math
 import os
 import threading
 import time
@@ -63,6 +64,9 @@ _DEFAULT_JOB_IDS = {
     "forven-data-fng-collect",
     "forven-data-macro-collect",
     "forven-data-btcdom-collect",
+    "forven-data-basis-collect",
+    "forven-data-iv-collect",
+    "forven-data-hl-venue-collect",
     "forven-quant-skills-consolidation",
     "forven-stale-triage",
     "forven-auto-intake",
@@ -111,6 +115,9 @@ _DATA_MANAGER_TIMEOUT_DEFAULTS = {
     "data_manager_collect_fng": 120.0,
     "data_manager_collect_macro": 180.0,
     "data_manager_collect_btcdom": 120.0,
+    "data_manager_collect_basis": 120.0,
+    "data_manager_collect_iv": 120.0,
+    "hl_venue_collect": 180.0,
 }
 
 _DATA_MANAGER_JOB_PAYLOAD_DEFAULTS: dict[str, dict[str, object]] = {
@@ -130,6 +137,9 @@ _DATA_MANAGER_JOB_PAYLOAD_DEFAULTS: dict[str, dict[str, object]] = {
     "forven-data-fng-collect": {"kind": "data_manager_collect_fng", "timeout_seconds": 120},
     "forven-data-macro-collect": {"kind": "data_manager_collect_macro", "timeout_seconds": 180},
     "forven-data-btcdom-collect": {"kind": "data_manager_collect_btcdom", "timeout_seconds": 120},
+    "forven-data-basis-collect": {"kind": "data_manager_collect_basis", "timeout_seconds": 120},
+    "forven-data-iv-collect": {"kind": "data_manager_collect_iv", "timeout_seconds": 120},
+    "forven-data-hl-venue-collect": {"kind": "hl_venue_collect", "timeout_seconds": 180},
 }
 
 # Jobs that can be deferred when a user is actively running tests.
@@ -578,7 +588,7 @@ def _apply_runtime_scheduler_overrides() -> int:
             if current_type == schedule_type and current_expr == schedule_expr and payload_update is None:
                 continue
             timezone_name = str(row["timezone"] or "UTC")
-            next_run = _compute_next_run(schedule_type, schedule_expr, timezone_name)
+            next_run = _compute_next_run(schedule_type, schedule_expr, timezone_name, job_id=job_id)
             if payload_update is None:
                 conn.execute(
                     "UPDATE scheduler_jobs SET schedule_type = ?, schedule_expr = ?, next_run_at = ? WHERE id = ?",
@@ -804,7 +814,7 @@ def add_job(
             (
                 job_id, name, schedule_type, schedule_expr,
                 timezone_str, command, json.dumps(payload) if payload else None,
-                _compute_next_run(schedule_type, schedule_expr, timezone_str),
+                _compute_next_run(schedule_type, schedule_expr, timezone_str, job_id=job_id),
             ),
         )
 
@@ -818,8 +828,22 @@ def enable_job(job_id: str, enabled: bool = True):
         )
 
 
-def _compute_next_run(schedule_type: str, schedule_expr: str, tz: str = "UTC") -> str:
-    """Compute the next run time for a job."""
+# LAG-2 / BAR-ALIGNED SCANS: the scanner jobs must fire just AFTER each bar closes, not
+# at an arbitrary interval phase. A plain `now + interval` schedule drifts to whatever
+# phase the job was last touched at, adding up to a full interval of latency between a
+# bar close and the scan that acts on it — on top of the signal-bar-close fill this
+# latency is pure entry/exit skew. Aligning the interval to wall-clock (UTC-epoch)
+# multiples makes every scan land at :00/:05/:10…, and the :00 scan catches every bar
+# close on every timeframe (all crypto bars are UTC-aligned). The small offset gives the
+# venue time to publish the just-closed candle before we fetch.
+_BAR_ALIGNED_JOB_IDS = frozenset({"forven-scanner-hourly", "forven-scanner-signal"})
+_BAR_ALIGN_OFFSET_SECONDS = 20.0
+
+
+def _compute_next_run(schedule_type: str, schedule_expr: str, tz: str = "UTC", *, job_id: str | None = None) -> str:
+    """Compute the next run time for a job. Interval jobs in ``_BAR_ALIGNED_JOB_IDS``
+    are aligned to wall-clock multiples of their interval (+ the candle-publication
+    offset) instead of free-running from "now"."""
     import zoneinfo
     schedule_expr = (schedule_expr or "").strip()
     if not schedule_expr:
@@ -839,8 +863,14 @@ def _compute_next_run(schedule_type: str, schedule_expr: str, tz: str = "UTC") -
             interval_ms = int(schedule_expr)
         except Exception as e:
             raise ValueError(f"invalid interval expression '{schedule_expr}' (ms integer required): {e}") from e
-        next_time = datetime.now(timezone.utc).timestamp() + interval_ms / 1000
-        return datetime.fromtimestamp(next_time, timezone.utc).isoformat()
+        now_s = datetime.now(timezone.utc).timestamp()
+        if job_id in _BAR_ALIGNED_JOB_IDS and interval_ms > 0:
+            step = interval_ms / 1000.0
+            next_s = (math.floor((now_s - _BAR_ALIGN_OFFSET_SECONDS) / step) + 1) * step + _BAR_ALIGN_OFFSET_SECONDS
+            if next_s <= now_s:  # float-edge guard: never schedule at/before now
+                next_s += step
+            return datetime.fromtimestamp(next_s, timezone.utc).isoformat()
+        return datetime.fromtimestamp(now_s + interval_ms / 1000, timezone.utc).isoformat()
     else:
         raise ValueError(f"unsupported schedule_type '{schedule_type}'")
 
@@ -1308,7 +1338,7 @@ async def run_job(job: dict) -> tuple[str, str | None]:
                         "routine_id": int(routine_id),
                         "routine_name": routine.get("name"),
                         "tools_context": routine.get("tools_context") or "scheduled",
-                        "skills": routine.get("skills") or [],
+                        "channel": routine.get("channel") or None,
                         "message": message,
                     },
                     priority=0,
@@ -1388,15 +1418,12 @@ async def run_job(job: dict) -> tuple[str, str | None]:
             await _run_sync_job(run_crucible_discovery, timeout_seconds=60)
             return "ok", None
 
-        # Evolution pipeline steps
-        if kind == "evolution_ideation":
-            from forven.evolution import run_ideation_step
-            await _run_sync_job(run_ideation_step)
-            return "ok", None
-
-        if kind == "evolution_coding":
-            from forven.evolution import run_coding_step
-            await _run_sync_job(run_coding_step)
+        # Evolution pipeline steps. The broad ideation/coding cycles are retired;
+        # an (always force-disabled, but manually runnable) ideation job routes
+        # straight to the crucible planner.
+        if kind in {"evolution_ideation", "evolution_coding"}:
+            from forven.crucible_planner import run_crucible_planner_cycle
+            await _run_sync_job(run_crucible_planner_cycle, limit=3)
             return "ok", None
 
         if kind == "evolution_testing":
@@ -1678,7 +1705,7 @@ async def run_job(job: dict) -> tuple[str, str | None]:
                 log.info("orphan_type_scan: no orphan strategies found")
             return "ok", None
 
-        # Slippage monitor — audit signal vs fill quality and store to ChromaDB
+        # Slippage monitor — audit signal vs fill quality
         if kind == "slippage_monitor":
             from forven.monitoring import run_slippage_monitor
             await _run_sync_job(
@@ -1687,6 +1714,18 @@ async def run_job(job: dict) -> tuple[str, str | None]:
                 max_trades=int(payload.get("max_trades", 2000)),
             )
             return "ok", None
+
+        # Execution-quality watchdog — nightly expected-vs-actual fill skew
+        # aggregated per strategy against its modeled cost budget
+        if kind == "exec_quality_watchdog":
+            from forven.monitoring import run_execution_quality_watchdog
+            result = await _run_sync_job(
+                run_execution_quality_watchdog,
+                lookback_days=int(payload.get("lookback_days", 30)),
+                min_trades=int(payload.get("min_trades", 5)),
+            )
+            flagged = int(result.get("flagged_count") or 0) if isinstance(result, dict) else 0
+            return "ok", (f"{flagged} strategy bucket(s) over cost budget" if flagged else None)
 
         if kind == "recalibrate":
             try:
@@ -1704,6 +1743,23 @@ async def run_job(job: dict) -> tuple[str, str | None]:
             except Exception as e:
                 log.error("Recalibration job failed: %s", e)
                 return "error", str(e)
+
+        # Testnet end-to-end execution harness — proves the full LIVE order
+        # lifecycle (open -> stop mirror -> trailing tighten -> close) against
+        # HL testnet, exchange-truth asserted per leg. Skips cleanly off-testnet.
+        if kind == "testnet_execution_harness":
+            from forven.testnet_harness import run_testnet_execution_harness
+            result = await _run_sync_job(
+                run_testnet_execution_harness,
+                asset=payload.get("asset"),
+                notional_usd=payload.get("notional_usd"),
+            )
+            status = str(result.get("status")) if isinstance(result, dict) else "unknown"
+            if status == "failed":
+                log.error("Testnet execution harness FAILED — see kv forven:testnet_harness:last_run")
+                return "error", "testnet execution harness failed"
+            log.info("Testnet execution harness: %s", status)
+            return "ok", None
 
         # Ghost container scan — detect strategies with missing/broken containers
         if kind == "ghost_container_scan":
@@ -1844,6 +1900,42 @@ async def run_job(job: dict) -> tuple[str, str | None]:
                 timeout_seconds=_coerce_timeout_seconds(
                     payload.get("timeout_seconds"),
                     _DATA_MANAGER_TIMEOUT_DEFAULTS["data_manager_collect_liquidation"],
+                ),
+            )
+            return "ok", None
+
+        # DataManager — premium-index basis collection (perp basis vs index)
+        if kind == "data_manager_collect_basis":
+            from forven.data_manager import data_manager
+            await _run_sync_job(
+                data_manager.collect_basis,
+                timeout_seconds=_coerce_timeout_seconds(
+                    payload.get("timeout_seconds"),
+                    _DATA_MANAGER_TIMEOUT_DEFAULTS["data_manager_collect_basis"],
+                ),
+            )
+            return "ok", None
+
+        # DataManager — Deribit DVOL implied volatility (BTC/ETH)
+        if kind == "data_manager_collect_iv":
+            from forven.data_manager import data_manager
+            await _run_sync_job(
+                data_manager.collect_iv,
+                timeout_seconds=_coerce_timeout_seconds(
+                    payload.get("timeout_seconds"),
+                    _DATA_MANAGER_TIMEOUT_DEFAULTS["data_manager_collect_iv"],
+                ),
+            )
+            return "ok", None
+
+        # Hyperliquid venue candles for the traded subset (venue-fidelity series)
+        if kind == "hl_venue_collect":
+            from forven.dataeng.venue import collect_hl_venue_series
+            await _run_sync_job(
+                collect_hl_venue_series,
+                timeout_seconds=_coerce_timeout_seconds(
+                    payload.get("timeout_seconds"),
+                    _DATA_MANAGER_TIMEOUT_DEFAULTS["hl_venue_collect"],
                 ),
             )
             return "ok", None
@@ -2171,7 +2263,7 @@ async def _execute_claimed_scheduler_job(job: dict) -> None:
     try:
         next_run_str = _compute_next_run(
             job["schedule_type"], job["schedule_expr"],
-            job.get("timezone", "UTC"),
+            job.get("timezone", "UTC"), job_id=str(job.get("id") or ""),
         )
     except Exception as e:
         # Fallback: schedule next run at a reasonable interval so the job
@@ -2292,6 +2384,7 @@ async def tick():
                     job["schedule_type"],
                     job["schedule_expr"],
                     job.get("timezone", "UTC"),
+                    job_id=str(job.get("id") or ""),
                 )
             except Exception as e:
                 msg = f"scheduler next-run error: {e}"
@@ -2311,6 +2404,7 @@ async def tick():
                     job["schedule_type"],
                     job["schedule_expr"],
                     job.get("timezone", "UTC"),
+                    job_id=str(job.get("id") or ""),
                 )
             except Exception as e:
                 msg = f"scheduler next-run error: {e}"
@@ -2340,6 +2434,7 @@ async def tick():
                         job["schedule_type"],
                         job["schedule_expr"],
                         job.get("timezone", "UTC"),
+                        job_id=str(job.get("id") or ""),
                     )
                 except Exception as e:
                     log.error("Scheduler schedule compute failed for %s: %s", job.get("id"), e)
@@ -2370,6 +2465,7 @@ async def tick():
                             job["schedule_type"],
                             job["schedule_expr"],
                             job.get("timezone", "UTC"),
+                            job_id=str(job.get("id") or ""),
                         )
                     except Exception as e:
                         log.error("Scheduler schedule compute failed for %s: %s", job.get("id"), e)
@@ -3014,6 +3110,21 @@ def seed_forven_jobs():
         payload={"kind": "orphan_type_scan", "auto_demote": False},
     )
 
+    # 4e. Testnet Execution Harness — daily end-to-end proof of the LIVE order
+    # lifecycle against Hyperliquid testnet (open -> stop mirror -> trailing
+    # tighten -> close -> no residuals, exchange truth asserted per leg).
+    # Skips cleanly when the configured network is not testnet, sim is active,
+    # or the kill switch is on. Report: kv forven:testnet_harness:last_run.
+    add_job(
+        job_id="forven-testnet-harness",
+        name="Testnet Execution Harness",
+        schedule_type="cron",
+        schedule_expr="30 5 * * *",  # daily 05:30, after DB maintenance
+        command="testnet-harness",
+        timezone_str="America/Halifax",
+        payload={"kind": "testnet_execution_harness"},
+    )
+
     # 5. Regime + Market Pot refresh — every 4 hours
     add_job(
         job_id="forven-regime-update",
@@ -3041,6 +3152,22 @@ def seed_forven_jobs():
             "kind": "slippage_monitor",
             "lookback_hours": 168,
             "max_trades": 2000,
+        },
+    )
+
+    # 5.5b. Execution-Quality Watchdog — nightly: flags strategies whose realized
+    # expected-vs-actual fill skew exceeds their modeled cost budget
+    add_job(
+        job_id="forven-exec-quality-watchdog",
+        name="Execution Quality Watchdog",
+        schedule_type="cron",
+        schedule_expr="30 6 * * *",
+        command="exec-quality-watchdog",
+        timezone_str="UTC",
+        payload={
+            "kind": "exec_quality_watchdog",
+            "lookback_days": 30,
+            "min_trades": 5,
         },
     )
 
@@ -3311,6 +3438,40 @@ def seed_forven_jobs():
         payload={"kind": "data_manager_collect_btcdom", "timeout_seconds": 120},
     )
 
+    # 22b. Perp basis (premium index) — hourly, crypto-native strategy stream
+    add_job(
+        job_id="forven-data-basis-collect",
+        name="DataManager Basis Collect",
+        schedule_type="interval",
+        schedule_expr="3600000",
+        command="data-basis-collect",
+        timezone_str="UTC",
+        payload={"kind": "data_manager_collect_basis", "timeout_seconds": 120},
+    )
+
+    # 22c. Implied volatility (Deribit DVOL BTC/ETH) — hourly regime stream
+    add_job(
+        job_id="forven-data-iv-collect",
+        name="DataManager Implied Vol Collect",
+        schedule_type="interval",
+        schedule_expr="3600000",
+        command="data-iv-collect",
+        timezone_str="UTC",
+        payload={"kind": "data_manager_collect_iv", "timeout_seconds": 120},
+    )
+
+    # 22d. Hyperliquid venue candles for the traded subset — hourly
+    # (venue-fidelity series: measures + stores what we actually execute on)
+    add_job(
+        job_id="forven-data-hl-venue-collect",
+        name="Hyperliquid Venue Candle Collect",
+        schedule_type="interval",
+        schedule_expr="3600000",
+        command="data-hl-venue-collect",
+        timezone_str="UTC",
+        payload={"kind": "hl_venue_collect", "timeout_seconds": 180},
+    )
+
     # 23. Hypothesis verdict loop — every 5 min. Without this the active-pool
     # cap silently traps the system: hypotheses never receive verdicts, never
     # graduate, never free their slot — so new hypotheses are refused.
@@ -3479,6 +3640,21 @@ def ensure_monitoring_jobs() -> int:
                 "kind": "slippage_monitor",
                 "lookback_hours": 168,
                 "max_trades": 2000,
+            },
+        )
+        added += 1
+    if "forven-exec-quality-watchdog" not in existing_ids:
+        add_job(
+            job_id="forven-exec-quality-watchdog",
+            name="Execution Quality Watchdog",
+            schedule_type="cron",
+            schedule_expr="30 6 * * *",
+            command="exec-quality-watchdog",
+            timezone_str="UTC",
+            payload={
+                "kind": "exec_quality_watchdog",
+                "lookback_days": 30,
+                "min_trades": 5,
             },
         )
         added += 1

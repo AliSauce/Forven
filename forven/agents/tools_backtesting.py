@@ -111,6 +111,47 @@ def _persist_strategy_provenance(strategy_id: str, provenance: dict[str, str | N
         )
 
 
+def _persist_task_strategy_link(strategy_id: str, cited_skills: list[str]) -> None:
+    """Link the running develop task to its created strategy and record skill citations.
+
+    Outcome closure (forven.skill_outcomes) walks agent_tasks by strategy_id and
+    reads output_data.cited_skills. Develop tasks are created BEFORE the strategy
+    exists (strategy_id is NULL at assign time), so without this backfill the
+    task chain is invisible to closure and cited skills never get their
+    confidence adjusted by real outcomes.
+    """
+    normalized_strategy_id = str(strategy_id or "").strip()
+    task_display_id = str(_current_task_display_id_var.get() or "").strip()
+    if not normalized_strategy_id or not task_display_id:
+        return
+    citations = [str(item).strip() for item in cited_skills if str(item or "").strip()][:10]
+    try:
+        with get_db() as conn:
+            row = conn.execute(
+                "SELECT id, output_data FROM agent_tasks WHERE display_id = ?",
+                (task_display_id,),
+            ).fetchone()
+            if not row:
+                return
+            conn.execute(
+                "UPDATE agent_tasks SET strategy_id = COALESCE(strategy_id, ?) WHERE id = ?",
+                (normalized_strategy_id, row["id"]),
+            )
+            if citations:
+                payload = _parse_json_object(row["output_data"])
+                existing = payload.get("cited_skills")
+                merged = list(dict.fromkeys(
+                    [*(existing if isinstance(existing, list) else []), *citations]
+                ))
+                payload["cited_skills"] = merged
+                conn.execute(
+                    "UPDATE agent_tasks SET output_data = ? WHERE id = ?",
+                    (json.dumps(payload), row["id"]),
+                )
+    except Exception as exc:
+        log.warning("cited_skills persistence failed for task %s: %s", task_display_id, exc)
+
+
 def _load_strategy_context(strategy_id: str) -> tuple[dict, dict]:
     from forven.db import get_db
 
@@ -180,21 +221,17 @@ def _persist_agent_backtest(
     )
 
     try:
-        from forven.vectordb import store_backtest_result
+        from forven.quant_skills_extractor import record_backtest_for_learning
 
-        store_backtest_result(
+        record_backtest_for_learning(
             strategy_id=strategy_id,
             asset=symbol,
             strategy_type=str(strategy_type or strategy_row.get("type") or "").strip(),
             params=params if isinstance(params, dict) else {},
             metrics=merged_metrics,
             fitness=float(fitness),
-            result_id=result_id,
-            job_id=job_id,
             strategy_name=strategy_name,
-            lifecycle_strategy_id=strategy_id,
             config=config_payload,
-            result_type="backtest",
         )
     except Exception:
         pass
@@ -213,12 +250,6 @@ def _persist_agent_backtest(
         merged_metrics,
         promotion_reason="Agent backtest completed",
     )
-
-    # Guardrail #2: Verify ChromaDB persistence
-    from forven.db import verify_chroma_persistence
-    persisted, error_msg = verify_chroma_persistence(result_id)
-    if not persisted:
-        log.warning(f"ChromaDB persistence check failed: {error_msg}")
 
     return True, result_id
 
@@ -415,6 +446,11 @@ def _tool_run_code(code: str) -> str:
             "type_name": {"type": "string", "description": "Unique type name for the strategy (e.g., 'fisher_momentum', 'qqe_trend'). Alphanumeric and underscores only."},
             "hypothesis_id": {"type": "string", "description": "Parent hypothesis ID for the strategy container that will be registered from this module."},
             "crucible_id": {"type": "string", "description": "Planner-approved crucible/hypothesis ID for this candidate."},
+            "cited_skills": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Names of learned quant skills (from the LEARNED KNOWLEDGE context block) that informed this design. Cited skills get their confidence adjusted when this strategy later graduates or dies, so cite honestly — only skills you actually applied.",
+            },
         },
         "required": ["code", "type_name", "hypothesis_id"],
     },
@@ -509,6 +545,11 @@ def _tool_register_strategy(params: dict) -> str:
                     (type_name, datetime.now(timezone.utc).isoformat(), target_strategy_id),
                 )
             _persist_strategy_provenance(target_strategy_id, provenance)
+            cited_skills = params.get("cited_skills")
+            _persist_task_strategy_link(
+                target_strategy_id,
+                cited_skills if isinstance(cited_skills, list) else [],
+            )
         if registered_strategy_id:
             return (
                 f"Strategy type '{type_name}' registered successfully as "
@@ -607,7 +648,7 @@ def _check_backtesting_available() -> bool:
 
 _BACKTESTING_FALLBACK_MSG = (
     "Forven Backtesting is not reachable. Do NOT debug connectivity — "
-    "use your local tools instead: run_backtest, optimize_strategy, search_chroma, "
+    "use your local tools instead: run_backtest, optimize_strategy, "
     "list_local_datasets. These provide equivalent backtesting capabilities."
 )
 

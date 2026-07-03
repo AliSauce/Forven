@@ -62,15 +62,6 @@ def _insert_audit(task_id: str, tool_name: str, summary: str) -> int:
         return int(cur.lastrowid)
 
 
-def _insert_brain_lesson(situation: str, lesson: str) -> int:
-    with get_db() as conn:
-        cur = conn.execute(
-            "INSERT INTO brain_lessons (situation_pattern, lesson_text) VALUES (?, ?)",
-            (situation, lesson),
-        )
-        return int(cur.lastrowid)
-
-
 # --- brain_decisions_fts -------------------------------------------------
 
 def test_brain_decisions_insert_makes_row_searchable(forven_db):
@@ -216,7 +207,6 @@ def test_rebuild_fts5_indices_repairs_after_simulated_drift(forven_db):
     decision_id = _insert_decision(f"drifty {TOKEN_INSERT}")
     task_id = _insert_agent_task(f"drift task {TOKEN_INSERT}", "x")
     audit_id = _insert_audit("t-drift", "tool", f"audit {TOKEN_INSERT}")
-    lesson_id = _insert_brain_lesson(f"drift pattern {TOKEN_INSERT}", "rebuild me")
 
     # Simulate trigger bypass: tell each FTS index to forget its contents
     # without touching the source rows. Rebuild should restore them.
@@ -249,14 +239,9 @@ def test_rebuild_fts5_indices_repairs_after_simulated_drift(forven_db):
             "SELECT rowid FROM task_audit_log_fts WHERE task_audit_log_fts MATCH ?",
             (TOKEN_INSERT,),
         ).fetchone()
-        bl = conn.execute(
-            "SELECT rowid FROM brain_lessons_fts WHERE brain_lessons_fts MATCH ?",
-            (TOKEN_INSERT,),
-        ).fetchone()
     assert bd is not None and int(bd["rowid"]) == decision_id
     assert at is not None and int(at["rowid"]) == task_id
     assert au is not None and int(au["rowid"]) == audit_id
-    assert bl is not None and int(bl["rowid"]) == lesson_id
 
 
 def test_fts5_rebuild_cli_command_runs(forven_db):

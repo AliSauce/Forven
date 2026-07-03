@@ -57,18 +57,29 @@ def test_nan_and_nonpositive_samples_rejected(forven_db):
     assert state["kill_switch_active"] is False
 
 
-def test_sustained_large_jump_self_heals_after_streak(forven_db):
-    """A transient 100x+ spike is rejected, but a sustained one (real deposit) heals."""
+def test_sustained_large_jump_stays_rejected_and_alerts(forven_db):
+    """EQ-BASIS-3: a 100x+ spike is rejected FOREVER (fail closed) — the old
+    accept-after-5-ticks self-heal is exactly how a persistent garbage read
+    latched a $516B HWM. The operator is alerted to confirm a genuine deposit
+    via the explicit re-baseline action instead."""
+    from forven.notifications import list_notifications, update_notification_preferences
+    update_notification_preferences({"discord_mode": "shadow"})
+
     risk.update_equity(1000.0, source="exchange")
     big = 1000.0 * 200  # 200x — suspect
 
-    for _ in range(risk._EQUITY_JUMP_MAX_CONSECUTIVE_REJECTS):
+    for _ in range(risk._EQUITY_JUMP_ALERT_AFTER_REJECTS + 3):
         assert risk.update_equity(big, source="exchange").get("rejected") is True
 
-    # Sustained beyond the streak -> accepted as a genuine regime change.
+    state = risk._get_risk_state()
+    assert state["high_water_mark"] == 1000.0  # never latched
+    assert list_notifications(event_type="equity_anomaly")  # operator alerted
+
+    # The explicit confirmation path accepts the new balance.
+    risk.rebaseline_equity_anchors(big, source="exchange", actor="test")
+    assert risk._get_risk_state()["high_water_mark"] == big
     result = risk.update_equity(big, source="exchange")
     assert result.get("rejected") is not True
-    assert risk._get_risk_state()["high_water_mark"] == big
 
 
 def test_real_drawdown_still_fires_kill_switch(forven_db):

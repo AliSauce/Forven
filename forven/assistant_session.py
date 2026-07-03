@@ -16,6 +16,7 @@ Event protocol (SSE ``data:`` JSON objects):
     {"type": "tool_call", "name": str, "input": dict}
     {"type": "tool_result", "name": str, "output": str}
     {"type": "action_proposed", "action_id": str, "name": str, "input": dict, "summary": str}
+    {"type": "navigate", "route": str}
     {"type": "done", "message_id": str}
     {"type": "error", "code": str, "message": str}
 """
@@ -227,6 +228,19 @@ def _history_to_llm_messages(history: list[dict]) -> list[dict]:
     return out
 
 
+def _navigate_route_from_output(output) -> str | None:
+    """Extract the validated route from a successful open_app_page tool result."""
+    import json as _json
+
+    try:
+        parsed = _json.loads(str(output))
+    except Exception:
+        return None
+    if isinstance(parsed, dict) and parsed.get("ok") and isinstance(parsed.get("route"), str):
+        return parsed["route"]
+    return None
+
+
 def _summarize_action(name: str, tool_input: dict) -> str:
     if name == "promote_strategy":
         sid = tool_input.get("strategy_id") or tool_input.get("id") or "?"
@@ -373,6 +387,12 @@ async def run_turn(
                 )
                 llm_messages.append({"role": "tool", "content": str(output), "tool_call_id": tc_id or ""})
                 yield {"type": "tool_result", "name": tc_name, "output": str(output)[:1500]}
+                # open_app_page's effect is client-side: the tool only validates
+                # the route; the browser navigates on this event.
+                if tc_name == "open_app_page":
+                    route = _navigate_route_from_output(output)
+                    if route:
+                        yield {"type": "navigate", "route": route}
 
         yield {"type": "error", "code": "max_rounds", "message": f"hit {MAX_TOOL_ROUNDS} round limit"}
     except Exception as exc:

@@ -435,6 +435,7 @@ _AGENT_MODEL_CATALOG = [
     {"provider": "openai", "model_id": "gpt-5.2-mini", "label": "OpenAI GPT-5.2 Mini"},
     {"provider": "openai", "model_id": "gpt-5.4", "label": "OpenAI GPT-5.4"},
     {"provider": "openai", "model_id": "gpt-5.4-mini", "label": "OpenAI GPT-5.4 Mini"},
+    {"provider": "openai", "model_id": "gpt-5.5", "label": "OpenAI GPT-5.5"},
     {"provider": "openai", "model_id": "o1", "label": "OpenAI O1"},
     {"provider": "openai", "model_id": "o1-mini", "label": "OpenAI O1 Mini"},
     {"provider": "openai", "model_id": "o1-preview", "label": "OpenAI O1 Preview"},
@@ -1711,6 +1712,11 @@ _DEFAULT_SETTINGS_PAYLOAD = {
     "pipeline_assignments_per_cycle": 3,
     "pipeline_drain_mode": True,
     "backtest_matrix_workers": 4,
+    # Process-wide cap on concurrent backtest SUBPROCESSES (memory ceiling all the
+    # parallel pipeline levers queue on). See forven/strategies/concurrency.py.
+    "backtest_subprocess_budget": 4,
+    # Gauntlet workflows advanced concurrently per tick (1 = serial drain).
+    "gauntlet_drain_workers": 3,
     "pipeline_saturation_threshold": 100,
     "pipeline_resume_threshold": 60,
     "pipeline_drain_max_seconds": 300,
@@ -1726,6 +1732,10 @@ _DEFAULT_SETTINGS_PAYLOAD = {
     "code_strategy_requires_approval": False,
     "auto_approve_code_edits": False,
     "auto_approve_promotions": False,
+    # GO-LIVE-1: even with auto_approve_promotions/promotion_mode=auto, a
+    # paper→live promotion requires an explicit operator confirmation with a
+    # notional ceiling — unless this is deliberately flipped on (dangerous).
+    "allow_auto_live_promotion": False,
     # When a challenger materially beats an incumbent occupying a capital slot,
     # auto-apply the dethrone so the slot frees without operator action. Default
     # ON for autonomous operation — reversible (the incumbent is demoted
@@ -2575,6 +2585,57 @@ def _apply_settings_section(section: str, payload: dict) -> dict:
             updates["liq_distance_critical_pct"] = _coerce_float(payload.get("liq_distance_critical_pct"), updates.get("liq_distance_critical_pct", 7))
         if "cooldown_after_loss_hours" in payload:
             updates["cooldown_after_loss_hours"] = _coerce_float(payload.get("cooldown_after_loss_hours"), updates["cooldown_after_loss_hours"])
+        # PORT-1: live account-level portfolio budget (read top-level from
+        # forven:settings by forven.exchange.risk.check_live_portfolio_budget).
+        if "live_portfolio_budget_enabled" in payload:
+            updates["live_portfolio_budget_enabled"] = _coerce_bool(
+                payload.get("live_portfolio_budget_enabled"),
+                bool(updates.get("live_portfolio_budget_enabled", True)),
+            )
+        for _pb_key, _pb_default in (
+            ("live_max_total_open_risk_pct", 5.0),
+            ("live_max_asset_exposure_pct", 150.0),
+            ("live_max_group_exposure_pct", 200.0),
+            # SIZE-CAP-1: per-order hard ceilings (forven.exchange.risk).
+            ("live_hard_max_per_trade_risk_pct", 2.0),
+            ("live_hard_max_order_notional_pct", 100.0),
+            # BOOK-BUDGET-1: per-wallet gross-notional cap (forven.exchange.risk).
+            ("live_max_book_notional_pct", 100.0),
+            # CORR-1: measured-correlation effective-exposure gate
+            # (forven.portfolio_correlation via check_live_portfolio_budget).
+            ("live_max_effective_exposure_pct", 200.0),
+            ("live_correlation_window_bars", 720.0),
+            ("live_correlation_missing_default", 1.0),
+        ):
+            if _pb_key in payload:
+                updates[_pb_key] = _coerce_float(payload.get(_pb_key), _coerce_float(updates.get(_pb_key), _pb_default))
+        if "live_correlation_budget_enabled" in payload:
+            updates["live_correlation_budget_enabled"] = _coerce_bool(
+                payload.get("live_correlation_budget_enabled"),
+                bool(updates.get("live_correlation_budget_enabled", True)),
+            )
+        # EQ-BASIS-1: whether the master wallet counts toward the live equity
+        # basis when direction books are enabled (forven.daemon).
+        if "live_equity_include_master" in payload:
+            updates["live_equity_include_master"] = _coerce_bool(
+                payload.get("live_equity_include_master"),
+                bool(updates.get("live_equity_include_master", False)),
+            )
+        # LIQ-1: order-time liquidity guard (forven.exchange.liquidity).
+        if "live_liquidity_guard_enabled" in payload:
+            updates["live_liquidity_guard_enabled"] = _coerce_bool(
+                payload.get("live_liquidity_guard_enabled"),
+                bool(updates.get("live_liquidity_guard_enabled", True)),
+            )
+        for _lq_key, _lq_default in (
+            ("live_min_daily_volume_usd", 5_000_000.0),
+            ("live_max_spread_bps", 50.0),
+            ("live_book_depth_window_bps", 100.0),
+            ("live_max_book_participation_pct", 25.0),
+            ("live_max_price_impact_bps", 50.0),
+        ):
+            if _lq_key in payload:
+                updates[_lq_key] = _coerce_float(payload.get(_lq_key), _coerce_float(updates.get(_lq_key), _lq_default))
         if "strict_regime_gating" in payload:
             updates["strict_regime_gating"] = _coerce_bool(payload.get("strict_regime_gating"), updates["strict_regime_gating"])
         if "regime_min_confidence" in payload:
@@ -2731,6 +2792,8 @@ def _apply_settings_section(section: str, payload: dict) -> dict:
             updates["auto_approve_code_edits"] = _coerce_bool(payload.get("auto_approve_code_edits"), updates.get("auto_approve_code_edits", False))
         if "auto_approve_promotions" in payload:
             updates["auto_approve_promotions"] = _coerce_bool(payload.get("auto_approve_promotions"), updates.get("auto_approve_promotions", False))
+        if "allow_auto_live_promotion" in payload:
+            updates["allow_auto_live_promotion"] = _coerce_bool(payload.get("allow_auto_live_promotion"), updates.get("allow_auto_live_promotion", False))
         if "auto_approve_dethrone" in payload:
             updates["auto_approve_dethrone"] = _coerce_bool(payload.get("auto_approve_dethrone"), updates.get("auto_approve_dethrone", True))
         if "canonical_auto_deploy_enabled" in payload:
@@ -2869,6 +2932,20 @@ def _apply_settings_section(section: str, payload: dict) -> dict:
             updates["backtest_matrix_workers"] = _coerce_bounded_int(
                 payload.get("backtest_matrix_workers"),
                 _coerce_bounded_int(updates.get("backtest_matrix_workers"), 4, 1, 8),
+                1,
+                8,
+            )
+        if "backtest_subprocess_budget" in payload:
+            updates["backtest_subprocess_budget"] = _coerce_bounded_int(
+                payload.get("backtest_subprocess_budget"),
+                _coerce_bounded_int(updates.get("backtest_subprocess_budget"), 4, 1, 8),
+                1,
+                8,
+            )
+        if "gauntlet_drain_workers" in payload:
+            updates["gauntlet_drain_workers"] = _coerce_bounded_int(
+                payload.get("gauntlet_drain_workers"),
+                _coerce_bounded_int(updates.get("gauntlet_drain_workers"), 3, 1, 8),
                 1,
                 8,
             )
@@ -3326,6 +3403,10 @@ class BacktestSubmitBody(BaseModel):
     leverage: float | None = Field(default=None, gt=0, le=125)
     lifecycle_id: str | None = None
     preserve_result: bool = False
+    # Point-in-time pin (ISO-8601): reconstruct the data as it was known at
+    # this instant from the revision log. Gauntlet stages pass their
+    # candidate's creation time so every stage scores identical data.
+    as_of: str | None = Field(default=None, max_length=64)
 
 
 class OptimizationSubmitBody(BaseModel):
@@ -4148,18 +4229,6 @@ def _backtest_trash_table(conn):
         )
     """
         )
-
-
-def _delete_backtest_record(result_id: str):
-    """Delete one backtest result from Chroma collection."""
-    result_id = str(result_id or "").strip()
-    if not result_id:
-        return
-    try:
-        from forven.vectordb import get_collection
-        get_collection("backtest_results").delete(ids=[result_id])
-    except Exception:
-        pass
 
 
 def _coerce_float(value, default: float | None = 0.0) -> float | None:
@@ -5210,56 +5279,15 @@ def _coalesce_ws_messages(messages: list[dict]) -> dict | None:
 
 
 def _chroma_backtest_records():
-    """Return all backtest result records from Chroma in a deterministic order.
+    """Legacy secondary backtest-result source — permanently empty.
 
-    Runs ChromaDB in a subprocess to isolate segfaults on Windows (ONNX
-    runtime crashes).  Falls back to an empty list on any failure.
+    The ChromaDB vector layer was removed 2026-07-02 (it had been disabled in
+    production for months and held no records). SQLite backtest_results rows +
+    artifacts are the canonical store; callers that still merge this source get
+    an empty list. Kept as a stub so the merge sites need no rewrite — safe to
+    inline away whenever those paths are next touched.
     """
-    # Check availability in the main process first.  If ChromaDB embeddings
-    # are broken (common on Windows/ONNX), skip the subprocess entirely to
-    # avoid spawning nested health-check subprocesses that deadlock under
-    # file lock contention.
-    from forven.vectordb import _check_chroma_available
-    if not _check_chroma_available():
-        return []
-
-    import subprocess
-    import sys
-
-    script = (
-        "import json\n"
-        "from forven.vectordb import get_collection\n"
-        "col = get_collection('backtest_results')\n"
-        "if col is None or col.count() == 0:\n"
-        "    print(json.dumps([]))\n"
-        "else:\n"
-        "    records = col.get(include=['metadatas'], limit=col.count())\n"
-        "    ids = records.get('ids', [])\n"
-        "    metas = records.get('metadatas') or []\n"
-        "    rows = []\n"
-        "    for i, rid in enumerate(ids):\n"
-        "        rows.append({'id': rid, 'metadata': metas[i] if i < len(metas) else {}})\n"
-        "    print(json.dumps(rows))\n"
-    )
-    try:
-        proc = subprocess.run(
-            [sys.executable, "-c", script],
-            capture_output=True, text=True, timeout=60,
-        )
-        if proc.returncode != 0:
-            log.warning(
-                "ChromaDB read subprocess failed (exit %d): %s",
-                proc.returncode, (proc.stderr or "")[:200],
-            )
-            return []
-        rows = json.loads(proc.stdout)
-        if isinstance(rows, list):
-            rows.sort(key=_record_backtest_sort_time, reverse=True)
-            return rows
-        return []
-    except Exception as exc:
-        log.warning("Could not read local backtest_results collection: %s", exc)
-        return []
+    return []
 
 
 def _resolve_backtest_results_remote_api() -> str | None:
@@ -5615,7 +5643,7 @@ def _normalize_backtest_summary(record: dict) -> dict:
     backtest_months = _meta_float("backtest_months")
     derived_backtest_months = None
 
-    # Filter -999.0 sentinel values (written by vectordb for absent metrics).
+    # Filter -999.0 sentinel values (legacy rows used them for absent metrics).
     if monthly_return is not None and monthly_return == -999.0:
         monthly_return = None
     if annualized_return is not None and annualized_return == -999.0:
@@ -6029,8 +6057,10 @@ def _persist_backtest_result_row(
     if not normalized_strategy_id:
         raise ValueError("strategy_id is required")
 
+    from forven.engine_provenance import stamp_engine_version
+
     metrics_json = json.dumps(metrics or {}, separators=(",", ":"), default=str)
-    config_json = json.dumps(config or {}, separators=(",", ":"), default=str)
+    config_json = json.dumps(stamp_engine_version(config), separators=(",", ":"), default=str)
     created_value = str(created_at or _now()).strip() or _now()
     start_value = str(start_date or "").strip() or None
     end_value = str(end_date or "").strip() or None
@@ -6100,8 +6130,10 @@ def _persist_backtest_result_row(
 
 def _update_optimization_result_row(*, result_id: str, metrics: dict, config: dict) -> None:
     """Update an existing backtest_results row with final optimization data."""
+    from forven.engine_provenance import stamp_engine_version
+
     metrics_json = json.dumps(metrics or {}, separators=(",", ":"), default=str)
-    config_json = json.dumps(config or {}, separators=(",", ":"), default=str)
+    config_json = json.dumps(stamp_engine_version(config), separators=(",", ":"), default=str)
     with get_db() as conn:
         conn.execute(
             "UPDATE backtest_results SET metrics_json = ?, config_json = ? WHERE result_id = ?",
@@ -6173,7 +6205,7 @@ async def post_brain_chat_direct(body: BrainChatBody):
     )
     from forven.agents.tool_definitions import CHAT_ASK_TOOL_NAMES
     from forven.brain import resolve_brain_provider_model
-    from forven.context import build_chat_context, store_conversation
+    from forven.context import build_chat_context
 
     provider, model = resolve_brain_provider_model(
         str(body.provider or "").strip() or None,
@@ -6255,15 +6287,6 @@ async def post_brain_chat_direct(body: BrainChatBody):
         response_text = str(result[0])
     else:
         response_text = str(result)
-
-    # Persist the exchange for long-term recall — best-effort, never blocks the
-    # response (store_conversation is itself fire-and-forget, but guard anyway).
-    try:
-        await store_conversation(
-            None, message, response_text, source="ui_chat"
-        )
-    except Exception:
-        log.debug("UI chat conversation store skipped", exc_info=True)
 
     return {"ok": True, "response": response_text, "mode": "direct"}
 
@@ -7253,39 +7276,12 @@ def _normalize_history_metrics(raw_metrics: object) -> dict:
     return normalized
 
 
-def _best_backtest_rank_key(metrics: dict, created_at: str) -> tuple[float, float, float, float, int, float]:
-    sharpe = _coerce_optional_float(metrics.get("sharpe_ratio"))
-    if sharpe is None:
-        sharpe = _coerce_optional_float(metrics.get("sharpe"))
-    total_return = _normalize_ratio_metric(
-        metrics.get("total_return_pct")
-        if metrics.get("total_return_pct") is not None
-        else metrics.get("total_return")
-    )
-    max_drawdown = _normalize_drawdown_metric(
-        metrics.get("max_drawdown_pct")
-        if metrics.get("max_drawdown_pct") is not None
-        else metrics.get("max_drawdown")
-    )
-    win_rate = _normalize_win_rate_metric(
-        metrics.get("win_rate")
-        if metrics.get("win_rate") is not None
-        else metrics.get("winRate")
-    )
-    total_trades = _coerce_optional_float(
-        metrics.get("total_trades")
-        if metrics.get("total_trades") is not None
-        else metrics.get("trades")
-    )
-    created_ts = _parse_timestamp(created_at)
-    return (
-        float(sharpe if sharpe is not None else float("-inf")),
-        float(total_return if total_return is not None else float("-inf")),
-        float(-(max_drawdown if max_drawdown is not None else float("inf"))),
-        float(win_rate if win_rate is not None else float("-inf")),
-        int(total_trades or 0),
-        float(created_ts.timestamp()) if created_ts else 0.0,
-    )
+def _best_backtest_rank_key(metrics: dict, created_at: str) -> tuple[int, float, float, float, float, int, float]:
+    # Single source of truth (incl. the degenerate-slice trade floor) lives in
+    # strategy_lifecycle; this module's enrichment is a legacy duplicate.
+    from forven.strategy_lifecycle import _best_backtest_rank_key as _lifecycle_rank_key
+
+    return _lifecycle_rank_key(metrics, created_at)
 
 
 def _enrich_strategy_rows_with_best_backtest(rows: list[dict]) -> list[dict]:
@@ -7297,6 +7293,17 @@ def _enrich_strategy_rows_with_best_backtest(rows: list[dict]) -> list[dict]:
     if not strategy_ids:
         return rows
 
+    from forven.strategy_lifecycle import _symbol_base_asset
+
+    market_by_strategy: dict[str, tuple[str, str]] = {
+        sid: (
+            _symbol_base_asset(row.get("symbol")),
+            str(row.get("timeframe") or "").strip().lower(),
+        )
+        for row in rows
+        if (sid := str(row.get("id") or "").strip())
+    }
+
     best_by_strategy: dict[str, dict] = {}
     with get_db() as conn:
         chunk_size = 500
@@ -7304,7 +7311,7 @@ def _enrich_strategy_rows_with_best_backtest(rows: list[dict]) -> list[dict]:
             chunk = strategy_ids[index:index + chunk_size]
             placeholders = ",".join(["?"] * len(chunk))
             sql = (
-                "SELECT strategy_id, result_id, metrics_json, created_at "
+                "SELECT strategy_id, result_id, symbol, timeframe, config_json, metrics_json, created_at "
                 "FROM backtest_results "
                 f"WHERE strategy_id IN ({placeholders}) "
                 "AND LOWER(TRIM(COALESCE(result_type, ''))) = 'backtest' "
@@ -7317,6 +7324,24 @@ def _enrich_strategy_rows_with_best_backtest(rows: list[dict]) -> list[dict]:
                     continue
                 metrics = _normalize_best_backtest_metrics(result_row["metrics_json"])
                 if not metrics:
+                    continue
+                # Scope "best" to the strategy's own market (see strategy_lifecycle —
+                # a cross-asset/timeframe screen run must not define the card).
+                from forven.strategy_lifecycle import (
+                    _extract_symbol_timeframe_from_config,
+                    _result_matches_strategy_market,
+                )
+
+                result_symbol = str(result_row["symbol"] or "").strip()
+                result_timeframe = str(result_row["timeframe"] or "").strip()
+                if not result_symbol or not result_timeframe:
+                    cfg_symbol, cfg_timeframe = _extract_symbol_timeframe_from_config(result_row["config_json"])
+                    result_symbol = result_symbol or (cfg_symbol or "")
+                    result_timeframe = result_timeframe or (cfg_timeframe or "")
+                strategy_market = market_by_strategy.get(sid, ("", ""))
+                if not _result_matches_strategy_market(
+                    strategy_market[0], strategy_market[1], result_symbol, result_timeframe
+                ):
                     continue
                 created_at = str(result_row["created_at"] or "")
                 rank_key = _best_backtest_rank_key(metrics, created_at)
@@ -8103,11 +8128,7 @@ def get_backtest_results(
 
 
 def update_backtest_result_params(result_id: str, new_params: dict) -> dict:
-    """Update the parameters in an existing backtest result's config_json.
-
-    Updates SQLite first (reliable), then best-effort ChromaDB update.
-    """
-    # Update SQLite first (reliable)
+    """Update the parameters in an existing backtest result's config_json."""
     try:
         with get_db() as conn:
             row = conn.execute(
@@ -8123,23 +8144,6 @@ def update_backtest_result_params(result_id: str, new_params: dict) -> dict:
                 )
     except Exception:
         pass
-
-    # Best-effort ChromaDB update
-    try:
-        from forven.vectordb import get_collection
-        collection = get_collection("backtest_results")
-        if collection is not None:
-            existing = collection.get(ids=[result_id], include=["metadatas", "documents"])
-            if existing["ids"]:
-                meta = existing["metadatas"][0]
-                config = json.loads(meta.get("config_json", "{}"))
-                config["params"] = new_params
-                meta["config_json"] = json.dumps(config, separators=(",", ":"))
-                if isinstance(new_params, dict):
-                    meta["params"] = json.dumps(new_params, separators=(",", ":"))
-                collection.upsert(ids=[result_id], documents=existing["documents"], metadatas=[meta])
-    except Exception:
-        pass  # ChromaDB update is best-effort
 
     return {"ok": True, "result_id": result_id, "updated_params": new_params}
 
@@ -8548,7 +8552,6 @@ def permanent_delete_backtest_result(result_id: str):
     with get_db() as conn:
         conn.execute("DELETE FROM backtest_result_trash WHERE result_id = ?", (result_id,))
         _set_backtest_result_trash(conn, result_id, deleted=False)
-        _delete_backtest_record(result_id)
     return {"status": "ok", "id": result_id}
 
 
@@ -9820,6 +9823,7 @@ def _persist_completed_backtest_run(
     leverage: float | None = None,
     lifecycle_id: str | None = None,
     session_id: str | None = None,
+    as_of: str | None = None,
 ) -> dict[str, object]:
     metrics = run.get("metrics")
     if not isinstance(metrics, dict):
@@ -9899,6 +9903,16 @@ def _persist_completed_backtest_run(
         "job_id": job_id,
         "dropzone_session_id": (str(session_id).strip() or None) if session_id else None,
     }
+    # Verdict auditability (edge-data-expansion Run 2): record the identity of
+    # the data this result was scored on (checksum/rows/span/market/as_of).
+    # Drift — rebuilds, venue changes, restatements — becomes DETECTABLE by
+    # comparing fingerprints instead of remembered by operators.
+    try:
+        from forven.dataeng.quality_gate import dataset_fingerprint
+
+        config_payload["data_fingerprint"] = dataset_fingerprint(asset, timeframe, as_of=as_of)
+    except Exception:
+        pass
     compact_config = {k: v for k, v in config_payload.items() if v is not None}
     lifecycle_tag = str(lifecycle_id).strip() if lifecycle_id else strategy_id
 
@@ -9928,23 +9942,23 @@ def _persist_completed_backtest_run(
         created_at=now_iso,
     )
 
-    try:
-        from forven.vectordb import store_backtest_result
+    if compact_config.get("dropzone_session_id"):
+        from forven.ai_dropzone_sessions import touch_session
 
-        store_backtest_result(
+        touch_session(compact_config["dropzone_session_id"])
+
+    try:
+        from forven.quant_skills_extractor import record_backtest_for_learning
+
+        record_backtest_for_learning(
             strategy_id=strategy_id,
             asset=asset,
             strategy_type=str(strategy_type),
             params=params if isinstance(params, dict) else {},
             metrics=metrics_for_storage,
             fitness=float(sharpe),
-            result_id=result_id,
-            job_id=job_id,
             strategy_name=strategy_name,
-            lifecycle_strategy_id=lifecycle_tag,
             config=compact_config,
-            definition_json=definition_json if isinstance(definition_json, dict) else None,
-            result_type="backtest",
         )
     except Exception:
         pass
@@ -10746,6 +10760,7 @@ def post_backtest_submit(body: BacktestSubmitBody, *, skip_auto_trash: bool = Fa
             slippage_bps=body.slippage_bps,
             initial_capital=body.initial_capital,
             execution_controls=manual_execution_controls or None,
+            as_of=(str(body.as_of).strip() or None) if body.as_of else None,
         )
     except HTTPException:
         raise
@@ -10829,7 +10844,16 @@ def post_backtest_submit(body: BacktestSubmitBody, *, skip_auto_trash: bool = Fa
         "leverage": leverage_value,
         "job_id": job_id,
         "preserve_result": bool(body.preserve_result),
+        "as_of": (str(body.as_of).strip() or None) if body.as_of else None,
     }
+    # Verdict auditability (edge-data-expansion Run 2): stamp the identity of
+    # the data this result was scored on so drift is detectable, not remembered.
+    try:
+        from forven.dataeng.quality_gate import dataset_fingerprint
+
+        config_payload["data_fingerprint"] = dataset_fingerprint(asset, timeframe, as_of=body.as_of)
+    except Exception:
+        pass
     compact_config = {k: v for k, v in config_payload.items() if v is not None}
     # Flag when this backtest's execution profile can't be reproduced live, so the
     # operator sees it on submit AND on every history row (persisted in config).
@@ -10870,26 +10894,26 @@ def post_backtest_submit(body: BacktestSubmitBody, *, skip_auto_trash: bool = Fa
         created_at=now_iso,
     )
 
-    try:
-        from forven.vectordb import store_backtest_result
+    if compact_config.get("dropzone_session_id"):
+        from forven.ai_dropzone_sessions import touch_session
 
-        store_backtest_result(
+        touch_session(compact_config["dropzone_session_id"])
+
+    try:
+        from forven.quant_skills_extractor import record_backtest_for_learning
+
+        record_backtest_for_learning(
             strategy_id=strategy_id,
             asset=asset,
             strategy_type=str(strategy_type),
             params=merged_params,
             metrics=metrics_for_storage,
             fitness=float(sharpe),
-            result_id=result_id,
-            job_id=job_id,
             strategy_name=strategy_name,
-            lifecycle_strategy_id=lifecycle_tag,
             config=compact_config,
-            definition_json=body.definition_json if isinstance(body.definition_json, dict) else None,
-            result_type="backtest",
         )
     except Exception:
-        pass  # ChromaDB store is best-effort; SQLite row already persisted
+        pass  # learning loop is best-effort; SQLite row already persisted
     _write_backtest_result_artifacts(
         result_id, job_id, run.get("trades"),
         equity_curve=run.get("equity_curve"),
@@ -11233,22 +11257,17 @@ def post_optimization_submit(body: OptimizationSubmitBody):
             )
 
             try:
-                from forven.vectordb import store_backtest_result
+                from forven.quant_skills_extractor import record_backtest_for_learning
 
-                store_backtest_result(
+                record_backtest_for_learning(
                     strategy_id=strategy_id,
                     asset=asset,
                     strategy_type=str(strategy_type),
                     params=best_params if isinstance(best_params, dict) else {},
                     metrics=metrics_for_storage,
                     fitness=float(best_fitness),
-                    result_id=result_id,
-                    job_id=job_id,
                     strategy_name=strategy_name,
-                    lifecycle_strategy_id=opt_lifecycle_tag,
                     config=compact_config,
-                    definition_json=definition_json,
-                    result_type="optimization",
                 )
             except Exception:
                 pass
@@ -11707,6 +11726,7 @@ def post_backtesting_run(body: dict):
                             leverage=_bt_leverage,
                             lifecycle_id=body.get("lifecycle_id"),
                             session_id=body.get("session_id"),
+                            as_of=body.get("as_of"),
                         )
                         result.setdefault("job_id", str(persisted.get("job_id") or ""))
                         result.setdefault("result_id", str(persisted.get("result_id") or ""))

@@ -53,8 +53,6 @@ function buildFallbackNavIndicators(heartbeat: SystemHeartbeatResponse): Record<
 		'/risk': emptyIndicator(),
 		'/trading': emptyIndicator(),
 		'/agents': emptyIndicator(),
-		'/memory': emptyIndicator(),
-		'/tasks': emptyIndicator(),
 		'/approval': emptyIndicator(),
 		'/settings': emptyIndicator(),
 	};
@@ -62,7 +60,6 @@ function buildFallbackNavIndicators(heartbeat: SystemHeartbeatResponse): Record<
 	const tasks = Array.isArray(heartbeat.agent_tasks)
 		? heartbeat.agent_tasks.filter((item): item is Record<string, unknown> => Boolean(item && typeof item === 'object'))
 		: [];
-	const blockedTasks = tasks.filter((task) => ['blocked', 'rejected'].includes(normalizeStatus(task.status)));
 	const failedAgentTasks = tasks.filter(
 		(task) => normalizeStatus(task.source) === 'agent_tasks' && normalizeStatus(task.status) === 'failed',
 	);
@@ -105,29 +102,6 @@ function buildFallbackNavIndicators(heartbeat: SystemHeartbeatResponse): Record<
 			runningAgents.length,
 			seenKey('agents-running', runningAgents.slice(0, 8)),
 		);
-	}
-
-	if (blockedTasks.length > 0) {
-		routes['/tasks'] = indicator(
-			'count',
-			'warn',
-			String(blockedTasks.length),
-			pluralize(blockedTasks.length, 'blocked task'),
-			blockedTasks.length,
-			seenKey('tasks-blocked', blockedTasks.map((task) => task.id).slice(0, 8)),
-		);
-	} else {
-		const pendingTasks = tasks.filter((task) => normalizeStatus(task.status) === 'pending');
-		if (pendingTasks.length > 0) {
-			routes['/tasks'] = indicator(
-				'count',
-				'info',
-				String(pendingTasks.length),
-				pluralize(pendingTasks.length, 'pending task'),
-				pendingTasks.length,
-				seenKey('tasks-pending', pendingTasks.map((task) => task.id).slice(0, 8)),
-			);
-		}
 	}
 
 	const approvals = Array.isArray(heartbeat.approvals) ? heartbeat.approvals : [];
@@ -243,4 +217,10 @@ export function startHeartbeat(): void {
 export function stopHeartbeat(): void {
 	controller?.stop();
 	controller = null;
+}
+
+/** Debounced immediate refresh — call after actions that change badge counts
+ *  (e.g. acknowledging notifications) so the sidebar reflects it right away. */
+export function triggerHeartbeat(): void {
+	controller?.trigger();
 }

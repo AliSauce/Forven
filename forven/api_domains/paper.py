@@ -520,10 +520,11 @@ def _resolve_real_account_snapshot(daemon_state: dict) -> dict:
     exchange round-trip from this (hot, list) endpoint — important because a
     synchronous exchange call here would risk starving the single-worker WebSocket.
 
-    ``source`` distinguishes a genuine read ('exchange' master / 'books_aggregate')
-    from the credentials-missing paper fallback ('paper'): only the former is a real
-    balance, so a paper/missing snapshot must surface as unavailable rather than
-    silently re-introducing the fabricated $10k base.
+    ``source`` distinguishes a genuine read ('exchange' master, 'books_only'
+    books-sum, or 'books_aggregate' master+books) from the credentials-missing
+    paper fallback ('paper'): only the former are real balances, so a
+    paper/missing snapshot must surface as unavailable rather than silently
+    re-introducing the fabricated $10k base.
     """
     exch = daemon_state.get("exchange_account") if isinstance(daemon_state, dict) else None
     exch = exch if isinstance(exch, dict) else {}
@@ -534,7 +535,7 @@ def _resolve_real_account_snapshot(daemon_state: dict) -> dict:
     available = bool(
         account_value is not None
         and account_value > 0
-        and source in {"exchange", "books_aggregate"}
+        and source in {"exchange", "books_only", "books_aggregate"}
     )
     return {
         "available": available,

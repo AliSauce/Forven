@@ -42,6 +42,10 @@ def test_quick_screen_runtime_error_blocks_without_rejecting_strategy(forven_db,
         raise RuntimeError("backtest engine unavailable")
 
     monkeypatch.setattr("forven.gauntlet.tasks._submit_backtest", _raise_runtime)
+    # The data-quality gate fail-closes on the empty test lake (blocked_data) BEFORE
+    # _submit_backtest runs — neutralize it so this test exercises the runtime-error
+    # classification it was written for; the gate has its own coverage.
+    monkeypatch.setattr("forven.gauntlet.tasks._data_quality_block", lambda *a, **k: None)
 
     result = resume_workflow(created["gauntlet_workflow_id"], max_steps=1)
     status = get_strategy_gauntlet_status(created["id"])
@@ -120,6 +124,9 @@ def test_quick_screen_pass_advances_to_gate(forven_db, monkeypatch):
         }
 
     monkeypatch.setattr("forven.gauntlet.tasks._submit_backtest", _fake_submit)
+    # The data-quality gate fail-closes on the empty test lake (blocked_data) —
+    # neutralize it like _submit_backtest; the gate has its own coverage.
+    monkeypatch.setattr("forven.gauntlet.tasks._data_quality_block", lambda *a, **k: None)
 
     # v3 order: quick_screen -> timeframe_sweep -> quick_screen_gate. Run all three so
     # the gate (best-of-N over the persisted backtest) admits the strategy to gauntlet.

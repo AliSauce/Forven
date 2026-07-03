@@ -97,7 +97,7 @@ def test_agent_run_backtest_persists_result_and_syncs_strategy(forven_db, monkey
         }
 
     monkeypatch.setattr("forven.strategies.backtest.backtest_strategy", _fake_backtest_strategy)
-    monkeypatch.setattr("forven.vectordb.store_backtest_result", lambda **_kwargs: None)
+    monkeypatch.setattr("forven.quant_skills_extractor.record_backtest_for_learning", lambda **_kwargs: None)
 
     token = _current_strategy_id_var.set("s-agent-backtest")
     try:

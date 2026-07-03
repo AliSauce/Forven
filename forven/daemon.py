@@ -147,6 +147,12 @@ CANDLE_CACHE_BARS = 360
 # the shared account breaker since _run_tick is not itself interval-gated).
 LIQ_CHECK_INTERVAL_SECONDS = 60
 _LAST_LIQ_CHECK = [0.0]
+# Resting-order mark watcher: minimum seconds between armed stop/TP checks (WS
+# ticks can arrive many times per second; level checks don't need sub-second
+# granularity) and the bounded time for a check + any resulting DB closes.
+MARK_WATCH_MIN_INTERVAL_SECONDS = 1.0
+MARK_WATCH_TIMEOUT_SECONDS = 15.0
+_LAST_MARK_WATCH = [0.0]
 # KS-1: while the kill-switch is persisted-active, re-flatten any residual
 # position on this cadence (a missed/partial/failed first flatten, a restart
 # between state-persist and flatten, or a close timeout) instead of relying on
@@ -179,7 +185,26 @@ def _env_float(name: str, default: float, minimum: float = 0.1) -> float:
 PRICE_SNAPSHOT_TIMEOUT_SECONDS = _env_float("FORVEN_DAEMON_PRICE_SNAPSHOT_TIMEOUT_SECONDS", 6)
 RISK_ACCOUNT_TIMEOUT_SECONDS = _env_float("FORVEN_DAEMON_ACCOUNT_TIMEOUT_SECONDS", 10)
 RISK_UPDATE_TIMEOUT_SECONDS = _env_float("FORVEN_DAEMON_RISK_UPDATE_TIMEOUT_SECONDS", 8)
+# PER-ACCOUNT reconcile budget. reconcile_all_books runs one sequential pass per
+# wallet (master + direction books + named wallets + any open-trade-routed
+# account), each making several exchange round-trips — a fixed total budget
+# sized for one wallet started "timing out" the moment the operator registered
+# a second account, and 15 minutes of those false timeouts tripped the
+# sustained-outage operator halt against a perfectly healthy exchange. See
+# _reconcile_timeout_seconds for the account-count scaling.
 RISK_RECONCILE_TIMEOUT_SECONDS = _env_float("FORVEN_DAEMON_RECONCILE_TIMEOUT_SECONDS", 20)
+
+
+def _reconcile_timeout_seconds() -> float:
+    """Total reconcile budget = per-account budget × (accounts + 1 headroom)."""
+    accounts = 1
+    try:
+        from forven.exchange import books
+
+        accounts = max(1, len(books.active_book_addresses()))
+    except Exception:
+        accounts = 1
+    return RISK_RECONCILE_TIMEOUT_SECONDS * (accounts + 1)
 # CR-2: a single transient reconcile error/timeout (testnet REST blip) must not
 # freeze ALL new entries + flag 'requires operator'. Only escalate to a hard
 # block after this many CONSECUTIVE errors; real discrepancies still block at once.
@@ -443,6 +468,8 @@ def _normalize_exchange_account_snapshot(
         ),
         "source": str(account_snapshot.get("source") or "exchange"),
         "network": _network_label(testnet),
+        # BOOK-BUDGET-1: per-wallet equity breakdown ({label: usd}), when known.
+        "books": dict(account_snapshot.get("books") or {}) if isinstance(account_snapshot.get("books"), dict) else {},
         "synced_at": synced,
     }
     return snapshot
@@ -1126,14 +1153,30 @@ def _update_recovery_state_from_reconcile(state: dict, recon: dict | None, *, so
     )
 
 
+def _equity_includes_master() -> bool:
+    """Whether the master wallet counts toward the live equity basis (EQ-BASIS-1).
+
+    Default False: with books enabled, only the direction sub-accounts hold
+    at-risk capital."""
+    try:
+        settings = kv_get("forven:settings", {}) or {}
+        if isinstance(settings, dict):
+            return bool(settings.get("live_equity_include_master", False))
+    except Exception:
+        pass
+    return False
+
+
 def _book_aware_account_value(testnet: bool = True) -> dict | None:
     """Account value for the GLOBAL risk cycle, aggregated across direction books.
 
     With books disabled this is just the master wallet (unchanged). With books
     enabled, capital is split across funded sub-accounts, so the drawdown /
-    daily-loss kill-switch must sum accountValue + margin across the master AND
-    every book sub-account — otherwise a loss bleeding a sub-account would never
-    trip the global switch (the master wallet alone would look healthy).
+    daily-loss kill-switch sums accountValue + margin across every book
+    sub-account — otherwise a loss bleeding a sub-account would never trip the
+    global switch. The master wallet is EXCLUDED by default (EQ-BASIS-1: trades
+    can only touch the books, so master reserve funds are not at-risk capital);
+    live_equity_include_master opts it back in.
 
     ROBUST to transient reads: a single sub-account whose accountValue read
     momentarily returns 0 / fails (a degraded read, or funds mid-transfer) must
@@ -1171,14 +1214,26 @@ def _book_aware_account_value(testnet: bool = True) -> dict | None:
         _LAST_BOOKS_ENABLED = True
         _BOOKS_DISABLED_STREAK = 0
 
-        addresses: list[str | None] = []
+        # EQ-BASIS-1: with books enabled, live orders route ONLY to the direction
+        # sub-accounts — the master wallet is reserve capital no trade can touch.
+        # Counting it inflates every equity-denominated risk number (portfolio
+        # budget, hard caps, drawdown/daily-loss base): a testnet master holding
+        # ~$36k of mock funds swamped ~$600 of real trading capital in the books.
+        # Default to books-only; live_equity_include_master opts the master back
+        # in. The source label changes with the composition ("books_only" vs
+        # "books_aggregate") so the risk engine's basis-change re-baseline
+        # re-anchors the HWM / daily start instead of comparing across bases.
+        include_master = _equity_includes_master()
+        wallet_entries = ([("master", None)] if include_master else []) + list(books.active_book_addresses())
+        wallets: list[tuple[str, str | None]] = []
         seen: set[str] = set()
-        for _label, addr in [(None, None)] + list(books.active_book_addresses()):
+        for label, addr in wallet_entries:
             key = (str(addr).strip().lower() if addr else "")
             if key in seen:
                 continue
             seen.add(key)
-            addresses.append(addr)
+            wallets.append((str(label or "master").strip().lower(), addr))
+        source_label = "books_aggregate" if include_master else "books_only"
 
         total_val = total_margin = total_ntl = 0.0
         unreliable = False
@@ -1191,13 +1246,26 @@ def _book_aware_account_value(testnet: bool = True) -> dict | None:
         substituted = False
         read_failed = False
         breakdown: list[str] = []
-        for addr in addresses:
+        # BOOK-BUDGET-1: per-wallet balances ride the snapshot (label -> equity)
+        # so the per-book budget gate and the risk page can see each wallet's
+        # capacity without extra exchange round-trips.
+        books_equity: dict[str, float] = {}
+        for label, addr in wallets:
             key = (str(addr).strip().lower() if addr else "__master__")
             kwargs = {"account_address": addr} if addr else {}
             raised = False
             err_reason = ""
             try:
-                acc = get_account_value(testnet=testnet, **kwargs)
+                # EQ-BASIS-4: require a REAL exchange read for every wallet slot.
+                # Without this, a transient client/breaker failure while the
+                # execution mode is "paper" returns the daemon's OWN bookkeeping
+                # (get_account_value's paper fallback: daily.current_equity →
+                # daemon.account_equity) as if it were this wallet's balance — a
+                # self-referential feedback loop that grew the aggregate by one
+                # books-worth per tick (55 x $665.79 = the $36.6k phantom equity)
+                # and can compound without bound. A failed read must RAISE and
+                # ride the last-known-good / unreliable paths below instead.
+                acc = get_account_value(testnet=testnet, require_connection=True, **kwargs)
                 val = float(acc.get("accountValue", 0) or 0) if isinstance(acc, dict) else 0.0
             except Exception as exc:
                 acc, val, raised = None, 0.0, True
@@ -1205,6 +1273,7 @@ def _book_aware_account_value(testnet: bool = True) -> dict | None:
             if val > 0:
                 _BOOK_EQUITY_CACHE[key] = val  # last-known-good
                 total_val += val
+                books_equity[label] = round(val, 2)
                 breakdown.append(f"{key}=${val:,.2f}(live)")
                 if isinstance(acc, dict):
                     total_margin += float(acc.get("totalMarginUsed", 0) or 0)
@@ -1217,6 +1286,7 @@ def _book_aware_account_value(testnet: bool = True) -> dict | None:
                     # Had funds before, now reads 0/failed => transient glitch.
                     # Substitute last-known-good so it can't fake a drawdown.
                     total_val += cached
+                    books_equity[label] = round(float(cached), 2)
                     substituted = True
                     breakdown.append(f"{key}=${cached:,.2f}(CACHED)")
                     log.warning(
@@ -1242,15 +1312,16 @@ def _book_aware_account_value(testnet: bool = True) -> dict | None:
             return None
         if substituted or read_failed:
             log.warning(
-                "book-aware equity used DEGRADED reads: total=$%.2f source=books_aggregate [%s]",
-                total_val, ", ".join(breakdown),
+                "book-aware equity used DEGRADED reads: total=$%.2f source=%s [%s]",
+                total_val, source_label, ", ".join(breakdown),
             )
         return {
             "accountValue": total_val,
             "totalMarginUsed": total_margin,
             "totalNtlPos": total_ntl,
             "totalRawUsd": total_val,
-            "source": "books_aggregate",
+            "source": source_label,
+            "books": books_equity,
         }
     except Exception:
         # Hard failure: skip rather than fall back to a master-only value that
@@ -1402,6 +1473,17 @@ async def _run_risk_cycle() -> dict:
             return snapshot
 
         snapshot["risk_check"] = dict(risk_check or {})
+        # EQ-BASIS-2: a sample the risk validator REJECTED (implausible ceiling,
+        # >100x jump) must not leak into the daemon_state mirrors — account_equity
+        # and exchange_account feed the portfolio-budget denominator and the
+        # dashboard directly, bypassing the validator. Keep the last good mirrors.
+        if risk_check.get("rejected"):
+            log.warning(
+                "risk cycle: equity sample $%.2f REJECTED (%s) — not persisting to daemon_state",
+                equity, risk_check.get("reject_reason"),
+            )
+            snapshot["equity"] = None
+            snapshot["account"] = None
         # KS-1: drive the flatten off the PERSISTED kill_switch flag, not only the
         # one-shot transition action. The first trip flattens immediately; while
         # the switch stays active, re-sweep on a throttled cadence so a residual
@@ -1493,6 +1575,15 @@ async def _run_risk_cycle() -> dict:
     return snapshot
 
 
+def _run_mark_watcher(prices: dict[str, float]) -> list[str]:
+    """Thread-side mark-watcher pass. Lazy import: forven.mark_watcher pulls the
+    scanner module (heavy) — pay that once on the first armed check, not at
+    daemon startup."""
+    from forven.mark_watcher import check_mark_exits
+
+    return check_mark_exits(prices)
+
+
 async def _run_tick(state: dict, prices: dict[str, float], source: str, last_reconcile: list[float]) -> None:
     """One daemon tick: publish prices FIRST (fresh), then enforce risk, reconcile periodically."""
     now = time.time()
@@ -1515,6 +1606,26 @@ async def _run_tick(state: dict, prices: dict[str, float], source: str, last_rec
     state["last_prices"] = dict(snapshot.get("prices") or prices)
     state["last_price_source"] = source
     state["last_tick_ts"] = now
+
+    # Resting-order mark watcher: fill paper stop/TP the moment the level trades,
+    # like a real exchange trigger order (the scanner's closed-bar monitors are the
+    # catch-up backstop). Runs BEFORE the slow risk cycle so a touched level fills
+    # within ~a tick of the touch, interval-gated to ~1s.
+    if now - _LAST_MARK_WATCH[0] >= MARK_WATCH_MIN_INTERVAL_SECONDS:
+        _LAST_MARK_WATCH[0] = now
+        try:
+            mark_actions = await _to_thread_with_timeout(
+                "daemon.mark_watcher",
+                MARK_WATCH_TIMEOUT_SECONDS,
+                _run_mark_watcher,
+                prices,
+            )
+            if mark_actions:
+                log.info("Mark watcher: %s", "; ".join(mark_actions))
+                state["last_mark_watch_actions"] = list(mark_actions)
+                state["last_mark_watch_at"] = _iso_now()
+        except Exception as e:
+            log.warning("Mark watcher tick failed: %s", e)
 
     risk_snapshot = await _run_risk_cycle()
 
@@ -1598,7 +1709,7 @@ async def _run_tick(state: dict, prices: dict[str, float], source: str, last_rec
             else:
                 recon = await _to_thread_with_timeout(
                     "daemon.reconcile_all_books",
-                    RISK_RECONCILE_TIMEOUT_SECONDS,
+                    _reconcile_timeout_seconds(),
                     reconcile_all_books,
                     _get_testnet(),
                 )

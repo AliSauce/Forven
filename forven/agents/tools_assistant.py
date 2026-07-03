@@ -175,6 +175,555 @@ def _tool_get_strategy_detail(strategy_id: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# App guide + navigation — the assistant as the operator's guide to the app.
+# ---------------------------------------------------------------------------
+
+@register_tool(
+    name="get_app_guide",
+    description=(
+        "Look up the built-in Forven app guide. With no topic: the full index "
+        "(every page, all how-to walkthroughs, all concepts). With a topic: the "
+        "matching entry — a how-to slug (e.g. 'promote-to-paper', 'go-live', "
+        "'add-data', 'why-blocked'), a concept (e.g. 'gauntlet', 'gates', "
+        "'kill-switch'), a page route ('/lab'), or a page name ('The Forge'). "
+        "Use this whenever the user asks how to do something in the app or what "
+        "a page/feature is for."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "topic": {
+                "type": "string",
+                "description": "How-to slug, concept slug, page route, page name, or free text. Omit for the index.",
+            },
+        },
+        "required": [],
+    },
+    permissions={"brain", None},
+)
+def _tool_get_app_guide(topic: str = "") -> str:
+    from forven.assistant_guide import lookup_guide, render_guide_index
+
+    q = str(topic or "").strip()
+    return lookup_guide(q) if q else render_guide_index()
+
+
+@register_tool(
+    name="open_app_page",
+    description=(
+        "Navigate the user's browser to a page inside the Forven app (e.g. '/lab', "
+        "'/risk', '/lab/strategy/S00719', '/settings'). Only known in-app routes are "
+        "allowed. Use when the user asks to go somewhere, or when a walkthrough "
+        "starts on another page and they've agreed to head there. Tell the user "
+        "where you took them."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "route": {"type": "string", "description": "In-app route path starting with '/'."},
+        },
+        "required": ["route"],
+    },
+    permissions={"brain", None},
+)
+def _tool_open_app_page(route: str) -> str:
+    from forven.assistant_guide import is_valid_app_route
+
+    r = str(route or "").strip()
+    if not is_valid_app_route(r):
+        return (
+            f"Error: '{r}' is not a known app route. Use get_app_guide for the page map; "
+            "routes must be in-app paths like /lab or /lab/strategy/S00719."
+        )
+    # The actual navigation is performed client-side: the session loop emits a
+    # 'navigate' SSE event when this tool returns ok.
+    return _json.dumps({"ok": True, "route": r, "message": f"Opening {r} for the user."})
+
+
+# ---------------------------------------------------------------------------
+# Read / grounding tools — broad app state (all read-only)
+# ---------------------------------------------------------------------------
+
+@register_tool(
+    name="list_strategies",
+    description=(
+        "List strategies with headline metrics, optionally filtered by stage "
+        "(quick_screen, gauntlet, paper, live_graduated, archived, rejected) and/or "
+        "a search string (matched against id/name/symbol). Use this to answer "
+        "'what's on paper?', 'find my BTC strategies', etc. For one strategy's full "
+        "detail use get_strategy_detail; for why it can/can't advance use get_gate_report."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "stage": {"type": "string", "description": "Optional stage filter."},
+            "search": {"type": "string", "description": "Optional substring match on id/name/symbol."},
+            "limit": {"type": "integer", "description": "Max rows (default 25, max 100)."},
+        },
+        "required": [],
+    },
+    permissions={"brain", None},
+)
+def _tool_list_strategies(stage: str = "", search: str = "", limit: int = 25) -> str:
+    from forven.strategy_lifecycle import read_strategies
+
+    try:
+        cap = max(1, min(int(limit or 25), 100))
+    except (TypeError, ValueError):
+        cap = 25
+    q = str(search or "").strip().lower()
+    rows = read_strategies(status=(str(stage or "").strip() or None), limit=200 if q else cap)
+    out = []
+    for r in rows:
+        if q:
+            hay = " ".join(
+                str(r.get(k) or "") for k in ("id", "display_id", "name", "display_name", "symbol")
+            ).lower()
+            if q not in hay:
+                continue
+        metrics = r.get("metrics") if isinstance(r.get("metrics"), dict) else {}
+        out.append({
+            "id": r.get("id"),
+            "name": r.get("display_name") or r.get("name"),
+            "stage": r.get("stage") or r.get("status"),
+            "type": r.get("runtime_type") or r.get("type"),
+            "symbol": r.get("symbol"),
+            "timeframe": r.get("timeframe"),
+            "sharpe": metrics.get("sharpe_ratio", metrics.get("sharpe")),
+            "profit_factor": metrics.get("profit_factor"),
+            "win_rate": metrics.get("win_rate"),
+            "max_drawdown_pct": metrics.get("max_drawdown_pct"),
+            "total_trades": metrics.get("total_trades"),
+            "updated_at": r.get("updated_at"),
+        })
+        if len(out) >= cap:
+            break
+    return _json.dumps({"count": len(out), "strategies": out}, indent=2, default=str)
+
+
+@register_tool(
+    name="get_gate_report",
+    description=(
+        "Why can/can't a strategy advance: promotion-readiness steps (pass/fail with "
+        "detail), gauntlet test rollup (per-test verdicts, robustness score), and — "
+        "for paper strategies — paper→live readiness. THE tool for 'why is this "
+        "stuck?' / 'what does it still need?'."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "strategy_id": {"type": "string", "description": "Strategy id, e.g. S00719"},
+        },
+        "required": ["strategy_id"],
+    },
+    permissions={"brain", None},
+)
+def _tool_get_gate_report(strategy_id: str) -> str:
+    sid = str(strategy_id or "").strip()
+    if not sid:
+        return "Error: strategy_id is required."
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT id, name, stage, status FROM strategies WHERE id = ?", (sid,)
+        ).fetchone()
+    if not row:
+        return f"No strategy found with id {sid}."
+    stage = row["stage"] or row["status"]
+    out: dict = {"strategy_id": sid, "name": row["name"], "stage": stage}
+
+    from forven.policy import check_promotion_readiness
+
+    try:
+        readiness = check_promotion_readiness(sid)
+        out["promotion_ready"] = readiness.get("ready")
+        out["readiness_steps"] = [
+            {"name": s.get("name"), "status": s.get("status"), "detail": s.get("detail")}
+            for s in (readiness.get("steps") or [])
+        ]
+    except Exception as exc:
+        out["readiness_error"] = str(exc)
+
+    try:
+        from forven.gauntlet.status import get_strategy_gauntlet_status
+
+        g = get_strategy_gauntlet_status(sid)
+        if isinstance(g, dict) and not g.get("error"):
+            tests = g.get("tests") or {}
+            out["gauntlet"] = {
+                "passed_tests": g.get("passed_tests"),
+                "missing_required": g.get("missing_required"),
+                "current_step": g.get("current_step"),
+                "robustness_score": g.get("robustness_score", g.get("score")),
+                "min_robustness": g.get("min_robustness"),
+                "tests": {
+                    k: {"status": v.get("status"), "verdict": v.get("verdict"), "stale": v.get("stale")}
+                    for k, v in tests.items()
+                    if isinstance(v, dict)
+                },
+            }
+    except Exception as exc:
+        out["gauntlet_error"] = str(exc)
+
+    if str(stage or "").lower() == "paper":
+        from forven.policy import check_paper_live_readiness
+
+        try:
+            live = check_paper_live_readiness(sid)
+            out["paper_to_live"] = {
+                "ready": live.get("ready"),
+                "steps": [
+                    {"name": s.get("name"), "status": s.get("status"), "detail": s.get("detail")}
+                    for s in (live.get("steps") or [])
+                ],
+            }
+        except Exception as exc:
+            out["paper_to_live_error"] = str(exc)
+
+    failed = [s["name"] for s in out.get("readiness_steps", []) if s.get("status") == "failed"]
+    out["failed_gates"] = failed
+    return _json.dumps(out, indent=2, default=str)
+
+
+@register_tool(
+    name="get_recent_trades",
+    description=(
+        "Read recent trades and/or open positions from the ledger, optionally "
+        "filtered by strategy id and status (OPEN or CLOSED). Includes paper, live, "
+        "and bot trades with entry/exit prices and PnL."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "status": {"type": "string", "description": "Optional: OPEN or CLOSED."},
+            "strategy_id": {"type": "string", "description": "Optional strategy id filter."},
+            "limit": {"type": "integer", "description": "Max rows (default 20, max 50)."},
+        },
+        "required": [],
+    },
+    permissions={"brain", None},
+)
+def _tool_get_recent_trades(status: str = "", strategy_id: str = "", limit: int = 20) -> str:
+    from forven.db import get_open_trades, get_recent_trades
+
+    try:
+        cap = max(1, min(int(limit or 20), 50))
+    except (TypeError, ValueError):
+        cap = 20
+    want_status = str(status or "").strip().upper()
+    sid = str(strategy_id or "").strip()
+
+    if want_status == "OPEN":
+        rows = get_open_trades() or []
+    else:
+        rows = get_recent_trades(limit=200) or []
+        if want_status:
+            rows = [r for r in rows if str(r.get("status") or "").upper() == want_status]
+    if sid:
+        rows = [
+            r for r in rows
+            if sid in (str(r.get("strategy_id") or ""), str(r.get("strategy") or ""))
+        ]
+
+    out = [
+        {
+            "id": r.get("display_id") or r.get("id"),
+            "strategy": r.get("strategy_name") or r.get("strategy_id") or r.get("strategy"),
+            "asset": r.get("asset") or r.get("symbol"),
+            "direction": r.get("direction"),
+            "status": r.get("status"),
+            "execution_type": r.get("execution_type"),
+            "entry_price": r.get("entry_price"),
+            "exit_price": r.get("exit_price"),
+            "pnl_pct": r.get("pnl_pct"),
+            "pnl_usd": r.get("pnl_usd"),
+            "opened_at": r.get("opened_at"),
+            "closed_at": r.get("closed_at"),
+        }
+        for r in rows[:cap]
+    ]
+    return _json.dumps({"count": len(out), "trades": out}, indent=2, default=str)
+
+
+@register_tool(
+    name="get_settings_overview",
+    description=(
+        "Read the current app settings (risk/pipeline/gate thresholds, execution "
+        "mode, regime gating, data/lab/notification config). Secrets are never "
+        "included. Use to answer 'what is X set to?' before pointing the user at "
+        "the Settings page to change it."
+    ),
+    input_schema={"type": "object", "properties": {}, "required": []},
+    permissions={"brain", None},
+)
+def _tool_get_settings_overview() -> str:
+    from forven.api_core import get_settings
+
+    sensitive = ("key", "token", "secret", "webhook", "password", "private", "wallet", "address")
+    settings = get_settings() or {}
+    out = {}
+    for k, v in settings.items():
+        kl = str(k).lower()
+        # Booleans like hyperliquid_has_key / *_configured are safe and useful.
+        if any(s in kl for s in sensitive) and not isinstance(v, bool):
+            continue
+        out[k] = v
+    blob = _json.dumps(out, indent=2, default=str)
+    if len(blob) > 20000:
+        blob = blob[:20000] + "\n… (truncated)"
+    return blob
+
+
+@register_tool(
+    name="get_ops_overview",
+    description=(
+        "One-shot operational snapshot: system mode, generation pause state, "
+        "kill-switch, pending approvals, scheduler jobs, recent health alerts, and "
+        "notification stats. Use for 'is everything OK?', 'anything waiting on me?', "
+        "and diagnosing why nothing seems to be happening."
+    ),
+    input_schema={"type": "object", "properties": {}, "required": []},
+    permissions={"brain", None},
+)
+def _tool_get_ops_overview() -> str:
+    from forven.db import kv_get
+
+    out: dict = {}
+    try:
+        from forven.control_plane.ops import get_system_mode_status
+
+        mode = get_system_mode_status() or {}
+        out["system"] = {
+            "mode": mode.get("system_mode"),
+            "paused": mode.get("paused"),
+            "generation_paused": mode.get("generation_paused"),
+        }
+    except Exception as exc:
+        out["system_error"] = str(exc)
+
+    try:
+        status = kv_get("status") or {}
+        out["risk"] = {
+            "kill_switch_active": bool(status.get("killSwitch")),
+            "account_equity": status.get("accountEquity"),
+            "daily_pnl": status.get("dailyPnl"),
+        }
+    except Exception as exc:
+        out["risk_error"] = str(exc)
+
+    try:
+        from forven.control_plane.approvals import get_approvals_list
+
+        pending = get_approvals_list(status="pending_approval", limit=10) or []
+        out["approvals"] = {
+            "pending_count": len(pending),
+            "pending": [
+                {
+                    "id": a.get("id"),
+                    "type": a.get("approval_type"),
+                    "target": a.get("target_id"),
+                    "created_at": a.get("created_at"),
+                }
+                for a in pending[:10]
+            ],
+        }
+    except Exception as exc:
+        out["approvals_error"] = str(exc)
+
+    try:
+        from forven.scheduler import get_jobs
+
+        jobs = get_jobs() or []
+        out["scheduler"] = [
+            {
+                "name": j.get("name"),
+                "enabled": j.get("enabled"),
+                "schedule": j.get("schedule_expr"),
+                "next_run_at": j.get("next_run_at"),
+            }
+            for j in jobs[:30]
+        ]
+    except Exception as exc:
+        out["scheduler_error"] = str(exc)
+
+    try:
+        from forven.health_monitor import get_health_monitor
+
+        monitor = get_health_monitor()
+        if monitor is not None:
+            alerts = monitor.state.get_alerts(limit=5) or []
+            out["recent_alerts"] = [a.to_dict() for a in alerts]
+        else:
+            out["recent_alerts"] = []
+    except Exception as exc:
+        out["alerts_error"] = str(exc)
+
+    try:
+        from forven.control_plane.notifications import get_notifications_list
+
+        notif = get_notifications_list(limit=5, actionable=True) or {}
+        out["notifications"] = {
+            "stats": notif.get("stats"),
+            "actionable": [
+                {"title": n.get("title"), "severity": n.get("severity"), "created_at": n.get("created_at")}
+                for n in (notif.get("items") or [])[:5]
+            ],
+        }
+    except Exception as exc:
+        out["notifications_error"] = str(exc)
+
+    return _json.dumps(out, indent=2, default=str)
+
+
+@register_tool(
+    name="list_hypotheses",
+    description=(
+        "List crucibles (trading-idea hypotheses) with status and strategy counts, "
+        "optionally filtered by status or a search string. Use for 'any promising "
+        "ideas?', 'what ideas are under test?'."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "status": {"type": "string", "description": "Optional status filter."},
+            "search": {"type": "string", "description": "Optional search string."},
+            "limit": {"type": "integer", "description": "Max rows (default 20, max 50)."},
+        },
+        "required": [],
+    },
+    permissions={"brain", None},
+)
+def _tool_list_hypotheses(status: str = "", search: str = "", limit: int = 20) -> str:
+    from forven.api_domains.hypotheses import list_hypotheses_page
+
+    try:
+        cap = max(1, min(int(limit or 20), 50))
+    except (TypeError, ValueError):
+        cap = 20
+    page = list_hypotheses_page(
+        status=(str(status or "").strip() or None),
+        search=(str(search or "").strip() or None),
+        limit=cap,
+        offset=0,
+    )
+    rows = page.get("hypotheses") or []
+    out = [
+        {
+            "id": h.get("id"),
+            "display_id": h.get("display_id"),
+            "title": h.get("title"),
+            "status": h.get("status"),
+            "lane": h.get("lane"),
+            "source_type": h.get("source_type"),
+            "strategy_count": h.get("strategy_count"),
+        }
+        for h in rows[:cap]
+    ]
+    return _json.dumps({"total": page.get("total"), "hypotheses": out}, indent=2, default=str)
+
+
+@register_tool(
+    name="list_bots",
+    description=(
+        "List Bot Factory bots: name, model, execution mode (paper/live), runtime "
+        "status, open positions, closed trades, realized PnL."
+    ),
+    input_schema={"type": "object", "properties": {}, "required": []},
+    permissions={"brain", None},
+)
+def _tool_list_bots() -> str:
+    from forven.api_domains.bot_factory import api_list_bots
+
+    bots = api_list_bots() or []
+    out = [
+        {
+            "id": b.get("id"),
+            "name": b.get("name"),
+            "model": b.get("model"),
+            "execution_mode": b.get("execution_mode"),
+            "runtime_status": b.get("runtime_status") or b.get("status"),
+            "open_positions": b.get("open_positions"),
+            "closed_trades": b.get("closed_trades"),
+            "realized_pnl": b.get("realized_pnl"),
+            "live_wallet": b.get("live_wallet"),
+        }
+        for b in bots[:50]
+    ]
+    return _json.dumps({"count": len(out), "bots": out}, indent=2, default=str)
+
+
+@register_tool(
+    name="list_routines",
+    description=(
+        "List scheduled routines (recurring agent jobs that post to Discord): "
+        "name, schedule, delivery channel, enabled state, and the job prompt."
+    ),
+    input_schema={"type": "object", "properties": {}, "required": []},
+    permissions={"brain", None},
+)
+def _tool_list_routines() -> str:
+    from forven.control_plane.routines import list_routines
+
+    routines = list_routines() or []
+    out = [
+        {
+            "id": r.get("id"),
+            "name": r.get("name"),
+            "schedule": r.get("cron_expr"),
+            "channel": r.get("channel"),
+            "enabled": r.get("enabled"),
+            "prompt": str(r.get("prompt") or "")[:160],
+        }
+        for r in routines[:50]
+    ]
+    return _json.dumps({"count": len(out), "routines": out}, indent=2, default=str)
+
+
+@register_tool(
+    name="list_agent_tasks",
+    description=(
+        "List recent agent tasks (research, strategy development, repairs, ...): "
+        "agent, title, status, cost. Optional status filter (e.g. pending, running, "
+        "completed, failed). Use for 'what are the agents doing?'."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "status": {"type": "string", "description": "Optional status filter."},
+            "limit": {"type": "integer", "description": "Max rows (default 20, max 50)."},
+        },
+        "required": [],
+    },
+    permissions={"brain", None},
+)
+def _tool_list_agent_tasks(status: str = "", limit: int = 20) -> str:
+    from forven.api_domains.tasks import get_agent_tasks
+
+    try:
+        cap = max(1, min(int(limit or 20), 50))
+    except (TypeError, ValueError):
+        cap = 20
+    want = str(status or "").strip().lower()
+    rows = get_agent_tasks() or []
+    if want:
+        rows = [r for r in rows if str(r.get("status") or "").lower() == want]
+    out = [
+        {
+            "id": t.get("display_id") or t.get("id"),
+            "agent": t.get("agent_id"),
+            "type": t.get("type"),
+            "title": str(t.get("title") or "")[:120],
+            "status": t.get("status"),
+            "strategy_id": t.get("strategy_id"),
+            "created_at": t.get("created_at"),
+            "cost_usd": t.get("cost_usd"),
+            "error": (str(t.get("error"))[:160] if t.get("error") else None),
+        }
+        for t in rows[:cap]
+    ]
+    return _json.dumps({"count": len(out), "tasks": out}, indent=2, default=str)
+
+
+# ---------------------------------------------------------------------------
 # Action tools (operator-authorized for direct use)
 # ---------------------------------------------------------------------------
 

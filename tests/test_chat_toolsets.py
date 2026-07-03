@@ -79,8 +79,6 @@ def test_ask_set_is_read_only():
         "write_file",
         "run_shell",
         "run_code",
-        "store_memory",
-        "store_chroma",
         "register_strategy",
         # backtesting jobs that spawn work / write results
         "forven_run_backtest",

@@ -84,20 +84,21 @@ _robustness_user_running = 0
 _robustness_lock = threading.Lock()
 _ROBUSTNESS_USER_RESERVED_SLOTS = 2  # always keep 2 slots free for user work
 
-# Hard ceiling for OPT-IN parallel reruns within a single robustness step (e.g.
+# Hard ceiling for parallel reruns within a single robustness step (e.g.
 # parameter jitter's ~30 backtests). The reruns are independent and DB-free and
 # parallelise near-linearly (benchmarked 4.84x at 4 workers, 8.13x at 8) — BUT in
 # production each backtest_strategy call runs in its OWN isolation subprocess
 # (FORVEN_BACKTEST_PROCESS_ISOLATION defaults ON outside pytest), so N concurrent
 # reruns = N child processes, each re-importing forven and holding its own candles.
 #
-# The gauntlet was strictly serial before — exactly ONE backtest subprocess at a
-# time. Fanning out multiplies peak memory by the worker count AND stacks on top of
-# the job-level _ROBUSTNESS_EXECUTOR concurrency, and this host (documented
-# memory-pressure-restart history) hit an OOM-style supervisor restart under the
-# added concurrent-subprocess load. So parallelism is now DEFAULT-OFF (serial) and
-# OPT-IN, hard-capped here even when configured, pending a PROCESS-WIDE subprocess
-# budget that bounds the global total rather than just one step's share.
+# Parallel reruns were originally DEFAULT-OFF because the per-step bounds STACKED
+# (jitter workers x _ROBUSTNESS_EXECUTOR jobs x gauntlet drain) with no global
+# ceiling, and this host (documented memory-pressure-restart history) hit an
+# OOM-style supervisor restart under the added concurrent-subprocess load. That
+# PROCESS-WIDE budget now exists (strategies/concurrency.py): every isolated
+# backtest queues on it, so reruns default ON bounded by that budget. Explicit
+# `robustness_thresholds.param_jitter_workers` still wins (1 = serial), and this
+# per-step ceiling still applies even when configured higher.
 _ROBUSTNESS_RERUN_MAX_WORKERS = 4
 
 # Parameter-jitter sweep sizing. A NON-VECTORIZABLE strategy runs the slow per-bar
@@ -157,18 +158,27 @@ def _estimate_rerun_seconds(strategy_type: object, n_bars: int) -> float:
 def _resolve_robustness_workers(configured: object, *, n_tasks: int) -> int:
     """Thread-pool width for fanning out one robustness step's independent reruns.
 
-    DEFAULT SERIAL (1): with isolation on, every extra worker is another concurrent
-    backtest subprocess, and that added load triggered a memory-pressure restart on
-    this host. Parallelism is opt-in via ``robustness_thresholds.param_jitter_workers``
-    and hard-capped at ``_ROBUSTNESS_RERUN_MAX_WORKERS`` even when configured higher,
-    until a process-wide subprocess budget exists. Never exceeds the task count,
-    never below 1 (1 => the serial fast-path, behaviourally identical to the old loop).
+    Default: min(``_ROBUSTNESS_RERUN_MAX_WORKERS``, the process-wide subprocess
+    budget) — each rerun's subprocess queues on that budget, so fanning out here
+    can no longer stack unbounded with the other parallel levers (the memory
+    pressure that used to keep this serial). Explicit
+    ``robustness_thresholds.param_jitter_workers`` wins (1 = the serial fast-path,
+    behaviourally identical to the old loop) but is still hard-capped at the
+    per-step ceiling. Under pytest the default is serial for determinism. Never
+    exceeds the task count, never below 1.
     """
     try:
         cfg = int(configured or 0)
     except (TypeError, ValueError):
         cfg = 0
-    workers = cfg if cfg > 0 else 1  # opt-in only; default serial
+    if cfg > 0:
+        workers = cfg
+    elif "PYTEST_CURRENT_TEST" in os.environ:
+        workers = 1
+    else:
+        from forven.strategies.concurrency import backtest_subprocess_budget
+
+        workers = min(_ROBUSTNESS_RERUN_MAX_WORKERS, backtest_subprocess_budget())
     workers = min(max(1, workers), _ROBUSTNESS_RERUN_MAX_WORKERS)  # hard ceiling, even for explicit config
     return max(1, min(workers, max(1, int(n_tasks))))
 
@@ -941,6 +951,9 @@ def _run_walk_forward_analysis(body: WalkForwardBody) -> dict:
         )
 
     result["verdict"] = "FAIL" if failures else "PASS"
+    # walk_forward() sets `robust` from its own looser rule; keep it in lockstep with
+    # the policy verdict so a persisted payload can't carry robust:true + verdict:FAIL.
+    result["robust"] = not failures
     result["verdict_reasons"] = failures
     result["verdict_thresholds"] = {
         "max_degradation": max_degradation,
@@ -2149,6 +2162,29 @@ def _reconcile_stage_after_validation(strategy_id: str) -> None:
     )
 
 
+def _current_params_hash(strategy_id: object) -> str | None:
+    """Fingerprint of the strategy's CURRENT default params.
+
+    Stamped into each validation row's config at submission — the moment the
+    runners read the params they validate — so the gauntlet status can flag a
+    result as STALE once those params change.
+    """
+    clean = str(strategy_id or "").strip()
+    if not clean:
+        return None
+    try:
+        from forven.db import get_db
+        from forven.util import params_fingerprint
+
+        with get_db() as conn:
+            row = conn.execute("SELECT params FROM strategies WHERE id = ?", (clean,)).fetchone()
+        if not row:
+            return None
+        return params_fingerprint(row["params"])
+    except Exception:
+        return None
+
+
 def _run_inline_result(
     *,
     result_type: str,
@@ -2179,6 +2215,7 @@ def _run_inline_result(
         "error": None,
         "start_date": context.get("start_date"),
         "end_date": context.get("end_date"),
+        "params_hash": _current_params_hash(context.get("strategy_id")),
     }
     _persist_placeholder_result(
         result_id=result_id,
@@ -2270,6 +2307,7 @@ def _submit_result(
         "strategy_id": context.get("strategy_id"),
         "symbol": context.get("symbol"),
         "timeframe": context.get("timeframe"),
+        "params_hash": _current_params_hash(context.get("strategy_id")),
     }
     _persist_placeholder_result(
         result_id=result_id,

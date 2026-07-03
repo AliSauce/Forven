@@ -556,6 +556,58 @@ def _m_2026_06_rewrite_custom_scanner_imports(conn: sqlite3.Connection) -> None:
         )
 
 
+def _m_2026_07_bot_execution_mode(conn: sqlite3.Connection) -> None:
+    """Per-bot execution mode for the Bot Factory (paper | live).
+
+    Bots were hardcoded paper-only. A bot may now be armed for LIVE execution
+    through the explicit go-live endpoint (typed "GO LIVE" confirmation + a
+    per-bot notional ceiling, mirroring the strategy pipeline's GO-LIVE-1
+    gate) — never via the generic config update. Default stays 'paper'.
+    """
+    cols = {
+        row[1] for row in conn.execute("PRAGMA table_info(bot_configs)").fetchall()
+    }
+    if "execution_mode" not in cols:
+        conn.execute(
+            "ALTER TABLE bot_configs ADD COLUMN execution_mode TEXT NOT NULL DEFAULT 'paper'"
+        )
+
+
+def _m_2026_07_dropzone_session_activity(conn: sqlite3.Connection) -> None:
+    """Idle-session hygiene for the AI Drop Zone.
+
+    Sessions were only ever closed explicitly, so abandoned MCP sessions
+    accumulated as 'active' forever. Adds last_activity_at (touched whenever a
+    strategy or backtest is tagged to the session) so an idle sweep can
+    auto-close stale sessions. Existing rows backfill from ended_at/started_at.
+    """
+    cols = {
+        row[1] for row in conn.execute("PRAGMA table_info(ai_dropzone_sessions)").fetchall()
+    }
+    if "last_activity_at" not in cols:
+        conn.execute("ALTER TABLE ai_dropzone_sessions ADD COLUMN last_activity_at TEXT")
+    conn.execute(
+        "UPDATE ai_dropzone_sessions "
+        "SET last_activity_at = COALESCE(last_activity_at, ended_at, started_at) "
+        "WHERE last_activity_at IS NULL"
+    )
+
+
+def _m_2026_07_bot_live_wallet(conn: sqlite3.Connection) -> None:
+    """Selectable live wallet for Bot Factory bots.
+
+    NULL = legacy routing (direction books / master wallet). A named-wallet
+    label routes the bot's live orders to that registered Hyperliquid
+    sub-account, isolating bot capital from the strategy pipeline. Set only
+    through the go-live arming endpoint, never the generic config update.
+    """
+    cols = {
+        row[1] for row in conn.execute("PRAGMA table_info(bot_configs)").fetchall()
+    }
+    if "live_wallet" not in cols:
+        conn.execute("ALTER TABLE bot_configs ADD COLUMN live_wallet TEXT")
+
+
 # Append new migrations to the END of this list. Never reorder, rename, or
 # delete existing entries — doing so will cause migrations to re-run on
 # databases that already applied them under the old name, or to silently
@@ -595,6 +647,18 @@ MIGRATIONS: list[Migration] = [
     Migration(
         name="2026_06_rewrite_custom_scanner_imports",
         up=_m_2026_06_rewrite_custom_scanner_imports,
+    ),
+    Migration(
+        name="2026_07_bot_execution_mode",
+        up=_m_2026_07_bot_execution_mode,
+    ),
+    Migration(
+        name="2026_07_dropzone_session_activity",
+        up=_m_2026_07_dropzone_session_activity,
+    ),
+    Migration(
+        name="2026_07_bot_live_wallet",
+        up=_m_2026_07_bot_live_wallet,
     ),
 ]
 

@@ -29,7 +29,6 @@ export interface BrainOverviewStats {
 	blocked_tasks: number;
 	pending_approvals: number;
 	decisions: number;
-	lessons: number;
 	recalls: number;
 }
 
@@ -309,94 +308,3 @@ export async function updateBrainAuxiliary(
 	});
 }
 
-// --------------------------------------------------------------------------- //
-// Brain lessons (P3-T10) — backs the /brain Lessons tab (P3-T13).             //
-// --------------------------------------------------------------------------- //
-
-export interface BrainLesson {
-	id: number;
-	situation_pattern: string;
-	lesson_text: string;
-	evidence_decisions: number[];
-	confidence: number;
-	created_at: string;
-	created_by: string | null;
-	last_validated_at: string | null;
-}
-
-export interface BrainLessonsListResponse {
-	items: BrainLesson[];
-	count: number;
-}
-
-export interface BrainLessonsSearchResponse extends BrainLessonsListResponse {
-	query: string;
-}
-
-export interface BrainLessonCreateBody {
-	situation_pattern: string;
-	lesson_text: string;
-	evidence_decisions?: number[];
-	confidence?: number;
-}
-
-export interface BrainLessonUpdateBody {
-	situation_pattern?: string;
-	lesson_text?: string;
-	confidence?: number;
-	last_validated_at?: string | null;
-}
-
-export async function listBrainLessons(
-	options: { limit?: number; minConfidence?: number } = {}
-): Promise<BrainLessonsListResponse> {
-	const params = new URLSearchParams();
-	if (options.limit !== undefined) params.set('limit', String(options.limit));
-	if (options.minConfidence !== undefined)
-		params.set('min_confidence', String(options.minConfidence));
-	const qs = params.toString();
-	return fetchApi<BrainLessonsListResponse>(qs ? `/brain/lessons?${qs}` : '/brain/lessons');
-}
-
-export async function searchBrainLessons(
-	query: string,
-	limit = 20
-): Promise<BrainLessonsSearchResponse> {
-	const params = new URLSearchParams({ q: query, limit: String(limit) });
-	return fetchApi<BrainLessonsSearchResponse>(`/brain/lessons/search?${params.toString()}`);
-}
-
-export async function createBrainLesson(body: BrainLessonCreateBody): Promise<BrainLesson> {
-	return fetchApi<BrainLesson>('/brain/lessons', {
-		method: 'POST',
-		body: JSON.stringify({
-			evidence_decisions: [],
-			confidence: 0.5,
-			...body
-		})
-	});
-}
-
-export async function getBrainLesson(lessonId: number): Promise<BrainLesson> {
-	return fetchApi<BrainLesson>(`/brain/lessons/${lessonId}`);
-}
-
-export async function updateBrainLesson(
-	lessonId: number,
-	body: BrainLessonUpdateBody
-): Promise<BrainLesson> {
-	return fetchApi<BrainLesson>(`/brain/lessons/${lessonId}`, {
-		method: 'PUT',
-		body: JSON.stringify(body)
-	});
-}
-
-export async function deleteBrainLesson(
-	lessonId: number
-): Promise<{ ok: true; lesson_id: number }> {
-	return fetchApi(`/brain/lessons/${lessonId}`, { method: 'DELETE' });
-}
-
-export async function validateBrainLesson(lessonId: number): Promise<BrainLesson> {
-	return fetchApi<BrainLesson>(`/brain/lessons/${lessonId}/validate`, { method: 'POST' });
-}

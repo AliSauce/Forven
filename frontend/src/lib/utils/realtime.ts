@@ -26,6 +26,8 @@ const DEFAULT_WS_EVENTS = [
 	'strategy_promoted',
 	'kill_switch_activated',
 	'kill_switch_cleared',
+	'approval_created',
+	'approval_resolved',
 	'risk_alert',
 	'trade',
 ];

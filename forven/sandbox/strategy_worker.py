@@ -209,7 +209,7 @@ def _validate_custom_module(workdir: Path) -> dict:
 
     from forven.strategies import registry
     from forven.strategies.certification import certify_execution_strategy
-    from forven.strategies.lookahead_probe import detect_lookahead
+    from forven.strategies.lookahead_probe import detect_execution_crash, detect_lookahead
 
     # Belt-and-suspenders re-scan in the child (the parent already scanned before
     # write; re-checking here means the worker never imports an unscanned module).
@@ -274,6 +274,7 @@ def _validate_custom_module(workdir: Path) -> dict:
 
     cert = certify_execution_strategy(str(type_name), default_params)
     lookahead_reason = detect_lookahead(probe)
+    execution_crash_reason = detect_execution_crash(probe)
 
     return {
         "ok": True,
@@ -287,6 +288,7 @@ def _validate_custom_module(workdir: Path) -> dict:
         "cert_error": cert.primary_blocking_reason(),
         "lookahead_blocked": bool(lookahead_reason),
         "lookahead_reason": lookahead_reason,
+        "execution_crash_reason": execution_crash_reason,
     }
 
 

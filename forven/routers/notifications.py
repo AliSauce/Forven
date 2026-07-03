@@ -21,6 +21,7 @@ def get_notifications(
     event_type: str | None = None,
     group_key: str | None = None,
     before_id: int | None = None,
+    actionable: bool = False,
 ):
     return control_plane_notifications.get_notifications_list(
         limit=limit,
@@ -30,6 +31,7 @@ def get_notifications(
         event_type=event_type,
         group_key=group_key,
         before_id=before_id,
+        actionable=actionable,
     )
 
 

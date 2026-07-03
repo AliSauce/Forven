@@ -757,43 +757,6 @@ def _check_pipeline_state() -> dict[str, Any]:
     )
 
 
-def _check_vector_store_health() -> dict[str, Any]:
-    from forven import vectordb
-
-    try:
-        available = bool(vectordb._check_chroma_available())
-    except Exception as exc:
-        return _make_check(
-            "vector_store",
-            "warn",
-            "ChromaDB vector store probe failed",
-            {
-                "available": False,
-                "error": str(exc),
-                "path": str(vectordb.CHROMA_DIR),
-                "critical_path": False,
-            },
-        )
-
-    status = "ok" if available else "warn"
-    summary = (
-        "ChromaDB vector store available"
-        if available
-        else "ChromaDB vector store degraded; agent memory recall is reduced but trading is unaffected"
-    )
-    return _make_check(
-        "vector_store",
-        status,
-        summary,
-        {
-            "available": available,
-            "path": str(vectordb.CHROMA_DIR),
-            "path_exists": vectordb.CHROMA_DIR.exists(),
-            "critical_path": False,
-        },
-    )
-
-
 def _check_operator_actions() -> dict[str, Any]:
     state = kv_get("ops_manual_action_state", {}) or {}
     if not isinstance(state, dict):
@@ -949,7 +912,6 @@ def collect_backend_soak_report(
         ("runtime", _check_runtime_watchdog),
         ("agents", _check_agent_roster),
         ("pipeline", _check_pipeline_state),
-        ("vector_store", _check_vector_store_health),
         ("operator_actions", _check_operator_actions),
         ("hyperliquid", lambda: _check_hyperliquid(require_exchange_connection=require_exchange_connection)),
     ]

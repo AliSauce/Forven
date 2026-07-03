@@ -8,7 +8,7 @@ from forven.db import get_db
 from .context import _current_agent_id_var, _current_task_display_id_var
 from .tool_definitions import BRAIN_AGENT_IDS
 from .tool_registry import register_tool
-from .tools_exchange import _normalize_agent_id
+from forven.roster import normalize_agent_id as _normalize_agent_id
 
 
 def _suggest_known_families(stype: str, *, n: int = 3) -> list[str]:
@@ -152,20 +152,21 @@ def _tool_assign_agent_task(params: dict) -> str:
             f"{', '.join(available)}"
         )
 
-    assign_task(agent_id, task_type, title, description, input_data=input_data, strategy_id=strategy_id)
+    task_id = assign_task(
+        agent_id, task_type, title, description, input_data=input_data, strategy_id=strategy_id
+    )
 
-    # Also broadcast to Discord (removed due to noise)
-    # try:
-    #     from forven.reporter import broadcast_agent_task
-    #     import asyncio
-    #     loop = asyncio.get_event_loop()
-    #     if loop.is_running():
-    #         loop.create_task(broadcast_agent_task(
-    #             "brain", f"Task Assigned → {agent_id}",
-    #             f"**{title}**\n\n{description[:500]}",
-    #         ))
-    # except Exception:
-    #     pass
+    # Link the created task to the Brain decision that spawned it (when the
+    # runtime worker recorded one for this cycle) so decision → task → outcome
+    # joins work.
+    try:
+        from forven.brain_decisions import get_active_decision_id, link_agent_task
+
+        decision_id = get_active_decision_id()
+        if decision_id and task_id:
+            link_agent_task(int(task_id), int(decision_id))
+    except Exception:
+        pass
 
     return f"Task assigned to {agent_id}: {title}"
 
@@ -692,11 +693,11 @@ def _tool_propose_skill_update(params: dict) -> str:
     description=(
         "Propose a new scheduled brain routine — an NL prompt that runs on a "
         "cron expression with a specific tools_context (scheduled/research/"
-        "interactive/recovery) and optional curated skills. The routine is "
-        "queued as a `routine_create` approval; the operator must approve it "
-        "before it begins firing on schedule. Use this when the Brain wants "
-        "to set up an autonomous repeating workflow (e.g. weekly post-mortem "
-        "sweep, hourly regime check)."
+        "interactive/recovery) and an optional Discord delivery channel. The "
+        "routine is queued as a `routine_create` approval; the operator must "
+        "approve it before it begins firing on schedule. Use this when the "
+        "Brain wants to set up an autonomous repeating workflow (e.g. weekly "
+        "post-mortem sweep, hourly regime check)."
     ),
     input_schema={
         "type": "object",
@@ -721,10 +722,12 @@ def _tool_propose_skill_update(params: dict) -> str:
                     "(no research tools)."
                 ),
             },
-            "skills": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "Optional list of curated skill names to inject into the routine context.",
+            "channel": {
+                "type": "string",
+                "description": (
+                    "Optional Discord channel alias (e.g. 'ops', 'alerts') the bot "
+                    "posts the routine's response to. Omit for no Discord delivery."
+                ),
             },
             "rationale": {
                 "type": "string",
@@ -748,10 +751,7 @@ def _tool_create_routine(params: dict) -> str:
     cron_expr = str(params.get("cron_expr") or "").strip()
     rationale = str(params.get("rationale") or "").strip()
     tools_context = str(params.get("tools_context") or "scheduled").strip() or "scheduled"
-    skills_raw = params.get("skills") or []
-    if not isinstance(skills_raw, list):
-        return json.dumps({"ok": False, "error": "skills_must_be_array"})
-    skills = [str(s).strip() for s in skills_raw if str(s).strip()]
+    channel = str(params.get("channel") or "").strip() or None
 
     if not name:
         return json.dumps({"ok": False, "error": "missing_name"})
@@ -780,7 +780,7 @@ def _tool_create_routine(params: dict) -> str:
         "prompt": prompt,
         "cron_expr": cron_expr,
         "tools_context": tools_context,
-        "skills": skills,
+        "channel": channel,
         "rationale": rationale,
         "proposed_by": actor,
     }

@@ -6,8 +6,7 @@ export interface Routine {
 	prompt: string;
 	cron_expr: string;
 	tools_context: string;
-	skills_json?: string | null;
-	skills: string[];
+	channel: string | null;
 	enabled: number | boolean;
 	created_by: string | null;
 	approval_id: number | null;
@@ -23,7 +22,7 @@ export interface RoutineCreatePayload {
 	prompt: string;
 	cron_expr: string;
 	tools_context?: string;
-	skills?: string[];
+	channel?: string | null;
 	enabled?: boolean;
 }
 
@@ -32,7 +31,8 @@ export interface RoutineUpdatePayload {
 	prompt?: string;
 	cron_expr?: string;
 	tools_context?: string;
-	skills?: string[];
+	/** Discord channel alias or raw id; send '' to clear. */
+	channel?: string | null;
 	enabled?: boolean;
 }
 
@@ -96,6 +96,21 @@ export async function previewRoutineSchedule(id: number, count = 5): Promise<str
 		{ method: 'POST', body: JSON.stringify({}) },
 	);
 	return res.upcoming || [];
+}
+
+/** A Discord channel the bot can post to. `id` is what gets stored on the
+ * routine (raw channel id from the live guild list, or an alias name when
+ * the backend falls back to the static alias map). */
+export interface RoutineChannel {
+	id: string;
+	label: string;
+}
+
+/** Discord channels the bot can deliver routine results to — live guild list
+ * when the bot has connected, alias-map fallback otherwise. */
+export async function listRoutineChannels(): Promise<RoutineChannel[]> {
+	const res = await fetchApi<{ channels: RoutineChannel[] }>('/routines/channels');
+	return res.channels || [];
 }
 
 export async function previewCronExpression(cron_expr: string, count = 5): Promise<string[]> {

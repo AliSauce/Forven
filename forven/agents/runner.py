@@ -20,10 +20,9 @@ from forven.ai import (
     is_transient_provider_exception,
     normalize_provider_and_model,
 )
-from forven.async_utils import spawn
 from forven.context import build_agent_context
 from forven.cost_pricing import estimate_cost_usd
-from forven.db import claim_pending_agent_tasks, create_pending_task, format_prefixed_id, get_db, get_task_tool_calls, init_db, is_user_active, kv_get, kv_set, log_activity
+from forven.db import create_pending_task, format_prefixed_id, get_db, get_task_tool_calls, kv_get, kv_set, log_activity
 from forven.provider_runtime_health import (
     record_call_failure,
     record_provider_event,
@@ -35,7 +34,6 @@ from forven.workspace import append_workspace, read_workspace
 
 from .context import (
     _current_agent_id as _legacy_current_agent_id,
-    _recover_dangling_tasks as _legacy_recover_dangling_tasks,
     reset_tool_context,
     set_tool_context,
 )
@@ -43,7 +41,6 @@ from .tool_definitions import (
     AGENT_TOOLS,
     BACKTESTING_TOOLS,  # noqa: F401 - legacy re-exported via forven.agents
     BRAIN_TOOLS,  # noqa: F401 - legacy re-exported via forven.agents
-    EXCHANGE_TOOLS,  # noqa: F401 - legacy re-exported via forven.agents
     MAX_TOOL_ROUNDS,
     PIPELINE_AUTO_HANDOFF_TASK_TYPES,
 )
@@ -54,10 +51,9 @@ from .tool_registry import (
 # Import tool modules to trigger @register_tool decorators.
 import forven.agents.tools_core         # noqa: F401
 import forven.agents.tools_brain        # noqa: F401
-import forven.agents.tools_exchange     # noqa: F401
 import forven.agents.tools_backtesting  # noqa: F401
 
-from .tools_exchange import (
+from .ownership import (
     _check_task_owner,
     _extract_task_strategy_id,
 )
@@ -90,9 +86,58 @@ def _is_missing_credentials_error(error: Exception) -> bool:
         or "has no api credentials" in text
     )
 
-# Backward-compatible re-exports used by forven.agents.__init__ and older tests.
+# Backward-compatible re-export used by forven.agents.__init__ and older tests.
 _current_agent_id = _legacy_current_agent_id
-_recover_dangling_tasks = _legacy_recover_dangling_tasks
+
+
+class _TaskTranscript:
+    """Streams per-round transcript rows to ``agent_task_messages``.
+
+    Rows are written AS EACH ROUND COMPLETES so a crashed or timed-out run
+    still has its partial thought process on disk. Best-effort by design —
+    a failed transcript write never interrupts the run (append_task_message
+    swallows its own errors).
+    """
+
+    def __init__(self, task_display_id: str | None, agent_id: str | None):
+        self.task_display_id = str(task_display_id or "").strip()
+        self.agent_id = agent_id
+        self.provider: str | None = None
+        self.model_id: str | None = None
+        self._seq = 0
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.task_display_id)
+
+    def set_attempt(self, provider: str | None, model_id: str | None) -> None:
+        """Record which provider/model the current chain attempt is using."""
+        self.provider = provider
+        self.model_id = model_id
+
+    def write(self, role: str, **fields) -> None:
+        if not self.enabled:
+            return
+        try:
+            from forven.db import append_task_message
+            from forven.redact import redact
+
+            for key in ("content", "reasoning", "tool_args", "tool_result"):
+                value = fields.get(key)
+                if value:
+                    fields[key] = redact(str(value))[0]
+            self._seq += 1
+            append_task_message(
+                self.task_display_id,
+                self.agent_id,
+                self._seq,
+                role,
+                provider=self.provider,
+                model_id=self.model_id,
+                **fields,
+            )
+        except Exception as exc:  # noqa: BLE001 - transcript is best-effort
+            log.debug("Transcript write failed for %s: %s", self.task_display_id, exc)
 
 
 def _coerce_task_input_data(task: dict) -> dict:
@@ -213,6 +258,7 @@ async def _call_with_tools(
     tools: list[dict] | None = None,
     agent_id: str | None = None,
     trace: list[dict] | None = None,
+    transcript: "_TaskTranscript | None" = None,
 ) -> tuple[str, dict]:
     """Call AI with tool support — implements the tool-call loop.
 
@@ -286,10 +332,18 @@ async def _call_with_tools(
 
     for chain_idx, (active_provider, active_model) in enumerate(chain):
         progress = {"tools_executed": False}
+        if transcript is not None:
+            transcript.set_attempt(active_provider, active_model)
+            if chain_idx > 0:
+                transcript.write(
+                    "event",
+                    content=f"Retrying on fallback provider {active_provider}/{active_model}.",
+                )
         try:
             result = await _call_with_tools_single(
                 active_provider, active_model, list(messages), system, tools,
                 progress=progress,
+                transcript=transcript,
             )
             # Health is keyed on the provider that ACTUALLY ran — a working
             # fallback must never mark the (broken) primary healthy.
@@ -312,6 +366,11 @@ async def _call_with_tools(
             return result
         except Exception as e:
             last_error = e
+            if transcript is not None:
+                transcript.write(
+                    "event",
+                    content=f"Provider {active_provider}/{active_model} failed: {_error_detail(e)[:500]}",
+                )
             # Record against the provider that actually failed (not the agent's
             # configured primary) so the banner/Discord name the right provider.
             record_call_failure(active_provider, e)
@@ -368,6 +427,7 @@ async def _call_with_tools_single(
     provider: str, model_id: str, messages: list[dict], system: str,
     tools: list[dict] | None = None,
     progress: dict | None = None,
+    transcript: "_TaskTranscript | None" = None,
 ) -> tuple[str, dict]:
     """Call a single provider with tool support — unified, provider-agnostic loop.
 
@@ -411,13 +471,13 @@ async def _call_with_tools_single(
                 break
 
         if round_num == MAX_TOOL_ROUNDS - 5:
-            messages.append({
-                "role": "user",
-                "content": (
-                    "Note: You have 5 tool calls remaining before the limit. "
-                    "Start wrapping up and prepare your final answer."
-                ),
-            })
+            nudge = (
+                "Note: You have 5 tool calls remaining before the limit. "
+                "Start wrapping up and prepare your final answer."
+            )
+            messages.append({"role": "user", "content": nudge})
+            if transcript is not None:
+                transcript.write("event", content=nudge, tool_round=round_num)
 
         # Spend-safety chokepoint for the tool-call path (no-op until enforced).
         from forven.model_selection import assert_callable
@@ -426,6 +486,16 @@ async def _call_with_tools_single(
         token = get_token(provider)
         response = await impl.call(model_id, messages, system, active_tools, token)
         _accum(response.usage)
+
+        if transcript is not None:
+            transcript.write(
+                "assistant",
+                content=response.text or None,
+                reasoning=response.reasoning,
+                tool_round=round_num,
+                input_tokens=int(response.usage.get("input_tokens") or response.usage.get("prompt_tokens") or 0),
+                output_tokens=int(response.usage.get("output_tokens") or response.usage.get("completion_tokens") or 0),
+            )
 
         if response.text:
             last_nonempty_text = response.text
@@ -463,6 +533,15 @@ async def _call_with_tools_single(
                 progress["tools_executed"] = True
             result = await _execute_tool(tc.name, tc.input)
             tool_results.append((tc.id, str(result)[:5000]))
+            if transcript is not None:
+                transcript.write(
+                    "tool",
+                    tool_name=tc.name,
+                    tool_call_id=tc.id,
+                    tool_args=json.dumps(tc.input, default=str),
+                    tool_result=str(result),
+                    tool_round=round_num,
+                )
             call_sig = (tc.name, json.dumps(tc.input, sort_keys=True, default=str)[:200])
             _recent_tool_calls.append(call_sig)
 
@@ -472,14 +551,14 @@ async def _call_with_tools_single(
         if len(_recent_tool_calls) >= 3:
             last_three = _recent_tool_calls[-3:]
             if last_three[0] == last_three[1] == last_three[2]:
-                messages.append({
-                    "role": "user",
-                    "content": (
-                        "You have called the same tool 3 times with identical arguments. "
-                        "The result will not change. Synthesize what you have and provide your final answer, "
-                        "or try a different approach."
-                    ),
-                })
+                stuck_nudge = (
+                    "You have called the same tool 3 times with identical arguments. "
+                    "The result will not change. Synthesize what you have and provide your final answer, "
+                    "or try a different approach."
+                )
+                messages.append({"role": "user", "content": stuck_nudge})
+                if transcript is not None:
+                    transcript.write("event", content=stuck_nudge, tool_round=round_num)
 
     # Hit max rounds — force one final non-tool answer from gathered context/tool results.
     log.warning("Hit max tool rounds (%d) for %s/%s; forcing final answer", MAX_TOOL_ROUNDS, provider, model_id)
@@ -503,6 +582,12 @@ async def _call_with_tools_single(
         )
         forced = (forced or "").strip()
         if forced:
+            if transcript is not None:
+                transcript.write(
+                    "assistant",
+                    content=forced,
+                    tool_round=MAX_TOOL_ROUNDS,
+                )
             return (forced, total_usage)
     except Exception as e:
         log.warning("Forced final answer after max tool rounds failed: %s", e)
@@ -513,9 +598,6 @@ async def _call_with_tools_single(
 
 
 _AGENT_TASK_TIMEOUT_SECONDS = DEFAULT_AGENT_TASK_TIMEOUT_SECONDS  # 15-minute hard wall-clock limit per task
-_AGENT_IDLE_POLL_SECONDS = 5
-_AGENT_DISABLED_POLL_SECONDS = 30
-_AGENT_USER_ACTIVE_YIELD_SECONDS = 2
 _BRAIN_CALLBACK_MAX_PENDING = 10  # Don't queue brain callbacks if queue is already this deep
 
 
@@ -752,12 +834,6 @@ _ARTIFACT_TOOLS: frozenset[str] = frozenset({
     "promote_strategy",
     "assign_agent_task",
     "write_file",
-    "store_memory",
-    "store_chroma",
-    "place_order",
-    "close_position",
-    "cancel_orders",
-    "update_trade",
 })
 
 
@@ -1227,8 +1303,19 @@ async def _run_agent_task_inner(
         messages = [{"role": "user", "content": prompt}]
         ai_trace: list[dict] = []
 
+        # Per-round transcript: the prompt, every assistant turn (text +
+        # reasoning), every tool call (args + result) and every injected nudge
+        # are persisted to agent_task_messages AS THE RUN PROGRESSES — this is
+        # what the operator reads to see the agent's thought process.
+        transcript = _TaskTranscript(
+            task_display_id or format_prefixed_id("T", int(task_id)), agent_id
+        )
+        transcript.set_attempt(provider, model_id)
+        transcript.write("user", content=prompt)
+
         response, usage = await _call_with_tools(
-            provider, model_id, messages, context, tools=agent_tools, agent_id=agent_id, trace=ai_trace
+            provider, model_id, messages, context, tools=agent_tools, agent_id=agent_id, trace=ai_trace,
+            transcript=transcript,
         )
         cost_usd = estimate_cost_usd(provider, model_id, usage)
 
@@ -1236,7 +1323,7 @@ async def _run_agent_task_inner(
         # check the agent's narrative against what actually happened. The LLM
         # has been observed to claim it created artifacts when the underlying
         # tool errored; the ledger exposes the audit-log truth at the top of
-        # every surface (UI, Discord, vectordb narrative).
+        # every surface (UI, Discord).
         try:
             ledger_text, tool_trace = _build_tool_ledger(task_display_id)
         except Exception:
@@ -1254,6 +1341,25 @@ async def _run_agent_task_inner(
             output["ai_trace"] = ai_trace
         if tool_trace:
             output["tool_trace"] = tool_trace
+
+        # Tools may persist structured fields onto output_data mid-run (e.g.
+        # register_strategy writes cited_skills for skill outcome closure). The
+        # completion UPDATE below replaces output_data wholesale, so carry those
+        # fields over or the citation is lost the moment the task finishes.
+        try:
+            with get_db() as conn:
+                _prior_row = conn.execute(
+                    "SELECT output_data FROM agent_tasks WHERE id = ?", (task_id,)
+                ).fetchone()
+            _prior_output = _parse_json_object_or_empty(
+                _prior_row["output_data"] if _prior_row else None
+            )
+            _prior_cited = _prior_output.get("cited_skills")
+            if isinstance(_prior_cited, list) and _prior_cited:
+                output["cited_skills"] = _prior_cited
+        except Exception:
+            pass
+
         if task_type == "phantom_repair" and strategy_id:
             from forven.phantom_recovery import handle_phantom_repair_completion
 
@@ -1386,6 +1492,20 @@ async def _run_agent_task_inner(
                     input_data=input_data,
                 )
 
+        # Durable spend accounting: task rows are pruned after the retention
+        # window, the daily rollup is what survives.
+        try:
+            from forven.db import record_agent_spend
+
+            record_agent_spend(
+                agent_id,
+                cost_usd=cost_usd,
+                input_tokens=usage.get("input_tokens", 0),
+                output_tokens=usage.get("output_tokens", 0),
+            )
+        except Exception:
+            pass
+
         if queue_follow_through:
             with get_db() as conn:
                 _queue_autonomous_research_follow_through_if_needed(
@@ -1452,16 +1572,6 @@ async def _run_agent_task_inner(
         else:
             log_activity("info", f"agent:{agent_id}", f"Completed task: {task.get('title', '')}")
 
-        # Store agent narrative in ChromaDB
-        try:
-            from forven.vectordb import store_narrative
-            store_narrative(
-                f"[{agent.get('name', agent_id)}] {response[:500]}",
-                metadata={"agent": agent_id, "task_type": task.get("type", "")},
-            )
-        except Exception:
-            pass
-
         # Provider runtime-health is recorded inside _call_with_tools, keyed on
         # the provider that ACTUALLY ran — so a working fallback never marks a
         # broken primary green. Nothing to record here.
@@ -1478,18 +1588,31 @@ async def _run_agent_task_inner(
             from forven.redact import redact_dict
 
             _fail_trace = getattr(e, "ai_attempts", [])
+            _fail_output: dict[str, object] = {
+                "request": redact_dict({
+                    "title": task.get("title"),
+                    "description": task.get("description"),
+                    "input_data": input_data,
+                })[0],
+                "ai_trace": _fail_trace,
+                "error_detail": _error_detail(e),
+            }
             with get_db() as conn:
+                # A task can register a strategy (persisting cited_skills onto
+                # output_data) and fail afterwards — the strategy still enters
+                # the pipeline, so the citations must survive this overwrite
+                # for skill outcome closure.
+                _prior_row = conn.execute(
+                    "SELECT output_data FROM agent_tasks WHERE id = ?", (task_id,)
+                ).fetchone()
+                _prior_cited = _parse_json_object_or_empty(
+                    _prior_row["output_data"] if _prior_row else None
+                ).get("cited_skills")
+                if isinstance(_prior_cited, list) and _prior_cited:
+                    _fail_output["cited_skills"] = _prior_cited
                 conn.execute(
                     "UPDATE agent_tasks SET output_data=? WHERE id=?",
-                    (json.dumps({
-                        "request": redact_dict({
-                            "title": task.get("title"),
-                            "description": task.get("description"),
-                            "input_data": input_data,
-                        })[0],
-                        "ai_trace": _fail_trace,
-                        "error_detail": _error_detail(e),
-                    }), task_id),
+                    (json.dumps(_fail_output), task_id),
                 )
         except Exception:
             pass
@@ -1600,8 +1723,10 @@ async def _run_agent_task_inner(
             from forven.reporter import broadcast_agent_task
             loop = asyncio.get_event_loop()
             if loop.is_running():
+                # Attribute the crash to the agent that actually failed (this
+                # used to broadcast every crash as risk-manager).
                 loop.create_task(broadcast_agent_task(
-                    "risk-manager", "🔴 CRITICAL: Task Execution Failed",
+                    agent_id, "🔴 CRITICAL: Task Execution Failed",
                     f"Agent {agent_id} crashed while processing task '{task.get('title', 'Untitled')}'.\n\nError snippet:\n```\n{error_summary[:500]}\n```"
                 ))
         except Exception:
@@ -1644,67 +1769,3 @@ async def _run_agent_task_inner(
     finally:
         if tool_context_tokens is not None:
             reset_tool_context(tool_context_tokens)
-
-
-async def run_agent_loop(agent_id: str):
-    """Run an agent's continuous loop — pick up tasks, execute, wait."""
-    init_db()
-
-    log.info("Agent %s loop started", agent_id)
-
-    while True:
-        # Refresh agent config each iteration so model/schedule/enabled
-        # changes take effect without a daemon restart.
-        with get_db() as conn:
-            row = conn.execute("SELECT * FROM agents WHERE id = ?", (agent_id,)).fetchone()
-        if not row:
-            log.error("Agent %s not found (deleted?), stopping loop", agent_id)
-            return
-        agent = dict(row)
-
-        # Determine loop interval (refresh each iteration). Agent schedules are
-        # heartbeat metadata; task pickup must stay fast for autonomous flow.
-        interval = _AGENT_IDLE_POLL_SECONDS
-        if agent.get("schedule_type") == "interval" and agent.get("schedule_expr"):
-            try:
-                configured_interval = int(agent["schedule_expr"]) / 1000  # ms to seconds
-                interval = min(max(configured_interval, 1), _AGENT_IDLE_POLL_SECONDS)
-            except (ValueError, TypeError):
-                pass
-
-        if not agent.get("enabled"):
-            log.debug("Agent %s is disabled, sleeping", agent_id)
-            await asyncio.sleep(_AGENT_DISABLED_POLL_SECONDS)
-            continue
-
-        try:
-            tasks = claim_pending_agent_tasks(agent_id)
-            for task in tasks:
-                # Yield to user: if user is active and this is a system task,
-                # insert a short delay between tasks to free up resources.
-                task_source = (task.get("source") or "system") if isinstance(task, dict) else "system"
-                if task_source != "user" and is_user_active():
-                    log.info("Agent %s briefly yielding to user-active signal before system task", agent_id)
-                    await asyncio.sleep(_AGENT_USER_ACTIVE_YIELD_SECONDS)
-                await run_agent_task(agent, task)
-        except Exception as e:
-            log.error("Agent %s loop error: %s", agent_id, e)
-
-        await asyncio.sleep(interval)
-
-
-async def run_all_agents():
-    """Run all enabled agents concurrently."""
-    init_db()
-
-    with get_db() as conn:
-        rows = conn.execute("SELECT * FROM agents WHERE enabled = 1").fetchall()
-        agents = [dict(r) for r in rows]
-
-    if not agents:
-        log.info("No enabled agents to run")
-        return
-
-    log.info("Starting %d agent loops", len(agents))
-    tasks = [spawn(run_agent_loop(a["id"]), name=f"agent-loop-{a['id']}") for a in agents]
-    await asyncio.gather(*tasks)

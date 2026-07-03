@@ -12,13 +12,17 @@ def root():
     return control_plane_status.root()
 
 
+# Sync `def` on purpose: these do DB reads (scheduler-job scan, kv), and an
+# `async def` handler would run them ON the request loop — the liveness check
+# itself starving the loop it reports on. Starlette runs sync handlers in the
+# threadpool.
 @router.get("/api/health")
-async def health_check():
+def health_check():
     return control_plane_status.health_check()
 
 
 @router.get("/health")
-async def health_check_compat():
+def health_check_compat():
     return control_plane_status.health_check_compat()
 
 

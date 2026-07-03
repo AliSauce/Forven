@@ -32,7 +32,8 @@ export function inferPageKind(pathname: string): string {
 	if (/^\/lab\/strategy\/[^/]+/.test(p)) return 'strategy_detail';
 	if (p === '/lab' || p.startsWith('/lab/')) return 'lab';
 	if (p === '/' || p.startsWith('/dashboard')) return 'dashboard';
-	if (p.startsWith('/paper') || p.startsWith('/trading')) return 'paper_trading';
+	if (p.startsWith('/paper') || p.startsWith('/trading') || p.startsWith('/all-trades'))
+		return 'paper_trading';
 	if (p.startsWith('/data')) return 'data_engine';
 	if (p.startsWith('/pipeline')) return 'pipeline';
 	if (p.startsWith('/risk')) return 'risk';
@@ -41,21 +42,48 @@ export function inferPageKind(pathname: string): string {
 	if (p.startsWith('/hypoth')) return 'hypotheses';
 	if (p.startsWith('/settings')) return 'settings';
 	if (p.startsWith('/tasks')) return 'tasks';
+	if (p.startsWith('/bot-factory')) return 'bot_factory';
+	if (p.startsWith('/strategy-creator')) return 'strategy_creator';
+	if (p.startsWith('/backtest')) return 'backtest';
+	if (p.startsWith('/brain')) return 'brain';
+	if (p.startsWith('/approval')) return 'approvals';
+	if (p.startsWith('/routines')) return 'routines';
+	if (p.startsWith('/integrations')) return 'integrations';
+	if (p.startsWith('/diagnostics')) return 'diagnostics';
 	const seg = p.split('/').filter(Boolean)[0];
 	return seg || 'dashboard';
 }
 
+// Routes that carry their entity in the URL — parsed automatically on every
+// navigation so those pages are assistant-aware with zero per-page wiring.
+const ENTITY_ROUTES: Array<{ re: RegExp; type: string }> = [
+	{ re: /^\/lab\/strategy\/([^/?#]+)/, type: 'strategy' },
+	{ re: /^\/hypotheses\/([^/?#]+)/, type: 'hypothesis' },
+	{ re: /^\/bot-factory\/([^/?#]+)/, type: 'bot' },
+	{ re: /^\/tasks\/([^/?#]+)/, type: 'task' },
+	{ re: /^\/integrations\/mcp\/([^/?#]+)/, type: 'mcp_server' },
+];
+
+// Non-entity subpaths that would otherwise match an ENTITY_ROUTES pattern.
+const ENTITY_ID_BLOCKLIST = new Set(['data-gaps', 'editor', 'new']);
+
 /** Called by the layout on every navigation. Resets entity/summary/data.
  *
- * For routes that carry their entity in the URL (today: strategy detail), the
- * entity is parsed automatically so those pages are assistant-aware with zero
- * per-page wiring. The backend fills in the human label from the id.
+ * For routes that carry their entity in the URL, the entity is parsed
+ * automatically so those pages are assistant-aware with zero per-page wiring.
+ * The backend fills in the human label from the id.
  */
 export function setRoute(pathname: string): void {
 	const next: PageContext = { route: pathname, page_kind: inferPageKind(pathname) };
-	const m = (pathname || '').match(/^\/lab\/strategy\/([^/?#]+)/);
-	if (m && m[1]) {
-		next.entity = { type: 'strategy', id: decodeURIComponent(m[1]) };
+	for (const { re, type } of ENTITY_ROUTES) {
+		const m = (pathname || '').match(re);
+		if (m && m[1]) {
+			const id = decodeURIComponent(m[1]);
+			if (!ENTITY_ID_BLOCKLIST.has(id.toLowerCase())) {
+				next.entity = { type, id };
+			}
+			break;
+		}
 	}
 	pageContext.set(next);
 }

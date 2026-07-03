@@ -22,8 +22,32 @@ class DataEngineSettings(BaseModel):
     )
     onchain_provider: str = ""
     onchain_api_key: str = ""
+    # Research universe (edge-data-expansion Run 1): symbols beyond the trading
+    # set that get deep history for strategy DISCOVERY. Seeded via Binance
+    # Vision + REST tail; kept current by the scheduled catch-up (not the
+    # keep-alive, which stays scoped to actively-trading symbols).
+    # Ladder: every research symbol gets base_timeframes; the top
+    # `intraday_top` by liquidity also get intraday_timeframes; the top
+    # `minute_top` also get 1m. metrics_days bounds the daily-file OI/LSR/taker
+    # deep backfill (BV serves metrics as ~1 file/day — unbounded would mean
+    # thousands of requests per symbol).
+    research_universe: dict[str, Any] = Field(
+        default_factory=lambda: {
+            "enabled": True,
+            "size": 50,
+            "base_timeframes": ["1h", "4h", "1d"],
+            "intraday_timeframes": ["15m", "5m"],
+            "intraday_top": 20,
+            "minute_top": 10,
+            "metrics_days": 365,
+        }
+    )
     stream_reconnect_initial_seconds: float = 1.0
     stream_reconnect_max_seconds: float = 60.0
+    # Per-candidate reproducibility: gauntlet stages pin as_of to their
+    # workflow's creation time so every stage scores identical data even when
+    # restatements/rebuilds land mid-gauntlet. (Run 2 of the edge-data plan.)
+    gauntlet_as_of_pin: bool = True
     point_in_time_mode: Literal["latest", "as_of_pin"] = "latest"
     # ISO-8601 pin consumed by backtests when point_in_time_mode == "as_of_pin":
     # reads reconstruct the values in force at this time from the revision log

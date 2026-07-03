@@ -21,6 +21,10 @@ def _reset_cache_and_books(monkeypatch):
         "forven.exchange.books.active_book_addresses",
         lambda: [("long", "0xLONG"), ("short", "0xSHORT")],
     )
+    # EQ-BASIS-1 made the master wallet opt-in; these tests pin the substitution /
+    # reliability machinery with the master INCLUDED (its original semantics).
+    # Books-only composition is covered by tests/test_equity_anchors.py.
+    monkeypatch.setattr(dmn, "_equity_includes_master", lambda: True)
     yield
     dmn._BOOK_EQUITY_CACHE.clear()
 

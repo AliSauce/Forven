@@ -181,6 +181,16 @@ def _runtime_health_summary() -> dict[str, object]:
         except Exception as exc:
             issues.append(f"api task-worker health failed: {exc}")
 
+    # Event-loop lag: stalls at/over the WS send timeout WILL drop live clients —
+    # surface them here so a starved loop is a named issue, not a mystery disconnect.
+    try:
+        from forven.loop_watchdog import loop_lag_issues, loop_lag_snapshot
+
+        details["event_loop"] = loop_lag_snapshot()
+        issues.extend(loop_lag_issues())
+    except Exception as exc:
+        issues.append(f"event-loop watchdog unavailable: {exc}")
+
     return {"status": "degraded" if issues else "ok", "issues": issues, "details": details}
 
 
@@ -577,20 +587,19 @@ def _build_nav_indicators(
     ingestion_runs: list[dict[str, Any]],
     notification_summary: dict[str, Any],
     auth_providers: dict[str, Any],
-    memory_nav_indicator: dict[str, Any],
 ) -> dict[str, object]:
+    # Keys MUST match the frontend nav hrefs (navMetrics.NAV_HREFS) — the client
+    # drops indicators for routes it doesn't know about.
     return {
         "/": _empty_nav_indicator(),
         "/data": _build_data_nav_indicator(ingestion_runs),
         "/lab": _build_lab_nav_indicator(scans),
-        "/ai-dropzone": _empty_nav_indicator(),
         "/risk": _build_risk_nav_indicator(risk),
-        "/trades": _build_trades_nav_indicator(open_trades, paper_sessions),
+        "/trading": _build_trades_nav_indicator(open_trades, paper_sessions),
         "/agents": _build_agents_nav_indicator(agent_tasks),
         "/tasks": _build_tasks_nav_indicator(agent_tasks),
         "/approval": _build_approvals_nav_indicator(approvals),
-        "/memory": memory_nav_indicator if isinstance(memory_nav_indicator, dict) else _empty_nav_indicator(),
-        "/ops": _build_ops_nav_indicator(notification_summary),
+        "/diagnostics": _build_ops_nav_indicator(notification_summary),
         "/settings": _build_settings_nav_indicator(auth_providers),
     }
 
@@ -635,7 +644,6 @@ def get_system_heartbeat() -> dict[str, object]:
     """Aggregated control-plane data for the frontend refresh cycle."""
     from forven.api_domains import analytics as analytics_domain
     from forven.api_domains import data as data_domain
-    from forven.api_domains import memory as memory_domain
     from forven.api_domains import paper as paper_domain
     from forven.api_domains import tasks as tasks_domain
     from forven.api_domains import trading as trading_domain
@@ -673,11 +681,6 @@ def get_system_heartbeat() -> dict[str, object]:
     except Exception:
         auth_providers = {"providers": []}
 
-    try:
-        memory_nav_indicator = memory_domain.get_memory_nav_indicator()
-    except Exception:
-        memory_nav_indicator = _empty_nav_indicator()
-
     settings_payload = core._load_settings_payload()
 
     return {
@@ -704,7 +707,6 @@ def get_system_heartbeat() -> dict[str, object]:
             ingestion_runs=[item for item in ingestion_runs if isinstance(item, dict)] if isinstance(ingestion_runs, list) else [],
             notification_summary=notification_summary if isinstance(notification_summary, dict) else {},
             auth_providers=auth_providers if isinstance(auth_providers, dict) else {"providers": []},
-            memory_nav_indicator=memory_nav_indicator if isinstance(memory_nav_indicator, dict) else _empty_nav_indicator(),
         ),
     }
 
@@ -770,14 +772,30 @@ def get_dashboard(require_account_connection: bool = False) -> dict[str, object]
     )
     if should_fetch_live_account:
         try:
-            from forven.exchange.hyperliquid import get_account_value
             from forven.api_domains.trading import _resolve_exchange_testnet
+            # EQ-BASIS-1: use the SAME books-aware aggregate the risk cycle uses.
+            # A master-only get_account_value here wrote the wrong basis back into
+            # daemon_state (master reserve funds are not at-risk capital when
+            # direction books are enabled), silently clobbering the daemon's
+            # books-only snapshot for every downstream reader.
+            from forven.daemon import _book_aware_account_value
 
             resolved_testnet = _resolve_exchange_testnet()
-            live_account = get_account_value(
-                testnet=resolved_testnet,
-                require_connection=strict_hyperliquid_account,
-            )
+            live_account = _book_aware_account_value(testnet=resolved_testnet)
+            if live_account is None and strict_hyperliquid_account:
+                raise HTTPException(
+                    status_code=503,
+                    detail="HyperLiquid wallet balance unavailable (degraded reads)",
+                )
+            if (
+                strict_hyperliquid_account
+                and isinstance(live_account, dict)
+                and str(live_account.get("source") or "") == "paper"
+            ):
+                raise HTTPException(
+                    status_code=503,
+                    detail="HyperLiquid credentials unavailable — no live wallet balance",
+                )
             if isinstance(live_account, dict):
                 live_equity_raw = live_account.get("accountValue")
                 try:

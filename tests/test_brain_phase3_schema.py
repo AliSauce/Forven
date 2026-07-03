@@ -1,9 +1,8 @@
-"""Phase 3 schema migration tests — quant_skills_history, skill_outcome_events,
-brain_lessons, brain_lessons_fts.
+"""Phase 3 schema migration tests — quant_skills_history, skill_outcome_events.
 
 Verifies the Phase 3 (P3-T01) DDL applies cleanly on a fresh DB, indexes are
-present, CHECK constraints fire, FTS5 mirror keeps in sync, and the migration
-is idempotent on re-run.
+present, CHECK constraints fire, and the migration is idempotent on re-run.
+(brain_lessons was removed 2026-07-02 — the migration now drops those tables.)
 """
 from __future__ import annotations
 
@@ -122,84 +121,12 @@ def test_skill_outcome_events_idempotent_unique(fresh_db):
         )
 
 
-# ── brain_lessons ───────────────────────────────────────────────────────────
+# ── brain_lessons (removed) ─────────────────────────────────────────────────
 
 
-def test_brain_lessons_table_present(fresh_db):
-    assert _table_exists(fresh_db, "brain_lessons")
-    cols = {row["name"] for row in fresh_db.execute("PRAGMA table_info(brain_lessons)")}
-    assert {
-        "situation_pattern",
-        "lesson_text",
-        "evidence_decisions_json",
-        "confidence",
-        "created_at",
-        "last_validated_at",
-        "created_by",
-    } <= cols
-
-
-def test_brain_lessons_confidence_check_too_high(fresh_db):
-    with pytest.raises(sqlite3.IntegrityError):
-        fresh_db.execute(
-            "INSERT INTO brain_lessons (situation_pattern, lesson_text, confidence) "
-            "VALUES ('p', 'l', 1.5)"
-        )
-
-
-def test_brain_lessons_confidence_check_negative(fresh_db):
-    with pytest.raises(sqlite3.IntegrityError):
-        fresh_db.execute(
-            "INSERT INTO brain_lessons (situation_pattern, lesson_text, confidence) "
-            "VALUES ('p', 'l', -0.1)"
-        )
-
-
-def test_brain_lessons_fts_roundtrip(fresh_db):
-    fresh_db.execute(
-        "INSERT INTO brain_lessons (situation_pattern, lesson_text) "
-        "VALUES ('trend on RANGE_BOUND regime', 'do not promote uniquemarker on choppy')"
-    )
-    fresh_db.commit()
-    rows = fresh_db.execute(
-        "SELECT rowid FROM brain_lessons_fts WHERE brain_lessons_fts MATCH 'uniquemarker'"
-    ).fetchall()
-    assert len(rows) == 1
-
-
-def test_brain_lessons_fts_update_reflects(fresh_db):
-    cur = fresh_db.execute(
-        "INSERT INTO brain_lessons (situation_pattern, lesson_text) "
-        "VALUES ('initial pattern', 'firsttoken text')"
-    )
-    rowid = cur.lastrowid
-    fresh_db.execute(
-        "UPDATE brain_lessons SET lesson_text=? WHERE id=?",
-        ("secondtoken text", rowid),
-    )
-    fresh_db.commit()
-    found_old = fresh_db.execute(
-        "SELECT rowid FROM brain_lessons_fts WHERE brain_lessons_fts MATCH 'firsttoken'"
-    ).fetchall()
-    assert len(found_old) == 0
-    found_new = fresh_db.execute(
-        "SELECT rowid FROM brain_lessons_fts WHERE brain_lessons_fts MATCH 'secondtoken'"
-    ).fetchall()
-    assert len(found_new) == 1
-
-
-def test_brain_lessons_fts_delete_unindexes(fresh_db):
-    cur = fresh_db.execute(
-        "INSERT INTO brain_lessons (situation_pattern, lesson_text) "
-        "VALUES ('p', 'aboutomarker disappear')"
-    )
-    rowid = cur.lastrowid
-    fresh_db.execute("DELETE FROM brain_lessons WHERE id=?", (rowid,))
-    fresh_db.commit()
-    rows = fresh_db.execute(
-        "SELECT rowid FROM brain_lessons_fts WHERE brain_lessons_fts MATCH 'aboutomarker'"
-    ).fetchall()
-    assert len(rows) == 0
+def test_brain_lessons_tables_dropped(fresh_db):
+    assert not _table_exists(fresh_db, "brain_lessons")
+    assert not _table_exists(fresh_db, "brain_lessons_fts")
 
 
 # ── meta ────────────────────────────────────────────────────────────────────
@@ -216,5 +143,3 @@ def test_phase3_migration_idempotent(fresh_db):
     forven_db.init_db()
     assert _table_exists(fresh_db, "quant_skills_history")
     assert _table_exists(fresh_db, "skill_outcome_events")
-    assert _table_exists(fresh_db, "brain_lessons")
-    assert _table_exists(fresh_db, "brain_lessons_fts")

@@ -178,14 +178,10 @@ def test_backtest_submit_recovers_type_from_task_audit(forven_db, monkeypatch):
             "trades": [],
         }
 
-    def _fake_store_backtest_result(**_kwargs):
-        return None
-
     import forven.strategies.backtest as bt_mod
-    import forven.vectordb as vectordb_mod
 
     monkeypatch.setattr(bt_mod, "backtest_strategy", _fake_backtest_strategy)
-    monkeypatch.setattr(vectordb_mod, "store_backtest_result", _fake_store_backtest_result)
+    monkeypatch.setattr("forven.quant_skills_extractor.record_backtest_for_learning", lambda **_kwargs: None)
 
     response = post_backtest_submit(
         BacktestSubmitBody(
@@ -235,7 +231,6 @@ def test_backtest_submit_skips_task_audit_lookup_when_strategy_is_already_execut
 
     import forven.api_core as api_core_mod
     import forven.strategies.backtest as bt_mod
-    import forven.vectordb as vectordb_mod
 
     monkeypatch.setattr(
         api_core_mod,
@@ -243,7 +238,7 @@ def test_backtest_submit_skips_task_audit_lookup_when_strategy_is_already_execut
         _unexpected_audit_lookup,
     )
     monkeypatch.setattr(bt_mod, "backtest_strategy", _fake_backtest_strategy)
-    monkeypatch.setattr(vectordb_mod, "store_backtest_result", lambda **_kwargs: None)
+    monkeypatch.setattr("forven.quant_skills_extractor.record_backtest_for_learning", lambda **_kwargs: None)
 
     response = post_backtest_submit(
         BacktestSubmitBody(
@@ -347,10 +342,9 @@ def test_backtest_submit_uses_strategy_leverage_when_request_omits_it(forven_db,
         }
 
     import forven.strategies.backtest as bt_mod
-    import forven.vectordb as vectordb_mod
 
     monkeypatch.setattr(bt_mod, "backtest_strategy", _fake_backtest_strategy)
-    monkeypatch.setattr(vectordb_mod, "store_backtest_result", lambda **_kwargs: None)
+    monkeypatch.setattr("forven.quant_skills_extractor.record_backtest_for_learning", lambda **_kwargs: None)
 
     response = post_backtest_submit(
         BacktestSubmitBody(
@@ -800,10 +794,9 @@ def test_submit_backtest_translates_simple_macd_rule_blob_params(forven_db, monk
         }
 
     import forven.strategies.backtest as bt_mod
-    import forven.vectordb as vectordb_mod
 
     monkeypatch.setattr(bt_mod, "backtest_strategy", _fake_backtest_strategy)
-    monkeypatch.setattr(vectordb_mod, "store_backtest_result", lambda **_kwargs: None)
+    monkeypatch.setattr("forven.quant_skills_extractor.record_backtest_for_learning", lambda **_kwargs: None)
 
     response = post_backtest_submit(
         BacktestSubmitBody(
@@ -850,16 +843,20 @@ def test_backtest_submit_persists_sqlite_before_index(forven_db, monkeypatch):
             "trades": [],
         }
 
+    # The quant-skills learning hook fires after the SQLite persist — count it
+    # as the "index" step (the vector-store index was removed).
     indexed: dict[str, int] = {"count": 0}
 
-    def _fake_store_backtest_result(**_kwargs):
+    def _fake_record_backtest_for_learning(**_kwargs):
         indexed["count"] += 1
 
     import forven.strategies.backtest as bt_mod
-    import forven.vectordb as vectordb_mod
 
     monkeypatch.setattr(bt_mod, "backtest_strategy", _fake_backtest_strategy)
-    monkeypatch.setattr(vectordb_mod, "store_backtest_result", _fake_store_backtest_result)
+    monkeypatch.setattr(
+        "forven.quant_skills_extractor.record_backtest_for_learning",
+        _fake_record_backtest_for_learning,
+    )
 
     response = post_backtest_submit(
         BacktestSubmitBody(
@@ -904,10 +901,9 @@ def test_manual_gauntlet_preserve_result_keeps_zero_trade_history(forven_db, mon
         }
 
     import forven.strategies.backtest as bt_mod
-    import forven.vectordb as vectordb_mod
 
     monkeypatch.setattr(bt_mod, "backtest_strategy", _fake_backtest_strategy)
-    monkeypatch.setattr(vectordb_mod, "store_backtest_result", lambda **_kwargs: None)
+    monkeypatch.setattr("forven.quant_skills_extractor.record_backtest_for_learning", lambda **_kwargs: None)
 
     response = post_backtest_submit(
         BacktestSubmitBody(

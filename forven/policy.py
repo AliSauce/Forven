@@ -1078,6 +1078,120 @@ def _check_validation_freshness(strategy_id: str, required_types: list[str] | No
     return True, "All validation tests are fresh"
 
 
+def _check_engine_artifact_freshness(strategy_id: str, required_types: list[str] | None = None) -> tuple[bool, str]:
+    """Verify the latest validation artifacts were produced by the CURRENT engine.
+
+    A stats-affecting engine change bumps BACKTEST_ENGINE_VERSION; artifacts
+    stamped with an older version describe an engine that no longer exists and
+    must never be compared against fresh numbers. The gauntlet sweep
+    (engine.requeue_stale_engine_artifacts) re-queues the validation suite, so
+    this check self-resolves — its reason code (stale_engine_artifacts) is
+    counter-exempt and never drains to failed_gate. Unstamped (pre-provenance)
+    artifacts are grandfathered as current (see forven/engine_provenance.py).
+    """
+    from forven.engine_provenance import (
+        BACKTEST_ENGINE_VERSION,
+        artifact_engine_version,
+        is_stale_engine_artifact,
+    )
+
+    required = {
+        _canonicalize_gauntlet_verdict_test(rt)
+        for rt in (required_types or [])
+        if str(rt or "").strip()
+    }
+    validation_types = sorted(required) if required else list(_GAUNTLET_VALIDATION_TYPES)
+    stale: list[str] = []
+    with get_db() as conn:
+        for vt in validation_types:
+            row = conn.execute(
+                """SELECT config_json FROM backtest_results
+                   WHERE strategy_id = ?
+                     AND LOWER(TRIM(COALESCE(result_type, 'backtest'))) = ?
+                     AND (deleted_at IS NULL OR TRIM(COALESCE(deleted_at, '')) = '')
+                   ORDER BY datetime(created_at) DESC LIMIT 1""",
+                (strategy_id, vt),
+            ).fetchone()
+            if row and is_stale_engine_artifact(row["config_json"]):
+                stamped = artifact_engine_version(row["config_json"])
+                stale.append(f"{vt} (engine v{stamped})")
+
+    if stale:
+        return (
+            False,
+            f"Validation artifacts predate the current engine version "
+            f"(v{BACKTEST_ENGINE_VERSION}) and are queued for re-validation: {', '.join(stale)}",
+        )
+    return True, "All validation artifacts match the current engine version"
+
+
+_INFLIGHT_RESULT_STATUSES = {"pending", "queued", "running", "started", "submitted"}
+
+
+def _check_validation_in_flight(strategy_id: str, config: dict | None = None) -> tuple[bool, str]:
+    """Block promotion while any robustness test's NEWEST row is still running.
+
+    The verdict extractor rightly skips pending/running rows (they carry no
+    verdict), but that made an in-flight test indistinguishable from a test
+    that never ran — and absent tests are not enforced. S05427 passed the
+    ->paper gate at 21:19:04 while its param_jitter was mid-run; the FAIL
+    (pass_rate 0.0) landed at 21:19:24 and nothing re-checks after promotion.
+    A verdict that is seconds away is pending evidence, not absence — wait
+    for it. Checks ALL validation types (not just required_tests) because
+    ran-but-failed safety checks fire regardless of required membership.
+
+    Age-capped so an orphaned 'running' row (worker crash between the startup
+    cleanups in routers.robustness) cannot deadlock the gate forever.
+    """
+    gate = (config or {}).get("gauntlet", {}) if isinstance(config, dict) else {}
+    try:
+        max_age_minutes = float(gate.get("validation_inflight_max_age_minutes", 60) or 60)
+    except (TypeError, ValueError):
+        max_age_minutes = 60.0
+
+    in_flight: list[str] = []
+    now = datetime.now(timezone.utc)
+    with get_db() as conn:
+        for vt in _GAUNTLET_VALIDATION_TYPES:
+            row = conn.execute(
+                """SELECT metrics_json, config_json, created_at FROM backtest_results
+                   WHERE strategy_id = ?
+                     AND LOWER(TRIM(COALESCE(result_type, 'backtest'))) = ?
+                     AND (deleted_at IS NULL OR TRIM(COALESCE(deleted_at, '')) = '')
+                   ORDER BY datetime(created_at) DESC LIMIT 1""",
+                (strategy_id, vt),
+            ).fetchone()
+            if not row:
+                continue
+            metrics_blob = _parse_json_blob(row["metrics_json"], {})
+            config_blob = _parse_json_blob(row["config_json"], {})
+            if not isinstance(metrics_blob, dict):
+                metrics_blob = {}
+            if not isinstance(config_blob, dict):
+                config_blob = {}
+            status = str(metrics_blob.get("status") or config_blob.get("status") or "").strip().lower()
+            if status not in _INFLIGHT_RESULT_STATUSES:
+                continue
+            created: datetime | None = None
+            try:
+                created = datetime.fromisoformat(str(row["created_at"] or "").strip().replace("Z", "+00:00"))
+                if created.tzinfo is None:
+                    created = created.replace(tzinfo=timezone.utc)
+            except (TypeError, ValueError):
+                created = None
+            if created is not None and (now - created) > timedelta(minutes=max_age_minutes):
+                continue  # orphaned placeholder — treat as absent, like before
+            in_flight.append(vt)
+
+    if in_flight:
+        return (
+            False,
+            f"Validation in flight: {', '.join(in_flight)} still running — "
+            f"promotion deferred until the verdict lands",
+        )
+    return True, "No validation tests in flight"
+
+
 def _check_artifact_rows_exist(strategy_id: str, required_types: list[str]) -> tuple[bool, str]:
     """Verify each required validation has a persisted, passing verdict payload."""
     required = {_canonicalize_gauntlet_verdict_test(rt) for rt in required_types if str(rt or "").strip()}
@@ -1212,7 +1326,7 @@ def check_paper_live_readiness(strategy_id: str) -> dict:
     return {"ready": ready, "steps": steps, "strategy_id": strategy_id}
 
 
-def _check_paper_duration(strategy_id: str) -> tuple[bool, str]:
+def _check_paper_duration(strategy_id: str) -> tuple:
     """Check if strategy has been in paper stage long enough."""
     config = load_pipeline_config()
     gate = config.get("paper_trading", {})
@@ -1228,9 +1342,12 @@ def _check_paper_duration(strategy_id: str) -> tuple[bool, str]:
         if started.tzinfo is None:
             started = started.replace(tzinfo=timezone.utc)
         days = (datetime.now(timezone.utc) - started).days
+        # `extra` carries the raw numbers so the UI can render a progress bar
+        # instead of re-parsing the detail string.
+        extra = {"current": days, "threshold": min_days, "direction": "gte", "unit": "days"}
         if days >= min_days:
-            return True, f"Paper duration: {days}/{min_days} days"
-        return False, f"Insufficient paper duration: {days}/{min_days} days"
+            return True, f"Paper duration: {days}/{min_days} days", extra
+        return False, f"Insufficient paper duration: {days}/{min_days} days", extra
     except Exception:
         return False, "Could not parse stage timestamp"
 
@@ -1247,7 +1364,7 @@ def _check_paper_duration(strategy_id: str) -> tuple[bool, str]:
 _PARITY_PNL_FILTER = " AND json_extract(signal_data, '$.pnl_is_equity_fraction') = 1"
 
 
-def _check_paper_trades(strategy_id: str) -> tuple[bool, str]:
+def _check_paper_trades(strategy_id: str) -> tuple:
     """Check if strategy has enough closed paper trades."""
     config = load_pipeline_config()
     gate = config.get("paper_trading", {})
@@ -1272,12 +1389,13 @@ def _check_paper_trades(strategy_id: str) -> tuple[bool, str]:
             tuple(params),
         ).fetchone()
     total = int(count_row["cnt"] or 0) if count_row else 0
+    extra = {"current": total, "threshold": min_trades, "direction": "gte", "unit": "trades"}
     if total >= min_trades:
-        return True, f"Paper trades: {total}/{min_trades}"
-    return False, f"Insufficient paper trades: {total}/{min_trades}"
+        return True, f"Paper trades: {total}/{min_trades}", extra
+    return False, f"Insufficient paper trades: {total}/{min_trades}", extra
 
 
-def _check_paper_return(strategy_id: str) -> tuple[bool, str]:
+def _check_paper_return(strategy_id: str) -> tuple:
     """Check if strategy has positive paper return."""
     row = _load_strategy_row_for_gate(strategy_id)
     if not row:
@@ -1301,12 +1419,13 @@ def _check_paper_return(strategy_id: str) -> tuple[bool, str]:
     pnls = [float(r["pnl_pct"]) for r in trade_rows if r["pnl_pct"] is not None]
     live = compute_live_metrics(pnls)
     total_return = float(live.get("total_return_pct", 0.0))
+    extra = {"current": round(total_return, 4), "threshold": 0.0, "direction": "gt", "unit": "%"}
     if total_return > 0:
-        return True, f"Paper return: {total_return:.2f}%"
-    return False, f"Paper return not positive: {total_return:.2f}%"
+        return True, f"Paper return: {total_return:.2f}%", extra
+    return False, f"Paper return not positive: {total_return:.2f}%", extra
 
 
-def _check_paper_drawdown(strategy_id: str) -> tuple[bool, str]:
+def _check_paper_drawdown(strategy_id: str) -> tuple:
     """Check if strategy paper drawdown is within limits."""
     config = load_pipeline_config()
     gate = config.get("paper_trading", {})
@@ -1333,9 +1452,15 @@ def _check_paper_drawdown(strategy_id: str) -> tuple[bool, str]:
     pnls = [float(r["pnl_pct"]) for r in trade_rows if r["pnl_pct"] is not None]
     live = compute_live_metrics(pnls)
     max_dd = float(live.get("max_drawdown_pct", 0.0))
+    extra = {
+        "current": round(max_dd * 100, 4),
+        "threshold": round(max_dd_limit * 100, 4),
+        "direction": "lt",
+        "unit": "%",
+    }
     if max_dd < max_dd_limit:
-        return True, f"Paper drawdown: {max_dd*100:.2f}% (limit {max_dd_limit*100:.2f}%)"
-    return False, f"Paper drawdown too high: {max_dd*100:.2f}% (limit {max_dd_limit*100:.2f}%)"
+        return True, f"Paper drawdown: {max_dd*100:.2f}% (limit {max_dd_limit*100:.2f}%)", extra
+    return False, f"Paper drawdown too high: {max_dd*100:.2f}% (limit {max_dd_limit*100:.2f}%)", extra
 
 
 def _load_strategy_row_for_gate(strategy_id: str):
@@ -1719,6 +1844,8 @@ def _validation_row_to_verdict_payload(result_type: str, metrics: dict, config: 
 
 
 def _extract_gauntlet_verdict_payloads(strategy_id: str, row, metrics: dict) -> tuple[dict[str, object], str | None]:
+    from forven.engine_provenance import is_stale_engine_artifact
+
     payloads: dict[str, object] = {}
     fallback_payloads: dict[str, object] = {}
 
@@ -1731,6 +1858,10 @@ def _extract_gauntlet_verdict_payloads(strategy_id: str, row, metrics: dict) -> 
                 fallback_payloads.setdefault(normalized_name, payload)
 
     verdict_blob = _parse_json_blob(row["verdict"], {}) if row and row["verdict"] else {}
+    # A cached strategy verdict blob stamped by a DIFFERENT engine version is
+    # stale evidence in its entirety — never let it backfill test payloads.
+    if is_stale_engine_artifact(verdict_blob):
+        verdict_blob = {}
     stored_tests = verdict_blob.get("tests") if isinstance(verdict_blob, dict) else {}
     if isinstance(stored_tests, dict):
         for test_name, payload in stored_tests.items():
@@ -1753,9 +1884,10 @@ def _extract_gauntlet_verdict_payloads(strategy_id: str, row, metrics: dict) -> 
             (strategy_id,),
         ).fetchall()
 
+    stale_engine_types: set[str] = set()
     for result_row in rows:
         normalized_type = _canonicalize_gauntlet_verdict_test(result_row["result_type"])
-        if normalized_type in payloads:
+        if normalized_type in payloads or normalized_type in stale_engine_types:
             continue
         metrics_blob = _parse_json_blob(result_row["metrics_json"], {})
         config_blob = _parse_json_blob(result_row["config_json"], {})
@@ -1763,6 +1895,16 @@ def _extract_gauntlet_verdict_payloads(strategy_id: str, row, metrics: dict) -> 
             metrics_blob = {}
         if not isinstance(config_blob, dict):
             config_blob = {}
+        # A verdict produced by a DIFFERENT engine version must never be compared
+        # against fresh numbers. It CLAIMS its test type (so an even-older row or
+        # the cached fallback blob cannot sneak in as the verdict) but contributes
+        # no payload: the test reads as MISSING evidence, the gate blocks with the
+        # counter-exempt stale_engine_artifacts code, and the gauntlet sweep
+        # re-queues the run. Unstamped legacy rows are grandfathered (see
+        # forven/engine_provenance.py).
+        if is_stale_engine_artifact(config_blob):
+            stale_engine_types.add(normalized_type)
+            continue
         status = str(metrics_blob.get("status") or config_blob.get("status") or "").strip().lower()
         if status in {"pending", "queued", "running", "started", "submitted"}:
             continue
@@ -1797,6 +1939,8 @@ def _extract_gauntlet_verdict_payloads(strategy_id: str, row, metrics: dict) -> 
         payloads[normalized_type] = payload
 
     for test_name, payload in fallback_payloads.items():
+        if test_name in stale_engine_types:
+            continue  # type is claimed by a stale-engine artifact — no backfill
         existing = payloads.get(test_name)
         if not isinstance(existing, dict) or not isinstance(payload, dict):
             payloads.setdefault(test_name, payload)
@@ -1848,11 +1992,9 @@ def _verdict_payload_failed(payload: object) -> bool:
 
 
 def verify_backtest_persisted(strategy_id: str) -> tuple[bool, str, dict]:
-    """Verify that backtest results exist in SQLite or ChromaDB before allowing lifecycle transitions."""
-    from forven.vectordb import search_backtest_results
+    """Verify that backtest results exist in SQLite before allowing lifecycle transitions."""
     from forven.db import get_db
-    
-    # First check SQLite
+
     with get_db() as conn:
         sqla_result = conn.execute(
             "SELECT result_id, created_at, metrics_json FROM backtest_results WHERE strategy_id = ? ORDER BY created_at DESC LIMIT 1",
@@ -1861,20 +2003,8 @@ def verify_backtest_persisted(strategy_id: str) -> tuple[bool, str, dict]:
 
     if sqla_result and sqla_result["metrics_json"]:
         return True, "Found SQLite backtest results", {"source": "sqlite", "result_id": sqla_result["result_id"]}
-    
-    # Also check ChromaDB
-    # P1-7: search_backtest_results returns list[dict], not raw chroma result.
-    try:
-        chroma_results = search_backtest_results(
-            query=f"strategy_id:{strategy_id}",
-            n_results=1,
-        )
-        if chroma_results and len(chroma_results) > 0:
-            return True, "Found ChromaDB backtest results", {"source": "chromadb"}
-    except Exception as exc:
-        log.warning("ChromaDB backtest verification failed for %s: %s", strategy_id, exc)
-    
-    return False, "No backtest results found in SQLite or ChromaDB", {}
+
+    return False, "No backtest results found in SQLite", {}
 
 
 def verify_backtest_exists_for_stage_transition(strategy_id: str, target_stage: str) -> tuple[bool, str]:
@@ -1906,7 +2036,7 @@ def verify_backtest_exists_for_stage_transition(strategy_id: str, target_stage: 
         except (_json.JSONDecodeError, KeyError):
             pass
 
-    # Fall back to checking the backtest_results table and ChromaDB
+    # Fall back to checking the backtest_results table
     has_data, message, _ = verify_backtest_persisted(strategy_id)
 
     if not has_data:
@@ -2223,6 +2353,18 @@ def _extract_reason_code(reason_text: str) -> str:
     # before the quality-failure matches so they get their own (counter-exempt) codes.
     if "persisted optimization or walk-forward run" in text:
         return "artifacts_pending"
+    # A validation test is mid-run: its verdict is pending, not absent. Blocks
+    # the gate until the result lands (self-resolving within minutes) — never a
+    # merit failure, never feeds the repeated-failure archive counter.
+    if "validation in flight" in text:
+        return "validation_in_flight"
+    # Engine-version staleness: the artifacts were produced by a DIFFERENT
+    # backtest engine (stats-affecting change bumped BACKTEST_ENGINE_VERSION).
+    # They are awaiting automatic re-validation — absence of current evidence,
+    # not evidence of a bad edge. Matched before stale_validation so the more
+    # specific code wins.
+    if "engine version" in text or "stale-engine" in text:
+        return "stale_engine_artifacts"
     if "stale validation tests" in text or "ordering violation" in text:
         return "stale_validation"
     if "zero trades" in text or "produces no signals" in text:
@@ -2293,8 +2435,15 @@ def _load_metrics_snapshot_for_rejection(strategy_id: str) -> dict | None:
 
 def _log_gate_rejection_record(strategy_id: str, gate: str, reason_text: str, config: dict):
     """P0-2/P3-1: Log structured gate rejection with failure taxonomy fields."""
+    from forven.engine_provenance import BACKTEST_ENGINE_VERSION
+
     reason_code = _extract_reason_code(reason_text)
     metrics_snapshot = _load_metrics_snapshot_for_rejection(strategy_id)
+    # Provenance: which engine produced the numbers this rejection judged. Lets
+    # triage distinguish "rejected by the current engine" from "rejected on
+    # since-fixed math" without archaeology.
+    metrics_snapshot = dict(metrics_snapshot or {})
+    metrics_snapshot["engine_version"] = BACKTEST_ENGINE_VERSION
     gate_config = config.get(gate, {})
     resolved_thresholds = {k: v for k, v in gate_config.items() if isinstance(v, (int, float, str, bool))}
 
@@ -2354,7 +2503,12 @@ _REPEATED_FAILURE_THRESHOLD = 5
 _EVIDENCE_ABSENCE_REASON_CODES = {
     "no_metrics_error",
     "artifacts_pending",
+    # A validation test still mid-run at gate time — verdict pending (S05427 race).
+    "validation_in_flight",
     "stale_validation",
+    # Artifacts from a previous BACKTEST_ENGINE_VERSION awaiting automatic
+    # re-validation (engine_provenance) — says nothing about edge quality.
+    "stale_engine_artifacts",
     "missing_evidence",
     # Paper warm-up: not enough forward days/trades accumulated yet (L-21).
     "insufficient_paper_evidence",
@@ -3405,12 +3559,18 @@ def _evaluate_gauntlet_gate(strategy_id: str, config: dict) -> tuple[bool, str]:
             False,
             "Gauntlet requires at least one persisted optimization or walk-forward run before promotion to paper",
         )
+    inflight_ok, inflight_msg = _check_validation_in_flight(strategy_id, config)
+    if not inflight_ok:
+        return False, inflight_msg
     ordering_ok, ordering_msg = _check_artifact_ordering(strategy_id, list(required_tests) if required_tests else None)
     if not ordering_ok:
         return False, ordering_msg
     freshness_ok, freshness_msg = _check_validation_freshness(strategy_id, list(required_tests) if required_tests else None)
     if not freshness_ok:
         return False, freshness_msg
+    engine_ok, engine_msg = _check_engine_artifact_freshness(strategy_id, list(required_tests) if required_tests else None)
+    if not engine_ok:
+        return False, engine_msg
 
     metrics = _load_metrics_blob(row)
     if not metrics:
@@ -3739,6 +3899,13 @@ def _evaluate_paper_gate(strategy_id: str, config: dict) -> tuple[bool, str]:
     row = _load_strategy_row_for_gate(strategy_id)
     if not row:
         return False, "Strategy not found"
+
+    # A robustness re-validation mid-run is pending evidence, not absence — its
+    # verdict may be seconds away and would be enforced by the strict battery
+    # below. Never grade the live-money gate on a partial evidence set.
+    inflight_ok, inflight_msg = _check_validation_in_flight(strategy_id, config)
+    if not inflight_ok:
+        return False, inflight_msg
 
     # STRICT-LIVE robustness battery: the criteria the lean paper gate demoted to
     # advisory (WFA degradation / absolute OOS Sharpe / OOS trade count, Monte-Carlo

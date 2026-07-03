@@ -13,6 +13,22 @@ from forven.control_plane.models import (
 router = APIRouter(tags=["ops"], dependencies=[Depends(require_operator_access)])
 
 
+# Sync `def` on purpose: the harness places real testnet orders and polls the
+# exchange (~30-90s) — it must run in the threadpool, never on the request loop.
+@router.post("/api/ops/testnet-harness/run")
+def run_testnet_harness(asset: str | None = None, notional_usd: float | None = None):
+    from forven.testnet_harness import run_testnet_execution_harness
+
+    return run_testnet_execution_harness(asset=asset, notional_usd=notional_usd)
+
+
+@router.get("/api/ops/testnet-harness/last")
+def get_testnet_harness_last():
+    from forven.testnet_harness import get_last_harness_report
+
+    return get_last_harness_report()
+
+
 @router.post("/api/system/stop")
 def stop_system():
     return control_plane_ops.stop_system()
@@ -116,6 +132,11 @@ def post_kill_switch_reset(body: ConfirmBody):
 @router.post("/api/system/trading/reset")
 def post_trading_halt_reset(body: ConfirmBody):
     return control_plane_ops.post_trading_halt_reset(body)
+
+
+@router.post("/api/risk/equity/rebaseline")
+def post_equity_rebaseline(body: ConfirmBody):
+    return control_plane_ops.post_equity_rebaseline(body)
 
 
 @router.post("/api/kill-switch/toggle")

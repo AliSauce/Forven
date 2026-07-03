@@ -125,7 +125,6 @@ def _patch_core_views(monkeypatch) -> None:
         "_bot_error_log_path",
         lambda: Path.cwd() / ".tmp" / "tests" / "missing-openai-rate-limit.log",
     )
-    monkeypatch.setattr("forven.vectordb._check_chroma_available", lambda: True)
 
 
 def test_collect_backend_soak_report_ok(forven_db, monkeypatch):
@@ -456,26 +455,11 @@ def test_collect_backend_soak_report_includes_queue_previews(forven_db, monkeypa
     assert stale_brain_preview[0]["error"] == "waiting on remote model"
 
 
-def test_collect_backend_soak_report_warns_when_vector_store_degraded(forven_db, monkeypatch):
-    _seed_scheduler_jobs()
-    _seed_agents()
-    _seed_runtime_state()
-    _patch_core_views(monkeypatch)
-    monkeypatch.setattr("forven.vectordb._check_chroma_available", lambda: False)
-
-    report = soak.collect_backend_soak_report()
-
-    vector_store = next(check for check in report["checks"] if check["name"] == "vector_store")
-    assert vector_store["status"] == "warn"
-    assert vector_store["details"]["critical_path"] is False
-
-
 def test_collect_backend_soak_report_includes_operator_actions(forven_db, monkeypatch):
     _seed_scheduler_jobs()
     _seed_agents()
     _seed_runtime_state()
     _patch_core_views(monkeypatch)
-    monkeypatch.setattr("forven.vectordb._check_chroma_available", lambda: True)
 
     kv_set(
         "ops_manual_action_state",

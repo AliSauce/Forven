@@ -95,13 +95,13 @@ def test_get_system_heartbeat_preserves_expected_keys(monkeypatch):
     }
 
 
-def test_get_system_heartbeat_includes_memory_nav_indicator(monkeypatch):
+def test_get_system_heartbeat_nav_indicators_use_frontend_route_keys(monkeypatch):
     monkeypatch.setattr(control_plane_status, "get_dashboard", lambda require_account_connection=False: {"execution_mode": "paper"})
     monkeypatch.setattr(control_plane_status, "get_risk", lambda: {"kill_switch_active": False})
     monkeypatch.setattr(control_plane_status, "get_sentiment", lambda: {"composite": 0.5})
     monkeypatch.setattr(control_plane_status, "get_regime", lambda: {"BTC": {"regime": "trend"}})
     monkeypatch.setattr(control_plane_status, "get_scanner_state", lambda: {"last_scan": "2026-03-06T00:00:00+00:00"})
-    monkeypatch.setattr("forven.api_domains.trading.read_open_trades", lambda verify_exchange=False: [])
+    monkeypatch.setattr("forven.api_domains.trading.read_open_trades", lambda verify_exchange=False: [{"id": "t1"}])
     monkeypatch.setattr("forven.api_domains.tasks.get_agent_tasks", lambda: [])
     monkeypatch.setattr("forven.api_domains.data.get_datasets_stub", lambda remote_skip=False: [])
     monkeypatch.setattr("forven.api_domains.analytics.get_research_feed_metrics_stub", lambda: {"new_count": 0})
@@ -109,15 +109,13 @@ def test_get_system_heartbeat_includes_memory_nav_indicator(monkeypatch):
     monkeypatch.setattr("forven.api_domains.data.get_data_ingestion_runs", lambda limit=25, offset=0, remote_skip=True: [])
     monkeypatch.setattr("forven.api_domains.paper.get_paper_sessions", lambda: [])
     monkeypatch.setattr("forven.db.get_strategies", lambda: [])
-    monkeypatch.setattr("forven.control_plane.approvals.get_approvals_list", lambda status=None: [])
-    monkeypatch.setattr("forven.api_domains.memory.get_memory_nav_indicator", lambda: {
-        "kind": "status",
-        "severity": "success",
-        "label": "CANON",
-        "summary": "2 curated memory items pinned",
-        "count": 2,
-        "seen_key": "memory:canon:2",
-    })
+    monkeypatch.setattr(
+        "forven.control_plane.approvals.get_approvals_list",
+        lambda status=None: [
+            {"id": 11, "approval_type": "strategy_promotion_approval"},
+            {"id": 12, "approval_type": "strategy_dethrone_recommendation"},
+        ],
+    )
     monkeypatch.setattr(
         control_plane_status.core,
         "_load_settings_payload",
@@ -125,15 +123,29 @@ def test_get_system_heartbeat_includes_memory_nav_indicator(monkeypatch):
     )
 
     payload = control_plane_status.get_system_heartbeat()
+    nav = payload["nav_indicators"]
 
-    assert payload["nav_indicators"]["/memory"] == {
-        "kind": "status",
-        "severity": "success",
-        "label": "CANON",
-        "summary": "2 curated memory items pinned",
-        "count": 2,
-        "seen_key": "memory:canon:2",
+    # Keys must be the frontend sidebar hrefs — the client silently drops
+    # indicators for routes it doesn't render (this regressed as /trades + /ops).
+    assert set(nav) == {
+        "/",
+        "/data",
+        "/lab",
+        "/risk",
+        "/trading",
+        "/agents",
+        "/tasks",
+        "/approval",
+        "/diagnostics",
+        "/settings",
     }
+
+    assert nav["/approval"]["kind"] == "count"
+    assert nav["/approval"]["count"] == 2
+    assert nav["/approval"]["severity"] == "warn"
+
+    assert nav["/trading"]["kind"] == "count"
+    assert nav["/trading"]["count"] == 1
 
 
 def test_system_heartbeat_route_sanitizes_nonfinite_values(monkeypatch):

@@ -93,15 +93,29 @@ def test_exception_in_a_thunk_propagates():
         assert "blew up" in str(exc)
 
 
-def test_worker_resolver_defaults_serial_and_hard_caps():
-    # DEFAULT SERIAL: parallelism is opt-in (each worker = a concurrent isolation
-    # subprocess; the added load OOM-restarted the host), so auto resolves to 1.
-    assert _resolve_robustness_workers(0, n_tasks=30) == 1         # auto -> serial
-    assert _resolve_robustness_workers(None, n_tasks=30) == 1      # unset -> serial
+def test_worker_resolver_defaults_serial_under_pytest_and_hard_caps():
+    # Under pytest the unconfigured default is SERIAL so engine/gauntlet tests stay
+    # deterministic; production defaults to the process-wide subprocess budget
+    # (covered below).
+    assert _resolve_robustness_workers(0, n_tasks=30) == 1         # auto -> serial in tests
+    assert _resolve_robustness_workers(None, n_tasks=30) == 1      # unset -> serial in tests
     assert _resolve_robustness_workers("nope", n_tasks=10) == 1    # bad input -> serial, never 0
-    # Opt-in honoured but hard-capped at the ceiling even when configured higher.
+    # Explicit config honoured but hard-capped at the ceiling even when higher.
     assert _resolve_robustness_workers(4, n_tasks=30) == _ROBUSTNESS_RERUN_MAX_WORKERS
     assert _resolve_robustness_workers(999, n_tasks=30) == _ROBUSTNESS_RERUN_MAX_WORKERS
     # Never exceeds the task count.
     assert _resolve_robustness_workers(999, n_tasks=2) == 2
     assert _resolve_robustness_workers(0, n_tasks=1) == 1
+
+
+def test_worker_resolver_production_default_follows_subprocess_budget(monkeypatch):
+    # Outside pytest, the unconfigured default is min(ceiling, process-wide
+    # subprocess budget): parallel reruns are ON but can never stack past the
+    # global memory ceiling in strategies/concurrency.py.
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.setenv("FORVEN_BACKTEST_SUBPROCESS_BUDGET", "2")
+    assert _resolve_robustness_workers(0, n_tasks=30) == 2
+    monkeypatch.setenv("FORVEN_BACKTEST_SUBPROCESS_BUDGET", "8")
+    assert _resolve_robustness_workers(None, n_tasks=30) == _ROBUSTNESS_RERUN_MAX_WORKERS
+    # Explicit 1 still restores the strict serial fast-path.
+    assert _resolve_robustness_workers(1, n_tasks=30) == 1

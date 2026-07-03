@@ -14,7 +14,6 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from forven.api_security import require_operator_access
-from forven import brain_lessons as brain_lessons_mod
 from forven import recall as recall_mod
 from forven.brain_decisions import get_decision
 from forven.brain_memory import (
@@ -142,9 +141,6 @@ def get_overview_endpoint() -> dict[str, Any]:
         decisions_count = int(
             conn.execute("SELECT COUNT(*) AS c FROM brain_decisions").fetchone()["c"]
         )
-        lessons_count = int(
-            conn.execute("SELECT COUNT(*) AS c FROM brain_lessons").fetchone()["c"]
-        )
         recall_count = int(
             conn.execute(
                 "SELECT COUNT(*) AS c FROM agent_tasks WHERE lower(COALESCE(type, '')) = 'recall'"
@@ -197,16 +193,6 @@ def get_overview_endpoint() -> dict[str, Any]:
                 "detail": "Brain activity exists, but no rows have landed in brain_decisions yet.",
             }
         )
-    if lessons_count == 0:
-        attention.append(
-            {
-                "kind": "learning",
-                "severity": "info",
-                "title": "No validated lessons yet",
-                "detail": "The learning loop is not producing curated situation-to-lesson records yet.",
-            }
-        )
-
     return {
         "memory": memory,
         "stats": {
@@ -217,7 +203,6 @@ def get_overview_endpoint() -> dict[str, Any]:
             "blocked_tasks": blocked_count,
             "pending_approvals": pending_approval_count,
             "decisions": decisions_count,
-            "lessons": lessons_count,
             "recalls": recall_count,
         },
         "attention": attention[:12],
@@ -472,100 +457,6 @@ def put_auxiliary_endpoint(body: _AuxiliaryUpdateBody) -> dict[str, Any]:
     next_policy = {**current, "auxiliary": next_aux}
     update_model_routing(next_policy)
     return get_auxiliary_endpoint()
-
-
-# --------------------------------------------------------------------------- #
-# Brain lessons (P3-T08)                                                      #
-# --------------------------------------------------------------------------- #
-
-
-class _LessonCreateBody(BaseModel):
-    situation_pattern: str
-    lesson_text: str
-    evidence_decisions: list[int] = Field(default_factory=list)
-    confidence: float = 0.5
-
-
-class _LessonUpdateBody(BaseModel):
-    situation_pattern: str | None = None
-    lesson_text: str | None = None
-    confidence: float | None = None
-    last_validated_at: str | None = None
-
-
-@router.get("/lessons")
-def list_lessons_endpoint(
-    limit: int = Query(50, ge=1, le=200),
-    min_confidence: float = Query(0.0, ge=0.0, le=1.0),
-) -> dict[str, Any]:
-    """Paginated list of brain lessons. Filter by minimum confidence."""
-    items = brain_lessons_mod.list_lessons(limit=limit, min_confidence=min_confidence)
-    return {"items": items, "count": len(items)}
-
-
-@router.get("/lessons/search")
-def search_lessons_endpoint(
-    q: str = Query(..., description="FTS5 query over situation_pattern + lesson_text"),
-    limit: int = Query(20, ge=1, le=50),
-) -> dict[str, Any]:
-    items = brain_lessons_mod.search_lessons(q, limit=limit)
-    return {"query": q, "items": items, "count": len(items)}
-
-
-@router.post("/lessons")
-def create_lesson_endpoint(body: _LessonCreateBody) -> dict[str, Any]:
-    try:
-        return brain_lessons_mod.create_lesson(
-            situation_pattern=body.situation_pattern,
-            lesson_text=body.lesson_text,
-            evidence_decisions=body.evidence_decisions,
-            confidence=body.confidence,
-            created_by="operator",
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-
-
-@router.get("/lessons/{lesson_id}")
-def get_lesson_endpoint(lesson_id: int) -> dict[str, Any]:
-    row = brain_lessons_mod.get_lesson(lesson_id)
-    if row is None:
-        raise HTTPException(status_code=404, detail=f"lesson {lesson_id} not found")
-    return row
-
-
-@router.put("/lessons/{lesson_id}")
-def update_lesson_endpoint(lesson_id: int, body: _LessonUpdateBody) -> dict[str, Any]:
-    try:
-        row = brain_lessons_mod.update_lesson(
-            lesson_id,
-            situation_pattern=body.situation_pattern,
-            lesson_text=body.lesson_text,
-            confidence=body.confidence,
-            last_validated_at=body.last_validated_at,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    if row is None:
-        raise HTTPException(status_code=404, detail=f"lesson {lesson_id} not found")
-    return row
-
-
-@router.delete("/lessons/{lesson_id}")
-def delete_lesson_endpoint(lesson_id: int) -> dict[str, Any]:
-    ok = brain_lessons_mod.delete_lesson(lesson_id)
-    if not ok:
-        raise HTTPException(status_code=404, detail=f"lesson {lesson_id} not found")
-    return {"ok": True, "lesson_id": lesson_id}
-
-
-@router.post("/lessons/{lesson_id}/validate")
-def validate_lesson_endpoint(lesson_id: int) -> dict[str, Any]:
-    """Stamp `last_validated_at` to now (UTC). Convenience for the Lessons tab."""
-    row = brain_lessons_mod.mark_validated(lesson_id)
-    if row is None:
-        raise HTTPException(status_code=404, detail=f"lesson {lesson_id} not found")
-    return row
 
 
 __all__ = ["router"]

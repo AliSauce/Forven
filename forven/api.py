@@ -44,7 +44,6 @@ from forven.routers.deepdive import router as deepdive_router
 from forven.routers.assistant import router as assistant_router
 from forven.routers.jobs import router as jobs_router
 from forven.routers.legacy import router as legacy_router
-from forven.routers.memory import router as memory_router
 from forven.routers.diagnostics import router as diagnostics_router
 from forven.routers.mcp import router as mcp_router
 from forven.routers.notifications import router as notifications_router
@@ -69,6 +68,7 @@ from forven.routers.robustness import router as robustness_router
 from forven.routers.gauntlet import router as gauntlet_router
 from forven.routers.lab_regime import router as lab_regime_router
 from forven.routers.bot_factory import router as bot_factory_router
+from forven.routers.wallets import router as wallets_router
 from forven.routers.brain import router as brain_router
 from forven.routers.strategy_guard import router as strategy_guard_router
 from forven.routers.skills import router as skills_router
@@ -192,11 +192,6 @@ if sys.platform.startswith("win"):
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     except Exception:
         pass
-    # ChromaDB's Rust/ONNX path can raise a native access violation on Windows
-    # during agent vector recall. Keep API-owned workers from loading it
-    # in-process; vectordb callers degrade to empty recall instead of crashing
-    # uvicorn.
-    os.environ.setdefault("FORVEN_DISABLE_CHROMA_IN_PROCESS", "1")
 
 
 _RUNTIME_LOGGING_CONFIGURED = False
@@ -406,6 +401,15 @@ async def lifespan(_app: FastAPI):
         log.exception("MCP server tool registration failed (continuing without MCP).")
 
     await _on_startup()
+
+    # Event-loop lag watchdog: measures request-loop scheduling drift so GIL/loop
+    # stalls (the WS-drop mechanism) are logged and surfaced in /api/health instead
+    # of showing up only as mysterious client disconnects. Must run on THIS loop.
+    try:
+        from forven.loop_watchdog import run_loop_watchdog
+        _loop_watchdog_task = spawn(run_loop_watchdog(), name="loop-lag-watchdog")
+    except Exception:
+        log.exception("Failed to start event-loop lag watchdog.")
 
     # Start bot heartbeat monitor as background task
     try:
@@ -647,7 +651,6 @@ if not any(isinstance(f, RequestIdLogFilter) for f in _root_logger.filters):
 app.include_router(status_router)
 app.include_router(diagnostics_router)
 app.include_router(notifications_router)
-app.include_router(memory_router)
 app.include_router(hypotheses_router)
 app.include_router(data_gap_router)
 app.include_router(approvals_router)
@@ -687,6 +690,7 @@ app.include_router(gauntlet_router)
 if regime_lab_enabled():
     app.include_router(lab_regime_router)
 app.include_router(bot_factory_router)
+app.include_router(wallets_router)
 app.include_router(brain_router)
 app.include_router(strategy_guard_router)
 app.include_router(skills_router)
