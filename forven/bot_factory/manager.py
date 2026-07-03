@@ -260,9 +260,14 @@ class BotManager:
         }
 
         if os.name == "nt":
+            # CREATE_NO_WINDOW only — never combine with DETACHED_PROCESS:
+            # Windows ignores CREATE_NO_WINDOW when DETACHED_PROCESS is set, so
+            # the child runs console-less and the venv launcher's re-spawned
+            # base interpreter allocates a fresh VISIBLE console (terminal
+            # window pops up on every bot start). With CREATE_NO_WINDOW alone
+            # the child owns a hidden console the grandchild inherits.
             creationflags = (
-                getattr(subprocess, "DETACHED_PROCESS", 0)
-                | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
                 | getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
             )
             popen_kwargs["creationflags"] = creationflags

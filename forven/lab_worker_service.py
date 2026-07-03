@@ -586,7 +586,10 @@ def start_lab_worker_process() -> dict[str, Any]:
         "close_fds": True,
     }
     if os.name == "nt":
-        creationflags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        # CREATE_NO_WINDOW, not DETACHED_PROCESS: a detached child has no
+        # console, so the venv launcher's re-spawned base interpreter allocates
+        # a fresh VISIBLE console window. A hidden console is inherited instead.
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
         popen_kwargs["creationflags"] = creationflags
     else:
         popen_kwargs["start_new_session"] = True
