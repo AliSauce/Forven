@@ -1055,6 +1055,14 @@ def _run_monte_carlo_analysis(body: MonteCarloBody) -> dict:
 
     return {
         "method": "trade_bootstrap",
+        # Interpretation guard (issue #19): this test bootstraps the trades the
+        # baseline ALREADY produced, so a PASS certifies sequencing/tail-risk
+        # stability of that trade set — it is not evidence the edge is real.
+        "scope_note": (
+            "Bootstrap of realized trade returns: tests stability of the trade "
+            "sequence and bounds tail risk. It does not test whether the "
+            "underlying edge is real — walk-forward and regime-split do that."
+        ),
         "original_sharpe": round(original_sharpe, 3),
         "original_return": round(original_return, 2),
         "n_simulations": int(body.n_simulations),

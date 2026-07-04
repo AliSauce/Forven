@@ -995,6 +995,7 @@ export interface MonteCarloRobustnessResult {
 	drawdown_histogram: RobustnessHistogram;
 	sharpe_histogram: RobustnessHistogram;
 	method?: string;
+	scope_note?: string;
 	job_id?: string;
 	persisted_result_id?: string;
 }

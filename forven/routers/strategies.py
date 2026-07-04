@@ -331,6 +331,7 @@ def get_ai_dropzone_context():
             "Derivatives enrichment columns (funding_rate, open_interest, ls_ratio, taker_buy_sell_ratio, ...) join only when collected and may have shallow in-sample history. Guard `if col in df.columns` and probe that in_sample.total_trades > 0 before committing to a flow-based design.",
             "Rare-entry designs starve the gates: you need >= 15 trades total and enough out-of-sample trades for walk-forward folds (~1y window, ~70/30 IS/OOS split).",
             "Transient verdict probes do NOT count toward promotion. Only the persisted robustness endpoints (/api/robustness/*/submit) write the validation artifacts the paper gate reads.",
+            "A Monte Carlo PASS is NOT evidence the edge is real — it bootstraps the realized trades, so it only certifies sequencing/tail-risk stability of that trade set. Never cite it as edge proof when arguing for promotion; edge existence is what walk-forward and regime-split test.",
         ],
         "sessions": {
             "purpose": "A session is a lightweight grouping token. Tag registrations and backtests with session_id to make 'what did I try in iteration #7' queryable.",

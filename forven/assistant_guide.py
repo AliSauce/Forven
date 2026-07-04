@@ -501,7 +501,9 @@ CONCEPTS: dict[str, dict] = {
             "The automated evaluation a strategy must survive before paper: backtest → optimization → "
             "robustness suite (walk-forward, Monte Carlo, parameter jitter, cost stress, regime split) → "
             "verdict. Results are PERSISTED artifacts — the paper gate reads the stored robustness "
-            "verdict, not a fresh opinion."
+            "verdict, not a fresh opinion. Scope note: Monte Carlo bootstraps the realized trades, so it "
+            "tests path/sequencing stability and tail risk — NOT whether the edge is real; that is "
+            "walk-forward's and regime-split's job."
         ),
     },
     "gates": {

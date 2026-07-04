@@ -972,6 +972,12 @@
 			: 'mt-3 border border-red-900 bg-red-500/5 px-3 py-2 text-xs text-red-400';
 	}
 
+	// Scope guard (issue #19): MC bootstraps the baseline's realized trades, so a
+	// PASS certifies path/tail-risk stability of that trade set — not edge existence.
+	// Fallback for stored results persisted before the backend emitted scope_note.
+	const MC_SCOPE_NOTE =
+		'Tests stability of the realized trade sequence and bounds tail risk — it does not test whether the underlying edge is real (walk-forward and regime split do that).';
+
 	// ── Scorecard data ──
 	const suiteTests: Array<{ key: SuiteTestKey; label: string; accent: string }> = [
 		{ key: 'walk_forward', label: 'Walk-Forward', accent: 'violet' },
@@ -1336,7 +1342,7 @@
 		on:click={() => toggleSection('monte_carlo')}
 	>
 		<div class="flex items-center gap-3">
-			<span class="text-[10px] font-bold uppercase tracking-widest text-[#888]">Monte Carlo Simulation</span>
+			<span class="text-[10px] font-bold uppercase tracking-widest text-[#888]" title={MC_SCOPE_NOTE}>Monte Carlo Simulation</span>
 			<span class={`border px-1.5 py-0.5 text-[10px] font-bold ${verdictBadge(scorecardVerdicts['monte_carlo'])}`}>{verdictLabel(scorecardVerdicts['monte_carlo'])}</span>
 			{#if loading.monte_carlo}<span class="animate-pulse text-[10px] text-yellow-400">running...</span>{/if}
 		</div>
@@ -1374,6 +1380,9 @@
 							<span class="border border-[#333] bg-black px-1.5 py-0.5 text-[10px] text-[#888]">{methodLabel(monteCarloResult.method)}</span>
 						{/if}
 						<span class="text-[10px] text-[#555]">{monteCarloResult.n_simulations} sims / {monteCarloResult.n_trades} trades</span>
+					</div>
+					<div class="mb-3 border border-[#1a1a1a] bg-black px-2.5 py-1.5 text-[11px] text-[#666]" data-testid="mc-scope-note">
+						{monteCarloResult.scope_note ?? MC_SCOPE_NOTE}
 					</div>
 					{#if monteCarloResult.verdict_reasons?.length}
 						<div class="mb-3 border border-red-900 bg-red-500/5 px-2.5 py-2 text-[11px] text-red-400" data-testid="mc-verdict-reasons">

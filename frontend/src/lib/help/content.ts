@@ -386,7 +386,7 @@ The process divides history into multiple rolling windows. Each window has a tra
 			'Training period should be 3-5x longer than test period',
 			'Look for consistent performance across ALL folds, not just average',
 			'Run WFA with different window sizes - robust strategies hold up',
-			'Combine with Monte Carlo simulation for even more rigor'
+			'Combine with Monte Carlo for tail-risk context — WFA tests edge existence, MC tests path stability'
 		],
 		examples: [
 			{
@@ -449,6 +449,46 @@ Overfitting is the #1 reason trading strategies fail in production. A 2016 study
 		references: [
 			'Bailey, D.H. et al. (2014). "The Probability of Backtest Overfitting." Journal of Computational Finance.',
 			'López de Prado, M. (2018). "Advances in Financial Machine Learning." Wiley.'
+		]
+	},
+
+	monte_carlo: {
+		id: 'monte_carlo',
+		term: 'Monte Carlo Simulation',
+		shortDescription: 'Bootstrap of realized trade returns measuring path stability and tail risk — not edge existence.',
+		category: 'risk',
+		fullDescription: `Forven's Monte Carlo test resamples the trades from a baseline backtest (bootstrap with replacement) thousands of times, building alternate equity paths from the same trade set in different orders. The distributions of final return and maximum drawdown reveal how much of the backtest's outcome depends on the lucky sequencing of one historical path.
+
+What it tests: given the trades this strategy actually produced, how bad can the drawdown tail get, and how often does a reshuffled path still end profitable? The verdict requires a minimum share of profitable resamples and caps the 95th-percentile drawdown.
+
+What it does NOT test: whether the underlying edge is real. The bootstrap assumes the trade set is valid and only randomizes its ordering — a curve-fitted strategy with a lucky trade set will pass Monte Carlo easily. Edge existence is tested by walk-forward analysis (unseen future data), regime split (does it survive different market conditions), and the deflated Sharpe guard (selection bias). A Monte Carlo PASS means "the trade sequence is stable and ruin risk is bounded", never "the edge is proven".`,
+		interpretations: [
+			{ range: 'Prob profitable ≥ 65%', label: 'Pass floor', color: 'green', description: 'Most reshuffled paths stay profitable — the outcome is not one lucky ordering.' },
+			{ range: 'P95 max DD ≤ 40%', label: 'Tail cap', color: 'green', description: 'Even the bad tail of reshuffled paths keeps drawdown inside the ceiling.' },
+			{ range: 'P95 max DD > 40%', label: 'Tail risk', color: 'red', description: 'A plausible reordering of the same trades breaches the drawdown ceiling.' }
+		],
+		limitations: [
+			'Assumes the baseline trade set is valid — cannot detect an overfit or curve-fitted edge',
+			'Resampling breaks serial correlation between trades (clustered losses may be understated)',
+			'Only randomizes trade ordering, not entry timing against the price series',
+			'Results are conditional on the backtest window; a different window gives a different trade set'
+		],
+		proTips: [
+			'Read a PASS as "path-stable and tail-bounded", not as evidence of edge',
+			'Pair with walk-forward analysis and regime split — those test edge existence',
+			'Watch P95 max drawdown even on a PASS: it is a better sizing guide than the backtest’s single realized drawdown'
+		],
+		examples: [
+			{
+				scenario: '1000 resamples of a 60-trade baseline with +18% total return',
+				calculation: '82% of resampled paths end profitable; P95 max drawdown = 24%',
+				result: 'PASS',
+				interpretation: 'The trade sequence is robust to reordering and tail risk is bounded. Says nothing about whether the entries have predictive power.'
+			}
+		],
+		relatedTerms: ['walk_forward_analysis', 'overfitting', 'max_drawdown'],
+		references: [
+			'Aronson, D. (2006). "Evidence-Based Technical Analysis." Wiley.'
 		]
 	},
 
