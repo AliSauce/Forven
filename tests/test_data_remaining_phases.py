@@ -110,18 +110,20 @@ class TestPerpResolution:
 
 
 # ---------------------------------------------------------------------------
-# Venue OHLC ceiling (Kraken). Kraken's REST OHLC returns at most ~720 candles
-# per request and 400s a since=0 (EGeneral:Invalid arguments). A download must
-# NEVER hard-fail on that: an unservable request is collapsed to the recent
-# window and MERGED (accumulated history is preserved, not truncated). A warning
-# is attached ONLY when the user explicitly picked a start date older than the
-# reachable window — not for the "all available" checkbox or a default limit.
+# Capped venue WITHOUT a trades fallback: an unservable request (all_available,
+# far-past since, big limit) must NEVER hard-fail — it collapses to the recent
+# window and MERGES (accumulation preserved), warning ONLY when the user picked
+# an explicit start older than the reachable window. Tested against a synthetic
+# capped venue since Kraken (the only real capped venue) now uses trades.
 # ---------------------------------------------------------------------------
 
 
 class TestVenueOhlcvCap:
+    CAP_VENUE = "capfake"
+
     @pytest.fixture(autouse=True)
-    def _reset_breakers(self):
+    def _register_capped_venue(self, monkeypatch):
+        monkeypatch.setitem(data_mod._VENUE_OHLCV_MAX_BARS, self.CAP_VENUE, 720)
         with data_mod._candle_breakers_lock:
             data_mod._candle_breakers.clear()
         yield
@@ -129,8 +131,6 @@ class TestVenueOhlcvCap:
             data_mod._candle_breakers.clear()
 
     def _wire(self, monkeypatch, seen: dict):
-        # Kraken returns its recent window; capture the `since` / `start_ms`
-        # each fetch path was actually handed so we can assert it was never 0.
         recent = _bars(_closed_start(30), 10)
 
         def _once(exchange, symbol, timeframe, since, limit):
@@ -150,80 +150,239 @@ class TestVenueOhlcvCap:
         monkeypatch.setattr(data_mod, "get_exchange", lambda ex: object())
         monkeypatch.setattr(data_mod, "_cached_markets", lambda ex: {})
 
-    def test_all_available_kraken_downloads_without_warning(self, lake, monkeypatch):
+    def test_all_available_downloads_without_warning(self, lake, monkeypatch):
         seen: dict = {}
         self._wire(monkeypatch, seen)
-
-        rec = data_mod.fetch_ohlcv_chunked(SYMBOL, TF, exchange_id="kraken", all_available=True)
-
-        # Downloads (never sends the since=0 that Kraken rejects) and, because
-        # "all available" got everything obtainable, does NOT flag a shortfall.
+        rec = data_mod.fetch_ohlcv_chunked(SYMBOL, TF, exchange_id=self.CAP_VENUE, all_available=True)
         assert seen.get("once_called") is True
-        assert seen.get("once_since") is None
-        assert seen.get("range_start") is None  # the since=0 range path is skipped
+        assert seen.get("once_since") is None  # never the since=0 that 400s
         assert not rec.get("capped")
         assert not rec.get("warning")
 
-    def test_all_available_kraken_preserves_accumulated_history(self, lake, monkeypatch):
-        # A dataset already grown past the recent window (via prior accumulation)
-        # must not be truncated to the ~720 window when "all available" re-runs.
-        old = _bars(_closed_start(5000), 4000)  # far older than the recent fetch
-        data_mod.save_parquet(old, SYMBOL, TF, source="kraken")
-        before = len(data_mod.load_parquet(SYMBOL, TF))
-        assert before == 4000
-
+    def test_far_past_since_clamps_and_warns(self, lake, monkeypatch):
         seen: dict = {}
         self._wire(monkeypatch, seen)
-        data_mod.fetch_ohlcv_chunked(SYMBOL, TF, exchange_id="kraken", all_available=True)
-
-        after = len(data_mod.load_parquet(SYMBOL, TF))
-        assert after >= before  # merged forward, nothing dropped
-
-    def test_far_past_since_kraken_clamps_and_warns(self, lake, monkeypatch):
-        seen: dict = {}
-        self._wire(monkeypatch, seen)
-
         old = int(datetime(2021, 1, 1, tzinfo=timezone.utc).timestamp() * 1000)
-        rec = data_mod.fetch_ohlcv_chunked(SYMBOL, TF, exchange_id="kraken", since_ms=old)
-
+        rec = data_mod.fetch_ohlcv_chunked(SYMBOL, TF, exchange_id=self.CAP_VENUE, since_ms=old)
         assert seen.get("once_since") is None  # collapsed to recent-window fetch
         assert rec["capped"] is True
         assert rec.get("warning")
 
-    def test_in_window_since_kraken_not_clamped(self, lake, monkeypatch):
+    def test_in_window_since_not_clamped(self, lake, monkeypatch):
         seen: dict = {}
         self._wire(monkeypatch, seen)
-
         recent_since = int(datetime.now(timezone.utc).timestamp() * 1000) - 50 * 3600 * 1000
-        rec = data_mod.fetch_ohlcv_chunked(SYMBOL, TF, exchange_id="kraken", since_ms=recent_since)
-
-        # A satisfiable request is honoured as-is, no cap flag.
+        rec = data_mod.fetch_ohlcv_chunked(SYMBOL, TF, exchange_id=self.CAP_VENUE, since_ms=recent_since)
         assert seen.get("range_start") == recent_since
-        assert not rec.get("capped")
-        assert not rec.get("warning")
-
-    def test_large_limit_kraken_clamps_without_warning(self, lake, monkeypatch):
-        seen: dict = {}
-        self._wire(monkeypatch, seen)
-
-        # A bar-count request beyond the cap downloads what's available; a
-        # count is not a date selection, so no warning is raised.
-        rec = data_mod.fetch_ohlcv_chunked(SYMBOL, TF, exchange_id="kraken", limit=5000)
-
-        assert seen.get("once_since") is None  # never the crashing since=0
         assert not rec.get("capped")
         assert not rec.get("warning")
 
     def test_binance_all_available_unaffected(self, lake, monkeypatch):
         seen: dict = {}
         self._wire(monkeypatch, seen)
-
         rec = data_mod.fetch_ohlcv_chunked(SYMBOL, TF, exchange_id="binance", all_available=True)
-
-        # Deep-history paging from 0 is preserved for uncapped venues.
-        assert seen.get("range_start") == 0
+        assert seen.get("range_start") == 0  # deep paging from 0 preserved
         assert not rec.get("capped")
         assert not rec.get("warning")
+
+
+# ---------------------------------------------------------------------------
+# Kraken full history via the Trades feed. Deep requests (all_available,
+# far-past since, big limit) reconstruct candles from the uncapped Trades
+# endpoint; recent/small requests keep the fast OHLC path.
+# ---------------------------------------------------------------------------
+
+
+class TestKrakenTradesHistory:
+    @pytest.fixture(autouse=True)
+    def _reset_breakers(self):
+        with data_mod._candle_breakers_lock:
+            data_mod._candle_breakers.clear()
+        yield
+        with data_mod._candle_breakers_lock:
+            data_mod._candle_breakers.clear()
+
+    def _wire(self, monkeypatch, seen: dict, bars=None):
+        recent = bars if bars is not None else _bars(_closed_start(30), 10)
+
+        def _build(exchange, sym, tf, start, end, progress_callback=None, checkpoint=None):
+            seen.setdefault("trades_windows", []).append((start, end))
+            return data_mod._normalize_ohlcv_frame(recent)
+
+        def _range(exchange, sym, tf, start_ms, end_ms, *a, **k):
+            seen["range_start"] = start_ms
+            return data_mod._normalize_ohlcv_frame(recent)
+
+        def _once(exchange, symbol, timeframe, since, limit):
+            seen["once_since"] = since
+            return [
+                [data_mod._to_ms(ts), r.open, r.high, r.low, r.close, r.volume]
+                for ts, r in zip(recent["timestamp"], recent.itertuples(index=False))
+            ]
+
+        monkeypatch.setattr(data_mod, "_build_ohlcv_from_trades", _build)
+        monkeypatch.setattr(data_mod, "_fetch_range", _range)
+        monkeypatch.setattr(data_mod, "_fetch_ohlcv_once", _once)
+        monkeypatch.setattr(data_mod, "get_exchange", lambda ex: object())
+        monkeypatch.setattr(data_mod, "_cached_markets", lambda ex: {})
+
+    def test_all_available_builds_full_history_from_zero(self, lake, monkeypatch):
+        seen: dict = {}
+        self._wire(monkeypatch, seen)
+        rec = data_mod.fetch_ohlcv_chunked(SYMBOL, TF, exchange_id="kraken", all_available=True)
+        wins = seen.get("trades_windows")
+        assert wins and len(wins) == 1 and wins[0][0] == 0  # trades from the start
+        assert "range_start" not in seen  # OHLC deep path not used
+        assert not rec.get("capped") and not rec.get("warning")
+
+    def test_far_past_since_builds_from_trades(self, lake, monkeypatch):
+        seen: dict = {}
+        self._wire(monkeypatch, seen)
+        old = int(datetime(2021, 1, 1, tzinfo=timezone.utc).timestamp() * 1000)
+        rec = data_mod.fetch_ohlcv_chunked(SYMBOL, TF, exchange_id="kraken", since_ms=old)
+        wins = seen.get("trades_windows")
+        assert wins and wins[0][0] == old
+        assert not rec.get("capped") and not rec.get("warning")
+
+    def test_large_limit_builds_from_trades(self, lake, monkeypatch):
+        seen: dict = {}
+        self._wire(monkeypatch, seen)
+        data_mod.fetch_ohlcv_chunked(SYMBOL, TF, exchange_id="kraken", limit=5000)
+        wins = seen.get("trades_windows")
+        assert wins and wins[0][0] < wins[0][1]  # a ~5000-bar window
+
+    def test_recent_since_uses_ohlc_not_trades(self, lake, monkeypatch):
+        seen: dict = {}
+        self._wire(monkeypatch, seen)
+        recent_since = int(datetime.now(timezone.utc).timestamp() * 1000) - 50 * 3600 * 1000
+        data_mod.fetch_ohlcv_chunked(SYMBOL, TF, exchange_id="kraken", since_ms=recent_since)
+        assert "trades_windows" not in seen  # trades not used for a recent window
+        assert seen.get("range_start") == recent_since
+
+    def test_default_small_fetch_uses_ohlc(self, lake, monkeypatch):
+        seen: dict = {}
+        self._wire(monkeypatch, seen)
+        data_mod.fetch_ohlcv_chunked(SYMBOL, TF, exchange_id="kraken", limit=200)
+        assert "trades_windows" not in seen
+        assert seen.get("once_since") is None  # recent-window OHLC, no since=0
+
+    def test_backfill_full_merges_not_tail_append(self, lake, monkeypatch):
+        # A trades backfill spans old→now; with a recent bar already on disk the
+        # tail-append fast-path would drop the older bars — the full merge must run.
+        data_mod.save_parquet(_bars(_closed_start(2), 1), SYMBOL, TF, source="kraken")
+        old_bars = _bars(_closed_start(200), 50)  # all older than the seeded bar
+        seen: dict = {}
+        self._wire(monkeypatch, seen, bars=old_bars)
+        old = int(datetime(2020, 1, 1, tzinfo=timezone.utc).timestamp() * 1000)
+        data_mod.fetch_ohlcv_chunked(SYMBOL, TF, exchange_id="kraken", since_ms=old)
+        after = len(data_mod.load_parquet(SYMBOL, TF))
+        assert after >= 50  # backfilled bars persisted, not dropped
+
+
+class TestTradesOhlcvBuild:
+    def test_aggregates_trades_into_bars(self, monkeypatch):
+        base = int(datetime(2021, 1, 1, tzinfo=timezone.utc).timestamp() * 1000)  # hour-aligned
+        H = 3_600_000
+        trades = [
+            {"timestamp": base + 0, "price": 100, "amount": 1},
+            {"timestamp": base + 60_000, "price": 110, "amount": 2},
+            {"timestamp": base + 120_000, "price": 90, "amount": 1},
+            {"timestamp": base + H, "price": 200, "amount": 5},
+            {"timestamp": base + H + 60_000, "price": 190, "amount": 1},
+        ]
+        calls = {"n": 0}
+
+        def _fake(exchange, symbol, since, limit):
+            calls["n"] += 1
+            return trades if calls["n"] == 1 else []
+
+        monkeypatch.setattr(data_mod, "_fetch_trades_once", _fake)
+        df = data_mod._build_ohlcv_from_trades(object(), "BTC/USDT", "1h", base, base + 2 * H)
+        assert len(df) == 2
+        h0 = df.iloc[0]
+        assert (h0["open"], h0["high"], h0["low"], h0["close"], h0["volume"]) == (100, 110, 90, 90, 4)
+        h1 = df.iloc[1]
+        assert (h1["open"], h1["close"], h1["volume"]) == (200, 190, 6)
+
+    def test_paginates_until_partial_page(self, monkeypatch):
+        base = int(datetime(2021, 1, 1, tzinfo=timezone.utc).timestamp() * 1000)
+        H = 3_600_000
+        page1 = [{"timestamp": base + i, "price": 100 + i, "amount": 1} for i in range(data_mod.TRADES_PAGE_LIMIT)]
+        page2 = [{"timestamp": base + H + i, "price": 200, "amount": 2} for i in range(3)]
+        calls = {"n": 0}
+
+        def _fake(exchange, symbol, since, limit):
+            calls["n"] += 1
+            return {1: page1, 2: page2}.get(calls["n"], [])
+
+        monkeypatch.setattr(data_mod, "_fetch_trades_once", _fake)
+        df = data_mod._build_ohlcv_from_trades(object(), "BTC/USDT", "1h", base, base + 5 * H)
+        assert calls["n"] == 2  # full page → continue; partial page → stop
+        assert len(df) == 2
+
+    def test_drops_trades_past_end_bound(self, monkeypatch):
+        base = int(datetime(2021, 1, 1, tzinfo=timezone.utc).timestamp() * 1000)
+        H = 3_600_000
+        trades = [
+            {"timestamp": base, "price": 100, "amount": 1},
+            {"timestamp": base + H, "price": 200, "amount": 1},
+            {"timestamp": base + 3 * H, "price": 300, "amount": 1},  # past the bound
+        ]
+        monkeypatch.setattr(data_mod, "_fetch_trades_once", lambda e, s, since, limit: trades if since <= base else [])
+        df = data_mod._build_ohlcv_from_trades(object(), "BTC/USDT", "1h", base, base + 2 * H)
+        assert len(df) == 2  # hour-3 trade excluded
+
+
+# ---------------------------------------------------------------------------
+# CSV upload — headerless exchange dumps + epoch timestamps (Kraken OHLCVT).
+# ---------------------------------------------------------------------------
+
+
+class TestCsvUploadFormats:
+    # Raw Kraken OHLCVT export: no header, epoch-SECONDS ts, 7 cols.
+    KRAKEN_RAW = (
+        b"1609459200,29000.1,29100.0,28950.0,29050.5,12.5,340\n"
+        b"1609462800,29050.5,29200.0,29010.0,29180.0,8.3,210\n"
+        b"1609466400,29180.0,29250.0,29100.0,29120.0,5.1,150"
+    )
+
+    def test_headerless_epoch_seconds_upload(self, lake):
+        p = data_mod.preview_csv(self.KRAKEN_RAW)
+        assert p["detected_timestamp_column"] == "timestamp"
+        assert all(p["has_required_columns"].values())
+
+        rec = data_mod.process_csv_upload(self.KRAKEN_RAW, "XBTUSDT_60.csv", "BTC-USDT", "1h")
+        df = data_mod.load_parquet("BTC-USDT", "1h")
+        # Epoch seconds parsed to 2021, NOT 1970.
+        assert str(df["timestamp"].iloc[0]).startswith("2021-01-01")
+        assert float(df["open"].iloc[0]) == 29000.1
+        assert int(rec["row_count"]) == 3
+
+    def test_millisecond_epoch_with_header(self, lake):
+        csv = (
+            b"time,open,high,low,close,volume\n"
+            b"1609459200000,1,2,0.5,1.5,10\n"
+            b"1609462800000,1.5,2.5,1,2,12"
+        )
+        data_mod.process_csv_upload(csv, "x.csv", "ETH-USDT", "1h")
+        df = data_mod.load_parquet("ETH-USDT", "1h")
+        assert str(df["timestamp"].iloc[0]).startswith("2021-01-01")
+
+    def test_iso_string_timestamps_still_work(self, lake):
+        csv = (
+            b"timestamp,open,high,low,close,volume\n"
+            b"2021-01-01T00:00:00Z,1,2,0.5,1.5,10\n"
+            b"2021-01-01T01:00:00Z,1.5,2.5,1,2,12"
+        )
+        data_mod.process_csv_upload(csv, "y.csv", "SOL-USDT", "1h")
+        df = data_mod.load_parquet("SOL-USDT", "1h")
+        assert str(df["timestamp"].iloc[0]).startswith("2021-01-01")
+
+    def test_headerless_unknown_layout_raises_clear_error(self, lake):
+        # 4 numeric columns — not a recognized OHLCV shape.
+        bad = b"1609459200,1,2,3\n1609462800,4,5,6"
+        with pytest.raises(ValueError, match="no header row"):
+            data_mod.process_csv_upload(bad, "bad.csv", "BTC-USDT", "1h")
 
 
 # ---------------------------------------------------------------------------

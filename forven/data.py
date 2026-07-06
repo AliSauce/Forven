@@ -1632,6 +1632,123 @@ def _venue_ohlcv_max_bars(exchange_id: str) -> int | None:
     return _VENUE_OHLCV_MAX_BARS.get(str(exchange_id or "").strip().lower())
 
 
+# Capped venues that ALSO expose a full-history public Trades feed we can
+# aggregate into candles, bypassing the OHLC per-request cap. Kraken's Trades
+# endpoint pages forward through the entire history from `since` (unlike its
+# 720-capped OHLC endpoint), so trade reconstruction is the only way to backfill
+# deep Kraken history.
+_VENUE_TRADES_OHLCV: set[str] = {"kraken"}
+TRADES_PAGE_LIMIT = 1000
+_TRADES_CHECKPOINT_PAGES = 100  # flush finalized bars every ~100k trades
+
+
+def _venue_builds_ohlcv_from_trades(exchange_id: str) -> bool:
+    return str(exchange_id or "").strip().lower() in _VENUE_TRADES_OHLCV
+
+
+def _fetch_trades_once(exchange, symbol: str, since: int | None, limit: int) -> list[dict[str, Any]]:
+    retryable = _retryable_ccxt_errors()
+    last_exc: Exception | None = None
+    for attempt in range(5):
+        try:
+            return exchange.fetch_trades(symbol, since=since, limit=limit)
+        except retryable as exc:  # type: ignore[misc]
+            last_exc = exc
+            time.sleep(min(60, 2 ** attempt))
+        except Exception as exc:
+            last_exc = exc
+            break
+    if last_exc:
+        raise last_exc
+    return []
+
+
+def _bars_dict_to_frame(bars: dict[int, list[float]]) -> pd.DataFrame:
+    if not bars:
+        return _normalize_ohlcv_frame(pd.DataFrame())
+    rows = [
+        {
+            "timestamp": pd.to_datetime(open_ms, unit="ms", utc=True),
+            "open": o, "high": h, "low": l, "close": c, "volume": v,
+        }
+        for open_ms, (o, h, l, c, v) in sorted(bars.items())
+    ]
+    return _normalize_ohlcv_frame(pd.DataFrame(rows))
+
+
+def _build_ohlcv_from_trades(
+    exchange,
+    ccxt_symbol: str,
+    timeframe: str,
+    start_ms: int,
+    end_ms: int,
+    progress_callback=None,
+    checkpoint=None,
+) -> pd.DataFrame:
+    """Reconstruct OHLCV bars from a venue's paginated public Trades feed.
+
+    Kraken's Trades endpoint pages forward through the FULL history from `since`
+    (unlike its 720-capped OHLC endpoint), so aggregating trades into candles is
+    the only way to backfill deep Kraken history. Trades arrive in time order, so
+    aggregation streams into per-bucket accumulators; when a ``checkpoint`` is
+    given, buckets before the currently-forming bar are finalized, flushed to it,
+    and dropped — bounding memory and persisting progress on a multi-hour build.
+    """
+    tf_ms = _timeframe_to_ms(timeframe)
+    cursor = max(0, int(start_ms))
+    bound = int(end_ms)
+    bars: dict[int, list[float]] = {}
+    pages = 0
+
+    while cursor <= bound:
+        batch = _fetch_trades_once(exchange, ccxt_symbol, cursor, TRADES_PAGE_LIMIT)
+        if not batch:
+            break
+        for trade in batch:
+            ts = int(trade.get("timestamp") or 0)
+            if ts <= 0 or ts > bound:
+                continue
+            price = trade.get("price")
+            if price is None:
+                continue
+            price = float(price)
+            amount = float(trade.get("amount") or 0.0)
+            bucket = (ts // tf_ms) * tf_ms
+            acc = bars.get(bucket)
+            if acc is None:
+                bars[bucket] = [price, price, price, price, amount]
+            else:
+                if price > acc[1]:
+                    acc[1] = price
+                if price < acc[2]:
+                    acc[2] = price
+                acc[3] = price
+                acc[4] += amount
+
+        last_ts = int(batch[-1].get("timestamp") or cursor)
+        pages += 1
+        if progress_callback is not None:
+            progress_callback(min(last_ts, bound), bound, len(batch))
+
+        if checkpoint is not None and pages % _TRADES_CHECKPOINT_PAGES == 0:
+            forming = (last_ts // tf_ms) * tf_ms
+            done = {k: v for k, v in bars.items() if k < forming}
+            if done:
+                checkpoint(_bars_dict_to_frame(done))
+                for k in done:
+                    bars.pop(k, None)
+
+        if len(batch) < TRADES_PAGE_LIMIT:
+            break  # partial page => reached the tail of available trades
+        # Trades are returned with ts >= cursor, so last_ts+1 always advances.
+        cursor = last_ts + 1
+        rate_limit = float(getattr(exchange, "rateLimit", 0) or 0)
+        if rate_limit > 0:
+            time.sleep(rate_limit / 1000.0)
+
+    return _bars_dict_to_frame(bars)
+
+
 _ingestion_runs = {}
 _ingestion_runs_lock = threading.Lock()
 
@@ -1768,43 +1885,90 @@ def fetch_ohlcv_chunked(
     # "all available" checkbox and a default/large bar-count are not shortfalls.
     capped_note: str | None = None
     venue_cap = _venue_ohlcv_max_bars(exchange_id)
-    if venue_cap is not None:
+    trades_venue = _venue_builds_ohlcv_from_trades(exchange_id)
+
+    # Trades-venues (Kraken) get FULL history: a deep request is served by
+    # reconstructing candles from the uncapped Trades feed instead of the
+    # 720-capped OHLC endpoint. "Deep" = all_available, an explicit start older
+    # than the OHLC window, or a bar-count beyond the cap. Recent/small requests
+    # still take the fast OHLC path (much cheaper than replaying trades).
+    use_trades = False
+    if trades_venue and venue_cap is not None:
+        reachable_start = now_ms - venue_cap * tf_ms
+        if all_available:
+            use_trades = True
+        elif since_ms is not None and int(since_ms) < reachable_start:
+            use_trades = True
+        elif since_ms is None and limit is not None and int(limit) > venue_cap:
+            use_trades = True
+
+    if venue_cap is not None and not trades_venue:
+        # Capped venue with NO trades fallback: collapse an unservable request to
+        # the recent window (never send the since=0 that 400s) and MERGE, warning
+        # only when the user explicitly picked a start older than the window.
         reachable_start = now_ms - venue_cap * tf_ms
         explicit_since_too_old = (
             not all_available
             and since_ms is not None
             and int(since_ms) < reachable_start
         )
-        # The bar-count `limit` only governs the fetch when neither all_available
-        # nor since_ms is set (that's the branch that reads it) — and only there
-        # can a huge limit on a long timeframe synthesize the crashing since=0.
-        # Guarding on it while since_ms is present would wrongly null a valid
-        # in-window date (limit defaults to 1000 > cap).
         limit_branch_overshoots = (
             not all_available
             and since_ms is None
             and limit is not None
             and int(limit) > venue_cap
         )
-        reaches_back = all_available or explicit_since_too_old or limit_branch_overshoots
-        if reaches_back:
+        if all_available or explicit_since_too_old or limit_branch_overshoots:
             if explicit_since_too_old:
                 capped_note = (
                     f"{exchange_id}'s history API returns at most ~{venue_cap} "
                     f"{timeframe} candles per request, so the earlier part of the "
                     f"requested range wasn't available — the most recent window was "
-                    f"downloaded and merged. Use Binance, OKX or Bybit for deeper history."
+                    f"downloaded and merged."
                 )
-            # Collapse to the recent window Kraken accepts (since=None → its latest
-            # bars), routed through the limit branch (not the since/append
-            # fast-path) so the fetched window MERGES with — never replaces — the
-            # already-accumulated dataset.
             all_available = False
             since_ms = None
             limit = venue_cap
 
+    def _trades_checkpoint(partial: pd.DataFrame) -> None:
+        # Persist finalized bars mid-build so a long full-history run is durable
+        # and its progress is visible in the lake. Runs before the final merge
+        # below acquires the same lock (sequential, no nesting).
+        if partial is None or partial.empty:
+            return
+        cp_lock = _get_dataset_lock(fs_symbol, timeframe)
+        with cp_lock:
+            try:
+                cp_current = load_parquet(fs_symbol, timeframe)
+            except Exception:
+                cp_current = None
+            cp_merged = _drop_unclosed_bars(merge_and_dedup(cp_current, partial), tf_ms, now_ms)
+            if not cp_merged.empty:
+                save_parquet(cp_merged, fs_symbol, timeframe, source=exchange_id)
+
+    def _trades_window(start: int, end: int) -> pd.DataFrame:
+        return _build_ohlcv_from_trades(
+            exchange, ccxt_symbol, timeframe, start, end,
+            progress_callback=progress_callback, checkpoint=_trades_checkpoint,
+        )
+
     try:
-        if all_available:
+        if use_trades:
+            if all_available and snapshot is not None and not snapshot.empty:
+                # Fill only the gaps around what's already accumulated.
+                earliest = _to_ms(snapshot["timestamp"].iloc[0])
+                latest = _to_ms(snapshot["timestamp"].iloc[-1])
+                if latest + tf_ms <= end_ms_to_use:
+                    fetched_blocks.append(_trades_window(latest + tf_ms, end_ms_to_use))
+                if earliest - tf_ms > 0:
+                    fetched_blocks.append(_trades_window(0, earliest - tf_ms))
+            elif all_available:
+                fetched_blocks.append(_trades_window(0, end_ms_to_use))
+            elif since_ms is not None:
+                fetched_blocks.append(_trades_window(int(since_ms), end_ms_to_use))
+            else:  # bar-count beyond the cap
+                fetched_blocks.append(_trades_window(now_ms - int(limit) * tf_ms, end_ms_to_use))
+        elif all_available:
             if snapshot is not None and not snapshot.empty:
                 earliest = _to_ms(snapshot["timestamp"].iloc[0])
                 latest = _to_ms(snapshot["timestamp"].iloc[-1])
@@ -1846,7 +2010,10 @@ def fetch_ohlcv_chunked(
         # the full merge path on first-time fetch, overlap (possible
         # restatement — the revision log must see the prior values), or any
         # bounds problem.
-        if since_ms is not None and fetched.empty and (
+        # A trades-built deep backfill spans old→now and MUST take the full merge
+        # path — the tail-append fast-path below would keep only strictly-newer
+        # bars and silently drop everything it backfilled.
+        if since_ms is not None and not use_trades and fetched.empty and (
             parquet_path(fs_symbol, timeframe).exists() or tail_path(fs_symbol, timeframe).exists()
         ):
             # Incremental fetch found nothing new: do NOT pay a full
@@ -1856,7 +2023,7 @@ def fetch_ohlcv_chunked(
             record["bars_new"] = 0
             return record
 
-        if since_ms is not None and not fetched.empty:
+        if since_ms is not None and not use_trades and not fetched.empty:
             appended = _append_bars_locked(fs_symbol, timeframe, fetched, source=exchange_id)
             if appended is not None:
                 record = _footer_dataset_record(fs_symbol, timeframe, exchange_id)
@@ -2509,6 +2676,77 @@ def _decode_csv_content(content: bytes) -> str:
     return content.decode("utf-8", errors="ignore")
 
 
+def _cell_is_numeric(value: Any) -> bool:
+    text = str(value).strip().replace(",", "")
+    if not text:
+        return False
+    try:
+        float(text)
+        return True
+    except ValueError:
+        return False
+
+
+# Positional layouts for headerless exchange dumps (no column names). Keyed by
+# column count. Kraken's downloadable OHLCVT export is the 7-column shape
+# (timestamp, O, H, L, C, volume, trades); some variants insert a vwap column
+# (8). Only the OHLCV columns are consumed downstream; extras are ignored.
+_HEADERLESS_OHLCV_LAYOUTS: dict[int, list[str]] = {
+    6: ["timestamp", "open", "high", "low", "close", "volume"],
+    7: ["timestamp", "open", "high", "low", "close", "volume", "trades"],
+    8: ["timestamp", "open", "high", "low", "close", "vwap", "volume", "trades"],
+}
+
+
+def _read_uploaded_csv(text: str) -> pd.DataFrame:
+    """Parse an uploaded CSV, transparently handling headerless exchange dumps.
+
+    A file whose first row is entirely numeric (e.g. Kraken's OHLCVT export) has
+    no header — pandas would otherwise consume that first data row as column
+    names. We detect that and re-read positionally, assigning canonical OHLCV
+    names by column count so the normal mapping/parse path just works.
+    """
+    frame = pd.read_csv(io.StringIO(text))
+    frame.columns = [str(c).strip() for c in frame.columns]
+    if frame.columns.size and all(_cell_is_numeric(c) for c in frame.columns):
+        frame = pd.read_csv(io.StringIO(text), header=None)
+        ncols = int(frame.shape[1])
+        layout = _HEADERLESS_OHLCV_LAYOUTS.get(ncols)
+        if layout is None:
+            raise ValueError(
+                f"CSV has no header row and an unrecognized {ncols}-column layout. "
+                f"Add a header line such as 'timestamp,open,high,low,close,volume'."
+            )
+        frame.columns = layout
+    return frame
+
+
+def _parse_timestamp_series(series: pd.Series, date_format: str | None = None) -> pd.Series:
+    """Timestamps → tz-aware UTC, auto-detecting epoch (s/ms/us/ns) columns.
+
+    Exchange dumps ship raw epoch integers (Kraken uses seconds); parsing those
+    as datetime strings silently yields 1970. When an explicit ``date_format`` is
+    given we honour it; otherwise a mostly-numeric column is treated as epoch and
+    the unit is inferred from magnitude, and anything else is parsed as a datetime
+    string.
+    """
+    if date_format:
+        return pd.to_datetime(series, format=date_format, utc=True, errors="coerce")
+    numeric = pd.to_numeric(series, errors="coerce")
+    if len(numeric) and numeric.notna().mean() >= 0.9:
+        magnitude = float(numeric.dropna().abs().median() or 0.0)
+        if magnitude >= 1e17:
+            unit = "ns"
+        elif magnitude >= 1e14:
+            unit = "us"
+        elif magnitude >= 1e11:
+            unit = "ms"
+        else:
+            unit = "s"
+        return pd.to_datetime(numeric, unit=unit, utc=True, errors="coerce")
+    return pd.to_datetime(series, utc=True, errors="coerce")
+
+
 def _suggest_csv_mapping(columns: list[str]) -> tuple[str | None, dict[str, str], dict[str, bool]]:
     lower_map = {c.lower(): c for c in columns}
     timestamp_candidates = ["timestamp", "time", "datetime", "date", "ts"]
@@ -2531,7 +2769,7 @@ def _suggest_csv_mapping(columns: list[str]) -> tuple[str | None, dict[str, str]
 
 def preview_csv(content: bytes) -> dict[str, Any]:
     text = _decode_csv_content(content)
-    frame = pd.read_csv(io.StringIO(text))
+    frame = _read_uploaded_csv(text)
     columns = [str(c) for c in list(frame.columns)]
     ts_col, mapping, required = _suggest_csv_mapping(columns)
     sample = frame.head(5).where(pd.notnull(frame.head(5)), None).to_dict("records")
@@ -2554,8 +2792,7 @@ def process_csv_upload(
     date_format: str | None = None,
 ) -> dict[str, Any]:
     text = _decode_csv_content(content)
-    frame = pd.read_csv(io.StringIO(text))
-    frame.columns = [str(c).strip() for c in frame.columns]
+    frame = _read_uploaded_csv(text)
 
     inferred_ts, mapping, required = _suggest_csv_mapping(list(frame.columns))
     timestamp_column = ts_col or inferred_ts
@@ -2566,12 +2803,7 @@ def process_csv_upload(
         raise ValueError(f"CSV missing required OHLCV columns: {', '.join(missing)}")
 
     ohlcv = pd.DataFrame()
-    ohlcv["timestamp"] = pd.to_datetime(
-        frame[timestamp_column],
-        format=(date_format or None),
-        utc=True,
-        errors="coerce",
-    )
+    ohlcv["timestamp"] = _parse_timestamp_series(frame[timestamp_column], date_format)
     for col in ("open", "high", "low", "close", "volume"):
         ohlcv[col] = pd.to_numeric(frame[mapping[col]], errors="coerce")
     ohlcv = _normalize_ohlcv_frame(ohlcv)
