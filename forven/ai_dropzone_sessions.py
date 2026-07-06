@@ -100,6 +100,22 @@ def create_session(
     out = _row_to_dict(row)
     out["strategy_count"] = 0
     out["run_count"] = 0
+    # Surface the connect on the Integrations nav badge: the activity-log line
+    # is classified to the `mcp_session_opened` WS event ("session ... opened"
+    # + source `integrations` — keep the wording in sync with
+    # api_core._classify_activity_log_event). Best-effort telemetry only.
+    try:
+        from forven.db import log_activity
+
+        log_activity(
+            "info",
+            "integrations",
+            f"AI Drop Zone session {session_id} opened"
+            + (f" by {clean_actor}" if clean_actor else ""),
+            {"session_id": session_id, "actor": clean_actor, "label": clean_label},
+        )
+    except Exception:
+        pass
     return out
 
 

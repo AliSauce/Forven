@@ -1870,6 +1870,28 @@ def transition_stage(
                         wf_cancelled,
                         strategy_id,
                     )
+                # GO-LIVE-1 hygiene: a terminal strategy must not stay live-armed.
+                # Its go-live notional ceiling is dormant live PERMISSION — revoke
+                # it here so archive/reject always disarms. Same-conn KV surgery
+                # (no nested get_db inside this write txn); the daily maintenance
+                # reaper (revoke_dead_strategy_ceilings) is the backstop.
+                from forven.exchange.risk import _LIVE_CEILINGS_KV_KEY
+
+                kv_row = conn.execute(
+                    "SELECT value FROM kv WHERE key = ?", (_LIVE_CEILINGS_KV_KEY,)
+                ).fetchone()
+                if kv_row and kv_row["value"]:
+                    ceilings = json.loads(kv_row["value"])
+                    if isinstance(ceilings, dict) and strategy_id in ceilings:
+                        ceilings.pop(strategy_id, None)
+                        conn.execute(
+                            "INSERT OR REPLACE INTO kv (key, value, updated_at) VALUES (?, ?, ?)",
+                            (_LIVE_CEILINGS_KV_KEY, json.dumps(ceilings), now),
+                        )
+                        log.info(
+                            "Revoked live notional ceiling for terminal strategy %s",
+                            strategy_id,
+                        )
             except Exception:
                 log.warning(
                     "Failed to cancel gauntlet workflow(s) for terminal strategy %s",

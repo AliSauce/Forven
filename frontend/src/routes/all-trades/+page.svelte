@@ -3,6 +3,7 @@
 	import type { ForvenTrade, ForvenTradesPage, ForvenTradesStats, ForvenTradesQuery } from '$lib/api';
 	import { forvenLivePrices } from '$lib/stores/forvenWebSocket';
 	import { toNumber, liveUnrealizedUsd } from '$lib/utils/livePnl';
+	import RegimeChip from '$lib/components/regime/RegimeChip.svelte';
 
 	export let data: { initialPage: ForvenTradesPage | null; initialStats: ForvenTradesStats | null };
 
@@ -33,6 +34,7 @@
 		{ key: 'asset', label: 'Asset', sortKey: 'asset' },
 		{ key: 'side', label: 'Side' },
 		{ key: 'type', label: 'Type' },
+		{ key: 'regime', label: 'Regime', align: 'center' },
 		{ key: 'status', label: 'Status', sortKey: 'status' },
 		{ key: 'entry', label: 'Entry', align: 'right' },
 		{ key: 'exit', label: 'Exit', align: 'right' },
@@ -242,6 +244,17 @@
 		const n = notional(t);
 		if (pnl === null || n === null || n === 0) return null;
 		return (pnl / n) * 100;
+	}
+
+	/** Display label for a trade's execution engine. `paper` and `paper_challenger`
+	 * are the same simulated stage on two engines (kernel vs legacy per-bar); the
+	 * blotter shows one "Paper" label so the distinction isn't user-facing. */
+	function execTypeLabel(execType: string | null | undefined): string {
+		const v = String(execType ?? '').toLowerCase();
+		if (v === 'paper' || v === 'paper_challenger') return 'Paper';
+		if (v === 'live') return 'Live';
+		if (v === 'simulation') return 'Sim';
+		return execType ? String(execType) : '—';
 	}
 
 	/** Strategy link target: hop into that strategy's trade on the Paper Trades or
@@ -530,9 +543,17 @@
 									class="px-1.5 py-0.5 border text-[10px] uppercase {String(trade.execution_type ?? '').toLowerCase() === 'live'
 										? 'border-red-900 text-red-400'
 										: 'border-[#333] text-[#888]'}"
+									title={String(trade.execution_type ?? '—')}
 								>
-									{String(trade.execution_type ?? '—')}
+									{execTypeLabel(trade.execution_type)}
 								</span>
+							</td>
+							<td class="px-2 py-1.5 text-center">
+								{#if trade.regime}
+									<RegimeChip mini regime={trade.regime} />
+								{:else}
+									<span class="text-[#444]">—</span>
+								{/if}
 							</td>
 							<td class="px-2 py-1.5 font-bold {statusClass(trade.status)}">{String(trade.status ?? '—').toUpperCase()}</td>
 							<td class="px-2 py-1.5 text-right text-[#888]">{fmtPrice(toNumber(trade.fill_entry_price) ?? toNumber(trade.entry_price))}</td>

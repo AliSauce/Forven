@@ -272,176 +272,9 @@ def _build_nav_indicator(
     }
 
 
-def _build_data_nav_indicator(ingestion_runs: list[dict[str, Any]]) -> dict[str, object]:
-    active_runs = [
-        run
-        for run in ingestion_runs
-        if _normalize_status(run.get("status")) in {"pending", "running"}
-    ]
-    failed_runs = [
-        run
-        for run in ingestion_runs
-        if _normalize_status(run.get("status")) == "failed"
-    ]
-
-    if failed_runs:
-        return _build_nav_indicator(
-            "count",
-            "danger",
-            str(len(failed_runs)),
-            f"{_pluralize(len(failed_runs), 'ingestion failure')} recent",
-            _build_seen_key("data-failed", [run.get("id") or run.get("symbol") for run in failed_runs[:8]]),
-            count=len(failed_runs),
-        )
-    if active_runs:
-        return _build_nav_indicator(
-            "activity",
-            "info",
-            str(len(active_runs)),
-            f"{_pluralize(len(active_runs), 'ingestion run')} active",
-            _build_seen_key("data-active", [run.get("id") or run.get("symbol") for run in active_runs[:8]]),
-            count=len(active_runs),
-        )
-    return _empty_nav_indicator()
 
 
-def _build_lab_nav_indicator(scans: list[dict[str, Any]]) -> dict[str, object]:
-    active_scans = [
-        scan
-        for scan in scans
-        if _normalize_status(scan.get("status")) in {"queued", "running"}
-    ]
-    failed_scans = [
-        scan
-        for scan in scans
-        if _normalize_status(scan.get("status")) in {"cancelled", "error", "failed"}
-    ]
 
-    if failed_scans:
-        return _build_nav_indicator(
-            "count",
-            "danger",
-            str(len(failed_scans)),
-            f"{_pluralize(len(failed_scans), 'scan')} failed",
-            _build_seen_key("lab-failed", [scan.get("id") for scan in failed_scans[:8]]),
-            count=len(failed_scans),
-        )
-    if active_scans:
-        return _build_nav_indicator(
-            "activity",
-            "info",
-            str(len(active_scans)),
-            f"{_pluralize(len(active_scans), 'scan')} running",
-            _build_seen_key("lab-active", [scan.get("id") for scan in active_scans[:8]]),
-            count=len(active_scans),
-        )
-    return _empty_nav_indicator()
-
-
-def _build_agents_nav_indicator(agent_tasks: list[dict[str, Any]]) -> dict[str, object]:
-    agent_only = [
-        task
-        for task in agent_tasks
-        if _normalize_status(task.get("source")) == "agent_tasks"
-    ]
-    failed = [task for task in agent_only if _normalize_status(task.get("status")) == "failed"]
-    blocked = [
-        task
-        for task in agent_only
-        if _normalize_status(task.get("status")) in {"blocked", "rejected"}
-    ]
-    running_agents = sorted(
-        {
-            str(task.get("agent_id") or "").strip()
-            for task in agent_only
-            if _normalize_status(task.get("status")) == "running" and str(task.get("agent_id") or "").strip()
-        }
-    )
-
-    if failed:
-        return _build_nav_indicator(
-            "count",
-            "danger",
-            str(len(failed)),
-            f"{_pluralize(len(failed), 'agent failure', 'agent failures')}",
-            _build_seen_key("agents-failed", [task.get("id") for task in failed[:8]]),
-            count=len(failed),
-        )
-    if blocked:
-        return _build_nav_indicator(
-            "count",
-            "warn",
-            str(len(blocked)),
-            f"{_pluralize(len(blocked), 'agent task')} blocked",
-            _build_seen_key("agents-blocked", [task.get("id") for task in blocked[:8]]),
-            count=len(blocked),
-        )
-    if running_agents:
-        return _build_nav_indicator(
-            "activity",
-            "success",
-            str(len(running_agents)),
-            f"{_pluralize(len(running_agents), 'agent')} active",
-            _build_seen_key("agents-running", running_agents[:8]),
-            count=len(running_agents),
-        )
-    return _empty_nav_indicator()
-
-
-def _build_tasks_nav_indicator(agent_tasks: list[dict[str, Any]]) -> dict[str, object]:
-    blocked = [
-        task
-        for task in agent_tasks
-        if _normalize_status(task.get("status")) in {"blocked", "rejected"}
-    ]
-    pending = [
-        task
-        for task in agent_tasks
-        if _normalize_status(task.get("status")) == "pending"
-    ]
-
-    if blocked:
-        return _build_nav_indicator(
-            "count",
-            "warn",
-            str(len(blocked)),
-            f"{_pluralize(len(blocked), 'blocked task')}",
-            _build_seen_key("tasks-blocked", [task.get("id") for task in blocked[:8]]),
-            count=len(blocked),
-        )
-    if pending:
-        return _build_nav_indicator(
-            "count",
-            "info",
-            str(len(pending)),
-            f"{_pluralize(len(pending), 'pending task')}",
-            _build_seen_key("tasks-pending", [task.get("id") for task in pending[:8]]),
-            count=len(pending),
-        )
-    return _empty_nav_indicator()
-
-
-def _build_risk_nav_indicator(risk: dict[str, Any]) -> dict[str, object]:
-    kill_switch_active = bool(risk.get("kill_switch_active"))
-    daily_loss_halt = bool(risk.get("daily_loss_halt"))
-
-    if not kill_switch_active and not daily_loss_halt:
-        return _empty_nav_indicator()
-
-    if kill_switch_active and daily_loss_halt:
-        summary = "Kill switch and daily loss halt active"
-    elif kill_switch_active:
-        summary = "Kill switch active"
-    else:
-        summary = "Daily loss halt active"
-
-    return _build_nav_indicator(
-        "status",
-        "danger",
-        "HALT",
-        summary,
-        _build_seen_key("risk", [kill_switch_active, daily_loss_halt]),
-    )
 
 
 def _build_live_trades_nav_indicator(open_trades: list[dict[str, Any]]) -> dict[str, object]:
@@ -521,87 +354,52 @@ def _build_ops_nav_indicator(notification_summary: dict[str, Any]) -> dict[str, 
     )
 
 
-def _build_settings_nav_indicator(auth_providers: dict[str, Any]) -> dict[str, object]:
-    providers = auth_providers.get("providers") if isinstance(auth_providers, dict) else []
-    if not isinstance(providers, list):
+
+def _build_bot_factory_nav_indicator() -> dict[str, object]:
+    """Running Bot Factory bots. Own tiny query — the heartbeat doesn't
+    otherwise carry bot state."""
+    try:
+        with get_db() as conn:
+            rows = conn.execute(
+                "SELECT bot_id FROM bot_status WHERE LOWER(COALESCE(status, '')) = 'running'"
+            ).fetchall()
+    except Exception:
         return _empty_nav_indicator()
-
-    active = []
-    expired = []
-    expiring = []
-    for provider in providers:
-        if not isinstance(provider, dict):
-            continue
-        normalized_status = _normalize_status(provider.get("status"))
-        configured = bool(provider.get("configured"))
-        if configured and normalized_status == "active":
-            active.append(provider)
-        elif configured and normalized_status == "expired":
-            expired.append(provider)
-        elif configured and normalized_status == "expiring_soon":
-            expiring.append(provider)
-
-    if expired:
-        return _build_nav_indicator(
-            "count",
-            "danger",
-            str(len(expired)),
-            f"{_pluralize(len(expired), 'provider')} expired",
-            _build_seen_key(
-                "settings-expired",
-                [f"{item.get('provider')}:{item.get('status')}" for item in expired[:8]],
-            ),
-            count=len(expired),
-        )
-    if not active and not expiring:
-        return _build_nav_indicator(
-            "status",
-            "danger",
-            "AUTH",
-            "No AI provider configured",
-            "settings:no-provider",
-        )
-    if expiring:
-        return _build_nav_indicator(
-            "status",
-            "warn",
-            "AUTH",
-            f"{_pluralize(len(expiring), 'provider')} expires soon",
-            _build_seen_key(
-                "settings-expiring",
-                [f"{item.get('provider')}:{item.get('status')}" for item in expiring[:8]],
-            ),
-            count=len(expiring),
-        )
-    return _empty_nav_indicator()
+    if not rows:
+        return _empty_nav_indicator()
+    bot_ids = [str(r["bot_id"]) for r in rows]
+    return _build_nav_indicator(
+        "count",
+        "info",
+        str(len(bot_ids)),
+        f"{_pluralize(len(bot_ids), 'bot')} running",
+        _build_seen_key("bot-factory", bot_ids[:8]),
+        count=len(bot_ids),
+    )
 
 
 def _build_nav_indicators(
     *,
-    risk: dict[str, Any],
     open_trades: list[dict[str, Any]],
-    agent_tasks: list[dict[str, Any]],
-    scans: list[dict[str, Any]],
     paper_sessions: list[dict[str, Any]],
     approvals: list[dict[str, Any]],
-    ingestion_runs: list[dict[str, Any]],
     notification_summary: dict[str, Any],
-    auth_providers: dict[str, Any],
 ) -> dict[str, object]:
     # Keys MUST match the frontend nav hrefs (navMetrics.NAV_HREFS) — the client
     # drops indicators for routes it doesn't know about.
+    #
+    # Deliberate allowlist (operator decision 2026-07-06): badges exist ONLY for
+    # approvals, diagnostics, integrations (event pulse), live/paper trades, and
+    # the Bot Factory. Everything else (data ingestion, agents, tasks, lab churn,
+    # settings auth) was ambient noise — those facts live on their own pages, and
+    # safety-critical states (kill switch, halts) surface via toasts + the risk
+    # page banner, not nav numerology.
     return {
-        "/": _empty_nav_indicator(),
-        "/data": _build_data_nav_indicator(ingestion_runs),
-        "/lab": _build_lab_nav_indicator(scans),
-        "/risk": _build_risk_nav_indicator(risk),
         "/paper-trades": _build_paper_trades_nav_indicator(paper_sessions),
         "/live-trades": _build_live_trades_nav_indicator(open_trades),
-        "/agents": _build_agents_nav_indicator(agent_tasks),
-        "/tasks": _build_tasks_nav_indicator(agent_tasks),
+        "/bot-factory": _build_bot_factory_nav_indicator(),
         "/approval": _build_approvals_nav_indicator(approvals),
         "/diagnostics": _build_ops_nav_indicator(notification_summary),
-        "/settings": _build_settings_nav_indicator(auth_providers),
     }
 
 
@@ -668,19 +466,9 @@ def get_system_heartbeat() -> dict[str, object]:
     approvals = get_approvals_list(status="pending_approval")
 
     try:
-        ingestion_runs = data_domain.get_cached_data_ingestion_runs(limit=25, offset=0)
-    except Exception:
-        ingestion_runs = []
-
-    try:
         notification_summary = get_actionable_notification_summary(limit=50)
     except Exception:
         notification_summary = {"count": 0, "highest_severity": "info", "notification_ids": []}
-
-    try:
-        auth_providers = core._get_auth_providers_compat()
-    except Exception:
-        auth_providers = {"providers": []}
 
     settings_payload = core._load_settings_payload()
 
@@ -699,15 +487,10 @@ def get_system_heartbeat() -> dict[str, object]:
         "strategies": strategies,
         "approvals": approvals,
         "nav_indicators": _build_nav_indicators(
-            risk=risk if isinstance(risk, dict) else {},
             open_trades=open_trades if isinstance(open_trades, list) else [],
-            agent_tasks=[item for item in agent_tasks if isinstance(item, dict)] if isinstance(agent_tasks, list) else [],
-            scans=[item for item in scans if isinstance(item, dict)] if isinstance(scans, list) else [],
             paper_sessions=[item for item in paper_sessions if isinstance(item, dict)] if isinstance(paper_sessions, list) else [],
             approvals=[item for item in approvals if isinstance(item, dict)] if isinstance(approvals, list) else [],
-            ingestion_runs=[item for item in ingestion_runs if isinstance(item, dict)] if isinstance(ingestion_runs, list) else [],
             notification_summary=notification_summary if isinstance(notification_summary, dict) else {},
-            auth_providers=auth_providers if isinstance(auth_providers, dict) else {"providers": []},
         ),
     }
 
@@ -900,6 +683,7 @@ def get_regime() -> dict[str, object]:
     for asset in ("BTC", "ETH", "SOL"):
         cached = kv_get(f"regime:{asset}")
         if cached:
+            since = kv_get(f"regime:{asset}:since") or {}
             result[asset] = {
                 "regime": cached.get("regime", "UNKNOWN"),
                 "confidence": cached.get("confidence", 0),
@@ -907,13 +691,96 @@ def get_regime() -> dict[str, object]:
                 "ema_alignment": cached.get("ema_alignment", "mixed"),
                 "atr_ratio": cached.get("atr_ratio", 1.0),
                 "rsi": cached.get("rsi", 50),
+                # epoch seconds of the last label flip (None = not yet observed)
+                "since": since.get("since") if since.get("regime") == cached.get("regime") else None,
                 "asset": asset,
             }
     return result
 
 
+_REGIME_SERIES_CACHE: dict[tuple, tuple[float, dict]] = {}
+_REGIME_SERIES_TTL_SECONDS = 300
+_REGIME_SERIES_WARMUP_BARS = 260
+
+
+def get_regime_series(symbol: str, timeframe: str = "1h", bars: int = 1000) -> dict[str, object]:
+    """Per-bar causal regime labels over the tail of a lake series, compressed
+    to contiguous segments for chart shading. Same classifier the backtest,
+    the trade stamp, and the entry gate use — no hindsight labels."""
+    import time as _time
+
+    import pandas as pd
+
+    from forven.data import load_parquet
+
+    bars = max(100, min(int(bars or 1000), 3000))
+    timeframe = str(timeframe or "1h").strip() or "1h"
+    raw = str(symbol or "").strip().upper().replace("/", "-")
+    if not raw:
+        return {"symbol": symbol, "timeframe": timeframe, "segments": []}
+
+    cache_key = (raw, timeframe, bars)
+    cached = _REGIME_SERIES_CACHE.get(cache_key)
+    if cached and _time.time() - cached[0] < _REGIME_SERIES_TTL_SECONDS:
+        return cached[1]
+
+    candidates = [raw] if "-" in raw else [raw + sfx for sfx in ("-USDT", "-USD", "-USDC")] + [raw]
+    df = None
+    resolved = None
+    for candidate in candidates:
+        loaded = load_parquet(candidate, timeframe)
+        if loaded is not None and not loaded.empty and "timestamp" in loaded.columns:
+            df = loaded
+            resolved = candidate
+            break
+    if df is None:
+        payload = {"symbol": raw, "timeframe": timeframe, "segments": []}
+        _REGIME_SERIES_CACHE[cache_key] = (_time.time(), payload)
+        return payload
+
+    # Extra warmup bars so the returned window carries real labels, not the
+    # classifier's <210-bar RANGE_BOUND default.
+    tail = df.tail(bars + _REGIME_SERIES_WARMUP_BARS).reset_index(drop=True)
+    from forven.strategies.backtest import _precompute_regimes
+
+    labels = _precompute_regimes(tail)
+    ts = pd.to_datetime(tail["timestamp"], utc=True, errors="coerce")
+    start = max(0, len(tail) - bars)
+
+    segments: list[dict] = []
+    for i in range(start, len(tail)):
+        stamp = ts.iloc[i]
+        if pd.isna(stamp):
+            continue
+        label = str(labels.iloc[i])
+        if segments and segments[-1]["regime"] == label:
+            segments[-1]["end"] = stamp.isoformat()
+        else:
+            segments.append({"start": stamp.isoformat(), "end": stamp.isoformat(), "regime": label})
+
+    payload = {
+        "symbol": raw,
+        "series": resolved,
+        "timeframe": timeframe,
+        "bars": min(bars, max(0, len(tail) - start)),
+        "segments": segments,
+    }
+    _REGIME_SERIES_CACHE[cache_key] = (_time.time(), payload)
+    return payload
+
+
 def get_risk() -> dict[str, object]:
-    return get_risk_status()
+    payload = get_risk_status()
+    # REGIME-GATE-1: the Risk page's gate panel rides on the existing risk
+    # payload (one fetch). Best-effort — gate telemetry must never take down
+    # the risk endpoint.
+    try:
+        from forven.regime_gate import get_regime_gate_status
+
+        payload["regime_gate"] = get_regime_gate_status()
+    except Exception:
+        payload["regime_gate"] = None
+    return payload
 
 
 def get_sentiment() -> dict[str, object]:

@@ -19,6 +19,7 @@
 	import { getHypothesisCounts } from '$lib/api/hypotheses';
 	import { goto } from '$app/navigation';
 
+	import AllocatorPanel from '$lib/components/hypotheses/AllocatorPanel.svelte';
 	import HypothesisTable from '$lib/components/hypotheses/HypothesisTable.svelte';
 	import ManualIngestDialog from '$lib/components/hypotheses/ManualIngestDialog.svelte';
 	import UrlIngestDialog from '$lib/components/hypotheses/UrlIngestDialog.svelte';
@@ -121,8 +122,10 @@
 		}
 	}
 
+	let allocatorPanel: AllocatorPanel | null = null;
+
 	async function refreshAll(): Promise<void> {
-		await Promise.all([loadSurface(), loadCounts()]);
+		await Promise.all([loadSurface(), loadCounts(), allocatorPanel?.refresh() ?? Promise.resolve()]);
 	}
 
 	function setBanner(tone: BannerTone, message: string): void {
@@ -372,7 +375,6 @@
 	$: activeTaskCount = hypotheses.filter((h) => h.active_task).length;
 	$: dataGapCount = hypotheses.reduce((total, h) => total + (h.open_data_gap_count ?? 0), 0);
 	$: provenCount = hypotheses.filter((h) => h.status === 'proven').length;
-	$: productiveCount = hypotheses.filter((h) => h.quality === 'productive').length;
 	$: researchCount = hypotheses.filter((h) => h.status === 'researching' || h.quality === 'researching').length;
 	$: filtersActive = Boolean(laneFilter || statusFilter || qualityFilter || searchQuery || includeDisproven || sortOption !== 'updated_desc');
 	$: visibleStart = totalRows === 0 ? 0 : (currentPage - 1) * pageSize + 1;
@@ -393,18 +395,26 @@
 
 <div class="h-full flex flex-col overflow-hidden bg-[#050505] text-gray-100">
 	<div class="flex-shrink-0 border-b border-[#222] bg-black">
-		<div class="px-4 py-4">
-			<div class="flex flex-col gap-4 xl:flex-row xl:items-start xl:justify-between">
-				<div class="min-w-0">
-					<div class="inline-flex items-center gap-2 border border-[#333] px-3 py-1 text-[10px] font-bold uppercase tracking-widest text-[#888]">
-						<span class="h-1.5 w-1.5 rounded-full bg-[#555]"></span>
-						Research / Crucibles
-					</div>
-					<h1 class="mt-3 text-lg font-bold uppercase tracking-widest text-white">The Crucible</h1>
-					<p class="mt-1 text-[11px] text-[#666]">An idea under test — proposed by an agent, harvested from a source, or seeded by you — that the Forge proves or disproves.</p>
-					<p class="mt-1 max-w-3xl text-xs leading-relaxed text-[#666]">
-						Operate the thesis inventory from intake to verdict. Prioritize active research, repair weak entries, and keep data blockers visible before they stall the strategy pipeline.
-					</p>
+		<div class="px-4 py-2.5">
+			<div class="flex flex-wrap items-center justify-between gap-2">
+				<div class="flex min-w-0 flex-wrap items-baseline gap-x-3 gap-y-1">
+					<h1
+						class="text-base font-bold uppercase tracking-widest text-white"
+						title="An idea under test — proposed by an agent, harvested from a source, or seeded by you — that the Forge proves or disproves. Operate the thesis inventory from intake to verdict."
+					>
+						The Crucible
+					</h1>
+					<!-- Inventory health, one line (was four viewport-eating tiles). -->
+					<span
+						class="text-[11px] {filtersActive ? 'text-yellow-400/80' : 'text-[#666]'}"
+						title={filtersActive ? 'Reflects the filtered view, not the full bucket' : 'Inventory health in the current view'}
+					>
+						{totalRows} {viewLabels[managerView].toLowerCase()}
+						· queue {researchCount} ({activeTaskCount} task{activeTaskCount === 1 ? '' : 's'})
+						· <span class={placeholderCount > 0 ? 'text-yellow-400' : ''}>{placeholderCount} placeholder{placeholderCount === 1 ? '' : 's'}</span>
+						· <span class={dataGapCount > 0 ? 'text-yellow-400' : ''}>{dataGapCount} data gap{dataGapCount === 1 ? '' : 's'}</span>
+						· {provenCount} proven{filtersActive ? ' · filtered' : ''}
+					</span>
 				</div>
 				<div class="flex flex-wrap items-center gap-2">
 					<a
@@ -454,42 +464,6 @@
 				</div>
 			</div>
 
-			<div class="mt-4 flex items-center gap-2 text-[10px] uppercase tracking-[0.18em] text-[#555]">
-				<span>Inventory health</span>
-				<span class="normal-case tracking-normal {filtersActive ? 'text-yellow-400/80' : 'text-[#555]'}">
-					— {filtersActive ? 'reflects the filtered view, not the full bucket' : 'in current view'}
-				</span>
-			</div>
-			<div class="mt-2 grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
-				<div class="border border-[#222] bg-[#090909] px-3 py-2">
-					<div class="text-[10px] uppercase tracking-[0.2em] text-[#555]">Inventory</div>
-					<div class="mt-1 flex items-end justify-between gap-3">
-						<div class="text-2xl font-semibold text-white">{totalRows}</div>
-						<div class="text-right text-[10px] uppercase tracking-[0.16em] text-[#555]">{viewLabels[managerView]}</div>
-					</div>
-				</div>
-				<div class="border border-[#222] bg-[#090909] px-3 py-2">
-					<div class="text-[10px] uppercase tracking-[0.2em] text-[#555]">Research Queue</div>
-					<div class="mt-1 flex items-end justify-between gap-3">
-						<div class="text-2xl font-semibold text-white">{researchCount}</div>
-						<div class="text-right text-[10px] uppercase tracking-[0.16em] text-[#555]">{activeTaskCount} active task{activeTaskCount === 1 ? '' : 's'}</div>
-					</div>
-				</div>
-				<div class="border border-[#222] bg-[#090909] px-3 py-2">
-					<div class="text-[10px] uppercase tracking-[0.2em] text-[#555]">Quality</div>
-					<div class="mt-1 flex items-end justify-between gap-3">
-						<div class="text-2xl font-semibold {placeholderCount > 0 ? 'text-yellow-400' : 'text-emerald-200'}">{placeholderCount}</div>
-						<div class="text-right text-[10px] uppercase tracking-[0.16em] text-[#555]">placeholder{placeholderCount === 1 ? '' : 's'} / {productiveCount} productive</div>
-					</div>
-				</div>
-				<div class="border border-[#222] bg-[#090909] px-3 py-2">
-					<div class="text-[10px] uppercase tracking-[0.2em] text-[#555]">Blockers / Wins</div>
-					<div class="mt-1 flex items-end justify-between gap-3">
-						<div class="text-2xl font-semibold {dataGapCount > 0 ? 'text-yellow-400' : 'text-white'}">{dataGapCount}</div>
-						<div class="text-right text-[10px] uppercase tracking-[0.16em] text-[#555]">{provenCount} proven</div>
-					</div>
-				</div>
-			</div>
 		</div>
 
 		<div class="border-t border-[#181818] bg-[#070707] px-4 pt-3">
@@ -500,10 +474,10 @@
 						role="tab"
 						aria-selected={managerView === view}
 						on:click={() => setManagerView(view)}
-						class="border-b-2 px-4 py-2 text-left transition-colors {managerView === view ? 'border-white text-white' : 'border-transparent text-[#555] hover:text-white'}"
+						title={viewDescriptions[view]}
+						class="border-b-2 px-4 py-1.5 text-left transition-colors {managerView === view ? 'border-white text-white' : 'border-transparent text-[#555] hover:text-white'}"
 					>
 						<span class="block text-xs font-medium">{viewLabels[view]} <span class="text-[#555]">({counts[view]})</span></span>
-						<span class="mt-0.5 block text-[10px] text-[#555]">{viewDescriptions[view]}</span>
 					</button>
 				{/each}
 			</div>
@@ -614,6 +588,12 @@
 
 	{#if error}
 		<div class="mx-4 mt-3 bg-red-900/20 border border-red-800 text-red-300 text-xs px-3 py-2">{error}</div>
+	{/if}
+
+	{#if managerView === 'active'}
+		<div class="mx-4 mt-3">
+			<AllocatorPanel bind:this={allocatorPanel} />
+		</div>
 	{/if}
 
 	{#if placeholderCount > 0 && managerView === 'active'}

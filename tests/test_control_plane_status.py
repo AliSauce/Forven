@@ -127,18 +127,15 @@ def test_get_system_heartbeat_nav_indicators_use_frontend_route_keys(monkeypatch
 
     # Keys must be the frontend sidebar hrefs — the client silently drops
     # indicators for routes it doesn't render (this regressed as /trades + /ops).
+    # Badge ALLOWLIST (operator decision 2026-07-06): only approvals,
+    # diagnostics, trades, and bot factory carry state badges; /integrations
+    # badges via event pulse only. Mirrors navMetrics.NAV_BADGE_HREFS.
     assert set(nav) == {
-        "/",
-        "/data",
-        "/lab",
-        "/risk",
         "/paper-trades",
         "/live-trades",
-        "/agents",
-        "/tasks",
+        "/bot-factory",
         "/approval",
         "/diagnostics",
-        "/settings",
     }
 
     assert nav["/approval"]["kind"] == "count"

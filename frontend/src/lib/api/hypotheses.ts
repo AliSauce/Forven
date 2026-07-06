@@ -553,3 +553,47 @@ export interface DiscoverCruciblesResponse {
 export async function discoverCrucibles(): Promise<DiscoverCruciblesResponse> {
 	return fetchApi('/hypotheses/discover', { method: 'POST' });
 }
+
+// ── CRUX-1 allocator overview (Crucibles page intelligence strip) ───────────
+
+export interface AllocatorCrucible {
+	id: string;
+	display_id: string;
+	title: string;
+	status: string;
+	protection_status?: string;
+	created_at?: string | null;
+	family: string;
+	family_survival_rate: number;
+	score: number;
+	children: number;
+	gauntlet_children: number;
+	survivor_children: number;
+	positive_children: number;
+	fruitless_develops: number;
+	failed_develops: number;
+	last_child_created_at?: string | null;
+}
+
+export interface AllocatorOverview {
+	budget: { daily: number; used_today: number; remaining: number };
+	short_quota: {
+		target_pct: number;
+		develops_today: number;
+		directed_today: number;
+		share_pct: number;
+	};
+	data_quota?: {
+		target_pct: number;
+		develops_today: number;
+		directed_today: number;
+		share_pct: number;
+	};
+	pool: { total: number; by_status: Record<string, number>; with_survivors: number };
+	crucibles: AllocatorCrucible[];
+}
+
+/** CRUX-1: daily develop budget, short quota, and the value-ranked active pool. */
+export async function getAllocatorOverview(limit = 40): Promise<AllocatorOverview> {
+	return fetchApi(`/hypotheses/allocator?limit=${limit}`);
+}

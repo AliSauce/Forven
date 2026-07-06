@@ -332,6 +332,95 @@ def set_regime_min_confidence(value: float):
     save_config(cfg)
 
 
+_REGIME_GATE_MODES = ("off", "observe", "enforce")
+
+
+def get_regime_gate_mode() -> str:
+    """Direction×regime entry gate mode: 'off' | 'observe' | 'enforce'.
+
+    'observe' (the shipping default) shadow-logs would-have-blocked entries to
+    the regime_gate_events ledger without touching execution; 'enforce' vetoes
+    them; 'off' disables blocking AND logging. Evidence base: the 2026-07-05
+    graveyard audit — longs opened while the causal classifier read TREND_DOWN
+    or HIGH_VOL were the dominant loss engine, robust to dedup/equal-weighting
+    and to strictly-prior-bar labels.
+    """
+    for raw in (
+        os.environ.get("FORVEN_REGIME_GATE_MODE"),
+        _settings_blob_value("regime_gate_mode"),
+        load_config().get("regime_gate_mode"),
+    ):
+        if raw is not None:
+            mode = str(raw).strip().lower()
+            if mode in _REGIME_GATE_MODES:
+                return mode
+            return "observe"
+    return "observe"
+
+
+def _parse_regime_csv(raw: object) -> set[str] | None:
+    from forven.regime import normalize_regime_label
+
+    if raw is None:
+        return None
+    if isinstance(raw, (list, tuple, set)):
+        parts = list(raw)
+    else:
+        parts = str(raw).split(",")
+    resolved = {normalize_regime_label(p) for p in parts}
+    return {r for r in resolved if r}
+
+
+def get_regime_gate_block_long() -> set[str]:
+    """Regimes in which the gate vetoes LONG entries. CSV of regime labels."""
+    for raw in (
+        os.environ.get("FORVEN_REGIME_GATE_BLOCK_LONG"),
+        _settings_blob_value("regime_gate_block_long"),
+    ):
+        parsed = _parse_regime_csv(raw)
+        if parsed is not None:
+            return parsed
+    parsed = _parse_regime_csv(load_config().get("regime_gate_block_long"))
+    if parsed is not None:
+        return parsed
+    return {"TREND_DOWN", "HIGH_VOL"}
+
+
+def get_regime_gate_block_short() -> set[str]:
+    """Regimes in which the gate vetoes SHORT entries. Default: none —
+    the audit found shorts net-positive in every regime bucket."""
+    for raw in (
+        os.environ.get("FORVEN_REGIME_GATE_BLOCK_SHORT"),
+        _settings_blob_value("regime_gate_block_short"),
+    ):
+        parsed = _parse_regime_csv(raw)
+        if parsed is not None:
+            return parsed
+    parsed = _parse_regime_csv(load_config().get("regime_gate_block_short"))
+    if parsed is not None:
+        return parsed
+    return set()
+
+
+def get_regime_gate_min_confidence() -> float:
+    """Live-detector confidence below which a hostile regime call is NOT acted on.
+
+    Only consulted when the cached live detector agrees on the hostile label —
+    the kernel's entry-bar label (the audit's evidence base) carries no
+    confidence and gates on its own. 0.0 makes the gate unconditional.
+    """
+    env_val = os.environ.get("FORVEN_REGIME_GATE_MIN_CONFIDENCE")
+    if env_val is not None:
+        return _clamp(_parse_float(env_val, 0.6), 0.0, 1.0)
+
+    blob_val = _settings_blob_value("regime_gate_min_confidence")
+    if blob_val is not None:
+        return _clamp(_parse_float(blob_val, 0.6), 0.0, 1.0)
+
+    cfg = load_config()
+    return _clamp(_parse_float(cfg.get("regime_gate_min_confidence", 0.6), 0.6), 0.0, 1.0)
+
+
 def get_allow_unknown_regime_strategies() -> bool:
     """Whether unknown strategy types bypass strict regime compatibility checks."""
     env_val = os.environ.get("FORVEN_ALLOW_UNKNOWN_REGIME_STRATEGIES")

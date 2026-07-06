@@ -105,6 +105,12 @@ def test_block_missing_returns_all_defaults() -> None:
         "unstarted_ageout_days": 7,
         "refine_in_flight_budget": 2,
         "disproven_dedup_lookback_days": 30,
+        "novelty_graveyard_scale": pytest.approx(4.0),
+        "novelty_graveyard_min_total": 40,
+        "novelty_graveyard_hard_block": 0,
+        # CRUX-1 allocator knobs.
+        "crucible_daily_develop_budget": 150,
+        "crucible_short_mode_quota_pct": 30,
     }
 
 

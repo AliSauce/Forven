@@ -19,6 +19,7 @@
 	} from '$lib/api';
 	import { createRealtimeRefresh, type RealtimeRefreshController } from '$lib/utils/realtime';
 	import LivePnlTicker from '$lib/components/forven/LivePnlTicker.svelte';
+	import RegimeChip from '$lib/components/regime/RegimeChip.svelte';
 
 	type ModalAction = 'mode-toggle' | 'emergency-halt' | 'trading-reset' | 'system-mode-change' | null;
 	type ExecutionMode = 'paper' | 'live';
@@ -94,9 +95,6 @@
 		return executionMode === 'live' ? 'mainnet' : 'testnet';
 	})();
 	$: daemonStatus = $forvenDashboard ? ($forvenDashboard.daemon_running ? 'ACTIVE' : 'OFFLINE') : 'SYNCING';
-	$: btcRegime = ($forvenRegime as Record<string, Record<string, string>> | null)?.BTC?.regime || '--';
-	$: ethRegime = ($forvenRegime as Record<string, Record<string, string>> | null)?.ETH?.regime || null;
-	$: solRegime = ($forvenRegime as Record<string, Record<string, string>> | null)?.SOL?.regime || null;
 	$: sentimentScore = typeof ($forvenSentiment as Record<string, unknown> | null)?.composite === 'number' ? ($forvenSentiment as Record<string, number>).composite : null;
 	$: tradingAllowed = $forvenDashboard?.trading_allowed ?? true;
 	$: tradingReason = ($forvenDashboard as Record<string, unknown> | null)?.trading_reason as string || 'OK';
@@ -279,11 +277,14 @@
 	<div class="flex min-w-0 flex-1 flex-wrap items-center justify-center gap-2">
 		<LivePnlTicker />
 
-		<span class="px-2 py-1 border border-[#333] text-[#888] whitespace-nowrap">
-			BTC: {btcRegime}
-			{#if ethRegime}<span class="text-[#666] ml-1">| ETH: {ethRegime}</span>{/if}
-			{#if solRegime}<span class="text-[#666] ml-1">| SOL: {solRegime}</span>{/if}
-		</span>
+		{#each ['BTC', 'ETH', 'SOL'] as regimeAsset (regimeAsset)}
+			{#if ($forvenRegime as Record<string, Record<string, unknown>> | null)?.[regimeAsset]}
+				<RegimeChip
+					asset={regimeAsset}
+					regime={($forvenRegime as Record<string, never>)[regimeAsset]}
+				/>
+			{/if}
+		{/each}
 
 		<!-- Execution mode is display-only: Forven supports paper trading +
 		     Hyperliquid testnet only. Live/mainnet is not a supported feature, so

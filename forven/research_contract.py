@@ -115,6 +115,21 @@ _DEFAULT_RESEARCH_SETTINGS: dict[str, Any] = {
         # proposed->researching funnel feeder), carved out so the promotion loop's
         # develop_candidate work can't monopolize every slot and starve the funnel.
         "refine_in_flight_budget": 2,
+        # CRUX-1 (2026-07-06): hard daily cap on develop_candidate dispatches
+        # shared by the crucible planner AND the hypothesis-promotion loop.
+        # In-flight caps bound concurrency, not spend — pre-CRUX the loops
+        # burned ~190 develops/day for ~1 survivor per ~250 develops. Value
+        # ranking decides WHO gets the budget; this bounds HOW MUCH exists.
+        "crucible_daily_develop_budget": 150,
+        # CRUX-1: percent of daily develops stamped with an explicit
+        # short/both trade_mode requirement (graveyard audit: shorts
+        # net-positive in every regime at 9:1 under-generation). 0 disables.
+        "crucible_short_mode_quota_pct": 30,
+        # CRUX-1: percent of daily develops stamped with an orthogonal-data
+        # requirement (primary signal from funding/basis/OI/positioning/IV
+        # instead of price-only indicators — the graveyard's most-mined
+        # field). Independent of the short quota. 0 disables.
+        "crucible_orthogonal_data_quota_pct": 40,
         # Autonomous-mint dedup (2026-06-10 audit B-16). An agent create_hypothesis
         # is rejected when its title duplicates an active crucible or one disproven
         # within this many days — stops the re-mint/re-disprove churn loop. 0
@@ -148,6 +163,9 @@ _HYPOTHESIS_DISCIPLINE_RANGES: dict[str, tuple[int | float, int | float]] = {
     "max_unrefined_active": (1, 500),
     "unstarted_ageout_days": (1, 365),
     "refine_in_flight_budget": (0, 10),
+    "crucible_daily_develop_budget": (1, 2000),
+    "crucible_short_mode_quota_pct": (0, 100),
+    "crucible_orthogonal_data_quota_pct": (0, 100),
     "disproven_dedup_lookback_days": (0, 365),
     "novelty_graveyard_scale": (1.0, 100.0),
     "novelty_graveyard_min_total": (0, 5000),

@@ -42,9 +42,11 @@ from __future__ import annotations
 import json
 
 # The current stats-affecting backtest-engine version. Bump on any change that
-# alters what the engine would compute for the SAME strategy + data, and add a
-# matching ENGINE_VERSION_LOG entry (test-enforced).
-BACKTEST_ENGINE_VERSION = 1
+# alters what the engine would compute for the SAME strategy + data — or on a
+# data-substrate rebuild that invalidates comparisons against prior verdicts
+# (verdicts are only evidence relative to the data they were scored on) — and
+# add a matching ENGINE_VERSION_LOG entry (test-enforced).
+BACKTEST_ENGINE_VERSION = 2
 
 # Append-only changelog: one entry per version, newest last. The unit test
 # asserts the newest entry matches BACKTEST_ENGINE_VERSION so a bump can never
@@ -57,6 +59,17 @@ ENGINE_VERSION_LOG: tuple[dict, ...] = (
             "Provenance baseline. History predating this stamp is grandfathered "
             "as current (operator re-baselined manually after the round-3 engine "
             "fixes); staleness detection starts from here."
+        ),
+    },
+    {
+        "version": 2,
+        "date": "2026-07-06",
+        "summary": (
+            "Combined data re-baseline (edge-data expansion): spot-mix perp "
+            "rebuild (2026-07-02), ~50-symbol deep-history research-universe "
+            "seed, DVOL backfill to 2021-03, and coverage-aware liquidation "
+            "fill (pre-capture bars NaN, not fake zeros). Verdicts scored on "
+            "the pre-rebuild data are stale evidence against the current lake."
         ),
     },
 )

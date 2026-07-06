@@ -128,9 +128,10 @@ function handleKillSwitch(data: Record<string, unknown>): void {
 	// Only the state-diff payload carries the boolean; log-classified
 	// "kill switch" text events don't and are skipped (no double toast).
 	if (typeof data.kill_switch_active !== 'boolean') return;
+	// Toast only — nav badges are allowlisted (navMetrics.NAV_BADGE_HREFS) and
+	// /risk is not on it; the halt also owns a persistent Risk page banner.
 	if (data.kill_switch_active) {
 		addToast('Kill switch activated — trading halted', 'error', '/risk', RISK_TOAST_MS);
-		pulse('/risk', 'danger', 'Kill switch activated');
 	} else {
 		addToast('Kill switch cleared', 'info', '/risk', RISK_TOAST_MS);
 	}
@@ -141,14 +142,12 @@ function handleRiskAlert(data: Record<string, unknown>): void {
 	if (kind === 'daily_loss_halt') {
 		if (data.daily_loss_halt) {
 			addToast('Daily loss halt active — trading paused for today', 'error', '/risk', RISK_TOAST_MS);
-			pulse('/risk', 'danger', 'Daily loss halt active');
 		} else {
 			addToast('Daily loss halt cleared', 'info', '/risk', RISK_TOAST_MS);
 		}
 	} else if (kind === 'drawdown_warning') {
 		const drawdown = Number(data.drawdown_pct ?? 0);
 		addToast(`Drawdown warning: ${(drawdown * 100).toFixed(1)}% from high-water mark`, 'warning', '/risk', RISK_TOAST_MS);
-		pulse('/risk', 'warn', 'Drawdown warning');
 	}
 	// kind === 'kill_switch' is already toasted via kill_switch_activated/cleared.
 }
@@ -178,13 +177,14 @@ function handleEvent(event: Event): void {
 		case 'risk_alert':
 			handleRiskAlert(data);
 			break;
-		case 'strategy_promoted':
-			// Lifecycle churn is frequent under autopilot — badge, don't toast.
-			pulse('/lab', 'success', 'Strategy promoted');
+		case 'mcp_session_opened': {
+			const detailData = data as { actor?: unknown; label?: unknown };
+			const who = String(detailData.actor ?? '').trim();
+			const summary = `MCP session connected${who ? `: ${who}` : ''}`;
+			addToast(summary, 'info', '/integrations', TRADE_TOAST_MS);
+			pulse('/integrations', 'info', summary);
 			break;
-		case 'task_failed':
-			pulse('/tasks', 'danger', 'Task failed');
-			break;
+		}
 	}
 }
 

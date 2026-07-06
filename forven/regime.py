@@ -20,6 +20,10 @@ import pandas as pd
 
 from forven.config import (
     get_allow_unknown_regime_strategies,
+    get_regime_gate_block_long,
+    get_regime_gate_block_short,
+    get_regime_gate_min_confidence,
+    get_regime_gate_mode,
     get_regime_min_confidence,
     get_strict_regime_gating,
 )
@@ -515,6 +519,89 @@ def is_strategy_allowed(
     return regime in compatible
 
 
+def check_direction_regime_gate(
+    strategy_id: str,
+    asset: str,
+    direction: str,
+    *,
+    ref_price: float | None = None,
+    kernel_regime: object = None,
+    execution_type: str = "paper",
+) -> tuple[bool, str]:
+    """Direction×regime entry gate. Returns (ok, reason).
+
+    Evidence base (2026-07-05 graveyard audit, adversarially verified): longs
+    opened while the causal classifier already read TREND_DOWN or HIGH_VOL were
+    the dominant loss engine (-0.20%/-0.28% per trade), robust to dedup,
+    equal-weighting, and strictly-prior-bar labels; shorts were net-positive in
+    every regime. Default rules encode exactly that: block longs in
+    TREND_DOWN/HIGH_VOL, never restrict shorts.
+
+    Label precedence: the kernel's entry-bar label (same causal classifier the
+    backtest used, on the trading timeframe, available for every asset) wins;
+    the cached live detector is the fallback. Unknown regime -> allow: a
+    filter must never veto blind.
+
+    Confidence: the kernel label carries none and gates on its own (matching
+    the audit, which did not condition on confidence). When the cached live
+    detector AGREES on the hostile label, its confidence below
+    regime_gate_min_confidence downgrades the call to allow — confidence can
+    only rescue, never extend, a veto.
+
+    Modes: 'off' -> always (True, "") with no logging. 'observe' -> allow but
+    shadow-log a would_block ledger event. 'enforce' -> veto with a blocked
+    event. Allows are never logged. Manual opens never reach the call sites.
+    """
+    mode = get_regime_gate_mode()
+    if mode == "off":
+        return True, ""
+
+    direction_norm = "short" if str(direction or "").strip().lower() in ("short", "sell") else "long"
+
+    cached = peek_cached_regime(asset)
+    label = normalize_regime_label(kernel_regime)
+    confidence: float | None = None
+    if label is None and cached is not None:
+        label = normalize_regime_label(cached.regime)
+        confidence = float(cached.confidence)
+    elif label is not None and cached is not None and normalize_regime_label(cached.regime) == label:
+        confidence = float(cached.confidence)
+    if label is None:
+        return True, ""
+
+    blocked_regimes = (
+        get_regime_gate_block_short() if direction_norm == "short" else get_regime_gate_block_long()
+    )
+    if label not in blocked_regimes:
+        return True, ""
+
+    min_confidence = get_regime_gate_min_confidence()
+    if confidence is not None and confidence < min_confidence:
+        return True, ""
+
+    decision = "blocked" if mode == "enforce" else "would_block"
+    try:
+        from forven.db import log_regime_gate_event
+
+        log_regime_gate_event(
+            strategy_id, asset, direction_norm, label, confidence,
+            mode, decision, execution_type=execution_type, ref_price=ref_price,
+        )
+    except Exception:
+        pass
+
+    conf_note = f" conf={confidence:.0%}" if confidence is not None else ""
+    if mode == "enforce":
+        reason = f"regime gate: {direction_norm} entries blocked in {label}{conf_note}"
+        log.info("[%s] %s %s — %s", strategy_id, asset, execution_type, reason)
+        return False, reason
+    log.debug(
+        "[%s] regime gate observe: would block %s %s in %s%s",
+        strategy_id, asset, direction_norm, label, conf_note,
+    )
+    return True, ""
+
+
 def format_regime_summary() -> str:
     """Format regime summary for context display."""
     lines = ["# MARKET REGIME"]
@@ -550,11 +637,23 @@ def _get_cached_regime(asset: str) -> RegimeState | None:
 
 
 def _cache_regime(asset: str, state: RegimeState):
-    """Cache regime state in KV store."""
+    """Cache regime state in KV store.
+
+    Also tracks regime flips: when the label changes vs the previous cached
+    state, ``regime:{asset}:since`` records the flip time and prior label so
+    the UI can answer "TREND_DOWN for how long?".
+    """
     try:
+        previous = kv_get(_cache_key(asset))
         data = asdict(state)
         data["cached_at"] = time.time()
         kv_set(_cache_key(asset), data)
+        prev_label = previous.get("regime") if isinstance(previous, dict) else None
+        if state.regime and prev_label != state.regime:
+            kv_set(
+                f"{_cache_key(asset)}:since",
+                {"regime": state.regime, "since": time.time(), "previous": prev_label},
+            )
     except Exception as e:
         log.debug("Failed to cache regime for %s: %s", asset, e)
 

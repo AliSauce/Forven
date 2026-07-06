@@ -1863,6 +1863,18 @@ async def async_market_loop(state: dict):
     except Exception:
         log.debug("Could not install asyncio signal handlers", exc_info=True)
 
+    # Liquidation forceOrder capture is forward-only (no historical API), so it
+    # runs whenever the daemon is up — including manual trading pauses; it is
+    # passive data collection. The module's own file lock arbitrates with a
+    # standalone capture process and hands ownership over when one exits.
+    liq_capture_task: asyncio.Task | None = None
+    if os.environ.get("FORVEN_ENABLE_LIQUIDATIONS", "1") != "0":
+        from forven.dataeng.liquidations_ws import run_capture_supervised
+
+        liq_capture_task = spawn(
+            run_capture_supervised(shutdown), name="daemon-liquidation-ws"
+        )
+
     price_queue: asyncio.Queue = asyncio.Queue(maxsize=100)
 
     async def enqueue_price(source: str, prices: dict):
@@ -1984,6 +1996,15 @@ async def async_market_loop(state: dict):
                 await asyncio.sleep(1)
     finally:
         await _stop_market_workers()
+        if liq_capture_task is not None:
+            liq_capture_task.cancel()
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(liq_capture_task, return_exceptions=True),
+                    timeout=SHUTDOWN_GRACE_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                log.warning("Liquidation capture shutdown timed out")
 
 
 def market_scan_loop(state: dict):

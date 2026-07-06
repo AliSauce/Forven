@@ -465,8 +465,15 @@ def _merge_asof_parquet(
     rename: dict[str, str] | None = None,
     direction: str = "backward",
     shift_to_bucket_close: bool = False,
+    fill_coverage_only: bool = False,
 ) -> pd.DataFrame:
     """Load stream parquet via cache, merge_asof on timestamp, rename + fillna.
+
+    ``fill_coverage_only`` restricts ``fill`` to bars at/after the stream's first
+    covered timestamp — bars BEFORE coverage stay NaN. Use it for event-count
+    streams (liquidations) where "no row" means 0 WITHIN coverage but is simply
+    unknown before capture started; a blanket fill would hand backtests years of
+    fake zeros (guaranteed 0-trade strategies, the phantom-family failure mode).
 
     ``shift_to_bucket_close`` re-stamps each source row from bucket START to bucket
     CLOSE (inferred modal width) before the join. Use it for bucket-AGGREGATE
@@ -536,9 +543,14 @@ def _merge_asof_parquet(
         on="timestamp",
         direction=direction,
     )
+    coverage_start = src["timestamp"].min()
     for col, default in fill.items():
         if col in merged.columns:
-            merged[col] = merged[col].fillna(default)
+            if fill_coverage_only:
+                in_coverage = merged["timestamp"] >= coverage_start
+                merged.loc[in_coverage, col] = merged.loc[in_coverage, col].fillna(default)
+            else:
+                merged[col] = merged[col].fillna(default)
     if index_is_time:
         merged = merged.set_index("timestamp")
         merged.index.name = original_index_name
@@ -2298,6 +2310,7 @@ class DataManager:
             cols=["long_liq_usd", "short_liq_usd", "liq_imbalance"],
             fill={"long_liq_usd": 0.0, "short_liq_usd": 0.0, "liq_imbalance": 0.0},
             shift_to_bucket_close=True,
+            fill_coverage_only=True,
         )
 
     def _enrich_basis(self, df: pd.DataFrame, symbol: str) -> pd.DataFrame:

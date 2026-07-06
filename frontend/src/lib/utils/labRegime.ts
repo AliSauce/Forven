@@ -12,12 +12,19 @@ export interface TimelinePriceLike {
 }
 
 function resolveRegimeKey(input: RegimeLike | string | null | undefined): string {
-	if (typeof input === 'string') return String(input || '').trim().toUpperCase();
-	const displayRegime = String(input?.display_regime || '').trim().toUpperCase();
-	if (displayRegime) return displayRegime;
-	const coreRegime = String(input?.core_regime || '').trim().toUpperCase();
-	if (coreRegime) return coreRegime;
-	return String(input?.regime || '').trim().toUpperCase();
+	let key: string;
+	if (typeof input === 'string') {
+		key = String(input || '').trim().toUpperCase();
+	} else {
+		key =
+			String(input?.display_regime || '').trim().toUpperCase() ||
+			String(input?.core_regime || '').trim().toUpperCase() ||
+			String(input?.regime || '').trim().toUpperCase();
+	}
+	// Pipeline classifier taxonomy (forven.regime) says RANGE_BOUND; the lab
+	// taxonomy says RANGE. One styling vocabulary for both.
+	if (key === 'RANGE_BOUND') return 'RANGE';
+	return key;
 }
 
 export function formatRegimeLabel(input: RegimeLike | string | null | undefined): string {

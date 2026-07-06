@@ -146,7 +146,9 @@ describe('notificationRouter', () => {
 		const list = get(toasts);
 		expect(list).toHaveLength(1);
 		expect(list[0].type).toBe('error');
-		expect(get(navEventPulses)['/risk']).toMatchObject({ severity: 'danger' });
+		// Badge allowlist (navMetrics.NAV_BADGE_HREFS): /risk never badges —
+		// the halt owns a toast here plus the persistent Risk page banner.
+		expect(get(navEventPulses)['/risk']).toBeUndefined();
 	});
 
 	it('accumulates pulse counts and clears them when the tab is visited', () => {

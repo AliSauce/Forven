@@ -39,6 +39,7 @@
 	import HeatmapChart from '$lib/components/charts/HeatmapChart.svelte';
 	import RobustnessPanel from '$lib/components/robustness/RobustnessPanel.svelte';
 	import GauntletStatusCard from '$lib/components/robustness/GauntletStatusCard.svelte';
+	import RegimePerfStrip from '$lib/components/regime/RegimePerfStrip.svelte';
 	import ExecutionSettingsFields from '$lib/components/lab/ExecutionSettingsFields.svelte';
 	import type { SizingMode, ExecutionProfileDraft } from '$lib/types/executionProfile';
 	import {
@@ -4410,6 +4411,8 @@
 							}}
 							on:promote={() => openStageChange()}
 						/>
+
+						<RegimePerfStrip {validationHistory} />
 					</div>
 
 					<div class="space-y-3">

@@ -255,9 +255,14 @@ def test_all_researching_crucibles_spawn_exhausted_proposes_replacement(forven_d
     assert actions[0].crucible_id is None
 
 
-def test_settled_research_pool_proposes_replacement_when_no_busy_work(forven_db):
+def test_settled_survivor_crucible_is_exploited_not_replaced(forven_db):
     from forven.crucible_planner import plan_next_actions
 
+    # CRUX-1 contract change: a crucible with a PROMOTED (paper) descendant is
+    # no longer "settled" — it is the strongest evidence in the pool and gets
+    # the expand/exploit lane instead of triggering fresh-idea replenishment.
+    # (Replenishment when only busy/exhausted work remains is still covered by
+    # test_busy_strategy_does_not_block_replenishment_when_pool_is_exhausted.)
     exhausted = _make_crucible("researching")
     for index in range(8):
         _make_archived_strategy(exhausted["id"], f"S-EXHAUSTED-MIXED-{index}")
@@ -268,8 +273,8 @@ def test_settled_research_pool_proposes_replacement_when_no_busy_work(forven_db)
     actions = plan_next_actions(limit=3)
 
     assert len(actions) == 1
-    assert actions[0].action_kind == "propose_crucible"
-    assert actions[0].crucible_id is None
+    assert actions[0].action_kind == "expand_viable_crucible"
+    assert actions[0].crucible_id == settled["id"]
 
 
 def test_busy_strategy_does_not_block_replenishment_when_pool_is_exhausted(forven_db):
@@ -505,11 +510,14 @@ def test_mismatched_strategy_lineage_does_not_satisfy_crucible_candidate_need(fo
             (parent["id"], "S-MISMATCH"),
         )
 
-    actions = plan_next_actions(limit=1)
+    # CRUX-1: iteration order is value-ranked, not FIFO — the contract under
+    # test is that the mismatched-lineage strategy satisfies NEITHER
+    # crucible's candidate need, so BOTH still emit develop_candidate.
+    actions = plan_next_actions(limit=2)
 
-    assert len(actions) == 1
-    assert actions[0].action_kind == "develop_candidate"
-    assert actions[0].crucible_id == parent["id"]
+    assert len(actions) == 2
+    assert {action.action_kind for action in actions} == {"develop_candidate"}
+    assert {action.crucible_id for action in actions} == {parent["id"], child["id"]}
 
 
 def test_open_matching_action_dedupes_pending_task(forven_db):

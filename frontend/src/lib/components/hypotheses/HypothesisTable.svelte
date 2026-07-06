@@ -88,7 +88,10 @@
 </script>
 
 <div class="bg-[#050505]">
-	<div class="overflow-x-auto">
+	<!-- No overflow wrapper here: the page's scroll container owns BOTH axes.
+	     A nested overflow-x-auto becomes the thead's nearest scroll box, which
+	     never scrolls vertically — silently defeating `sticky top-0`. -->
+	<div>
 		<table class="w-full min-w-[1180px] border-collapse">
 			<thead class="sticky top-0 z-10 bg-[#050505] text-left text-[10px] uppercase tracking-wider text-[#666]">
 				<tr class="border-b border-[#222]">

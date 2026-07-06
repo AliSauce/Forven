@@ -32,7 +32,7 @@ sub-hour candle never reads an in-progress bucket (no lookahead).
 | ls_ratio              | float64 | 1h          | ~2021-12       | Global long/short ACCOUNT ratio (>1 = more long accounts). Contrarian crowding signal. |
 | long_pct / short_pct  | float64 | 1h          | ~2021-12       | Long/short account shares derived from ls_ratio (sum to 1). |
 | taker_buy_sell_ratio  | float64 | 1h          | ~2021-12       | Taker buy volume / taker sell volume (>1 = aggressive buying). Order-flow signal. |
-| long_liq_usd / short_liq_usd / liq_imbalance | float64 | 1h | forward-only | Liquidation flow (collector env-gated; columns absent unless enabled). |
+| long_liq_usd / short_liq_usd / liq_imbalance | float64 | 1h | 2026-07-06 (forward-only) | Liquidation flow, captured live from OKX all-swap liquidation orders (cross-venue proxy — cascades are venue-correlated; magnitudes are OKX's, not Binance's). long_liq_usd = longs liquidated (forced selling); liq_imbalance = (long−short)/total in [−1, 1]. NaN before 2026-07-06; 0.0 within coverage means "no liquidations that hour". |
 | basis                 | float64 | 1h          | ~2019-09       | Perp premium index vs underlying index (dimensionless fraction, e.g. 0.0004). Funding predictor + crowding/carry regime. Positive = perp trades rich. |
 | iv_btc / iv_eth       | float64 | 1h          | ~2021-03       | Deribit DVOL implied-volatility index (crypto's VIX; annualized %, e.g. 55.0). Market-wide vol regime — joined onto EVERY symbol's frame. |
 

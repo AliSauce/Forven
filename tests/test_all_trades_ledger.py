@@ -101,6 +101,19 @@ def test_filters_asset_direction_exec_type(forven_db):
     assert count_trades(direction="short", execution_type="live") == 2
 
 
+def test_paper_filter_includes_paper_challenger(forven_db):
+    # `paper` and `paper_challenger` are one simulated stage on two engines; the
+    # blotter renders both as "Paper", so the "Paper" filter must match either.
+    _insert_trade("K", execution_type="paper", pnl_usd=1.0, minutes=1)
+    _insert_trade("L", execution_type="paper_challenger", pnl_usd=2.0, minutes=2)
+    _insert_trade("M", execution_type="live", pnl_usd=3.0, minutes=3)
+
+    assert {t["id"] for t in get_all_trades(execution_type="paper")} == {"K", "L"}
+    assert count_trades(execution_type="paper") == 2
+    # An explicit paper_challenger filter still narrows to just that engine.
+    assert {t["id"] for t in get_all_trades(execution_type="paper_challenger")} == {"L"}
+
+
 def test_search_matches_id_and_strategy(forven_db):
     _insert_trade("ZZTOP", strategy="momentum_x", pnl_usd=1.0, minutes=1)
     _insert_trade("OTHER", strategy="reversal_y", pnl_usd=1.0, minutes=2)

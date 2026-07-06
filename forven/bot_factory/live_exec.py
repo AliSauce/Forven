@@ -167,6 +167,20 @@ def open_live(
     if not allowed:
         return None, f"blocked: {why}"
 
+    # REGIME-GATE-1 (bot live lane): same direction×regime gate as the strategy
+    # pipeline's kernel live path — bots must not sidestep it. Observe mode
+    # shadow-logs and falls through; a gate error must not wedge the bot loop.
+    try:
+        from forven.regime import check_direction_regime_gate
+
+        rg_ok, rg_why = check_direction_regime_gate(
+            sid, coin, direction, ref_price=ref_price, execution_type="live",
+        )
+    except Exception:
+        rg_ok, rg_why = True, ""
+    if not rg_ok:
+        return None, f"blocked: {rg_why}"
+
     equity = _get_real_account_equity()
     if not equity or equity <= 0:
         return None, "blocked: real account equity unavailable (fail closed)"

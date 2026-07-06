@@ -1685,6 +1685,10 @@ _DEFAULT_SETTINGS_PAYLOAD = {
     "strict_regime_gating": True,
     "regime_min_confidence": 0.3,
     "allow_unknown_regime_strategies": False,
+    "regime_gate_mode": "observe",
+    "regime_gate_block_long": "TREND_DOWN,HIGH_VOL",
+    "regime_gate_block_short": "",
+    "regime_gate_min_confidence": 0.6,
     "self_healing_enabled": True,
     "auto_restart_on_crash": True,
     "maintenance_start_hour": None,
@@ -2642,6 +2646,23 @@ def _apply_settings_section(section: str, payload: dict) -> dict:
             updates["regime_min_confidence"] = _coerce_float(payload.get("regime_min_confidence"), updates["regime_min_confidence"])
         if "allow_unknown_regime_strategies" in payload:
             updates["allow_unknown_regime_strategies"] = _coerce_bool(payload.get("allow_unknown_regime_strategies"), updates["allow_unknown_regime_strategies"])
+        # Direction×regime entry gate (REGIME-GATE-1). Same KV-blob contract as
+        # the strict-regime knobs: forven.config getters read these directly.
+        if "regime_gate_mode" in payload:
+            _rg_mode = str(payload.get("regime_gate_mode") or "").strip().lower()
+            updates["regime_gate_mode"] = _rg_mode if _rg_mode in ("off", "observe", "enforce") else "observe"
+        for _rg_csv_key in ("regime_gate_block_long", "regime_gate_block_short"):
+            if _rg_csv_key in payload:
+                from forven.regime import normalize_regime_label as _rg_norm
+                _rg_parts = [
+                    _rg_norm(part)
+                    for part in str(payload.get(_rg_csv_key) or "").split(",")
+                ]
+                updates[_rg_csv_key] = ",".join(sorted({p for p in _rg_parts if p}))
+        if "regime_gate_min_confidence" in payload:
+            updates["regime_gate_min_confidence"] = max(
+                0.0, min(1.0, _coerce_float(payload.get("regime_gate_min_confidence"), 0.6))
+            )
         # Promotion-safety gates (read top-level from forven:settings by
         # forven.policy.evaluate_promotion and forven.hypothesis_graduation).
         if "allow_unsupported_backtest_risk_controls" in payload:
@@ -4477,6 +4498,8 @@ def _normalize_trade_rows(value) -> list[dict]:
             trade["exit_reason"] = str(row["exit_reason"])
         if row.get("size_fraction") not in (None, ""):
             trade["size_fraction"] = _coerce_float(row.get("size_fraction"))
+        if row.get("regime") not in (None, ""):
+            trade["regime"] = str(row["regime"])
         trades.append(trade)
     return trades
 
@@ -5249,6 +5272,9 @@ def _classify_activity_log_event(entry: dict) -> str | None:
 
     if "kill switch" in msg or (source == "daemon" and level == "critical"):
         return "kill_switch_activated"
+
+    if source == "integrations" and "session" in msg and "opened" in msg:
+        return "mcp_session_opened"
 
     if (
         "lifecycle transition" in msg
@@ -6521,6 +6547,10 @@ def get_settings():
         payload["strict_regime_gating"] = _regime_cfg.get_strict_regime_gating()
         payload["regime_min_confidence"] = _regime_cfg.get_regime_min_confidence()
         payload["allow_unknown_regime_strategies"] = _regime_cfg.get_allow_unknown_regime_strategies()
+        payload["regime_gate_mode"] = _regime_cfg.get_regime_gate_mode()
+        payload["regime_gate_block_long"] = ",".join(sorted(_regime_cfg.get_regime_gate_block_long()))
+        payload["regime_gate_block_short"] = ",".join(sorted(_regime_cfg.get_regime_gate_block_short()))
+        payload["regime_gate_min_confidence"] = _regime_cfg.get_regime_gate_min_confidence()
     except Exception:
         pass
     # Reflect the REAL Discord delivery preferences so the Notifications panel
@@ -9688,8 +9718,11 @@ def _normalize_trade_artifact_rows(raw_rows: object) -> list[dict]:
         }
         # Carry through descriptive fields (only when present) so the result
         # viewer can show direction / hold time / MAE-MFE and the manual
-        # backtester's exit reason + position size_fraction.
-        for key in ("direction", "exit_reason"):
+        # backtester's exit reason + position size_fraction. `regime` is the
+        # kernel's causal entry-bar label — per-regime analysis needs it to
+        # survive persistence (2026-07-05 graveyard audit re-classified 35k
+        # trades from candles because it was dropped here).
+        for key in ("direction", "exit_reason", "regime"):
             if row.get(key) not in (None, ""):
                 trade_row[key] = str(row[key])
         if row.get("bars_held") not in (None, ""):

@@ -452,6 +452,16 @@ def run_db_maintenance(settings: dict | None = None, *, vacuum: bool = False) ->
         _resolve_failed_retention_hours(settings)
     )
 
+    # GO-LIVE-1 hygiene: reap live notional ceilings still held by terminal
+    # (or deleted) strategies — dormant live arming must not outlive its owner.
+    try:
+        from forven.exchange.risk import revoke_dead_strategy_ceilings
+
+        summary["stale_live_ceilings_revoked"] = len(revoke_dead_strategy_ceilings())
+    except Exception:
+        log.exception("maintenance: stale live-ceiling reap failed")
+        summary["stale_live_ceilings_revoked"] = 0
+
     try:
         busy, log_pages, checkpointed = checkpoint_wal("PASSIVE")
         summary["wal_checkpointed_pages"] = checkpointed

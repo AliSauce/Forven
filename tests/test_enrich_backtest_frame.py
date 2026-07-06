@@ -168,9 +168,16 @@ def test_enrich_backtest_frame_gains_order_flow_columns(tmp_path):
     with _patch_dirs(tmp_path):
         out = dm.enrich(frame, "BTC-USDT", "1h", exclude_streams=("funding", "oi"))
 
-    for col in ("ls_ratio", "taker_buy_sell_ratio", "long_liq_usd", "short_liq_usd", "liq_imbalance"):
+    for col in ("ls_ratio", "taker_buy_sell_ratio"):
         assert col in out.columns, f"order-flow column {col} missing from backtest frame"
         assert out[col].notna().all(), f"{col} has NaNs (sparse columns must be filled, not evict rows)"
+    for col in ("long_liq_usd", "short_liq_usd", "liq_imbalance"):
+        assert col in out.columns, f"order-flow column {col} missing from backtest frame"
+        # Liquidations fill 0.0 only WITHIN coverage (fill_coverage_only): the
+        # first bar predates the stream's first bucket CLOSE and must stay NaN —
+        # blanket zeros before capture start would hand backtests fake data.
+        assert out[col].iloc[0] != out[col].iloc[0], f"{col} pre-coverage bar must be NaN"
+        assert out[col].iloc[1:].notna().all(), f"{col} has NaNs within coverage"
     # No row eviction; IS leg intact.
     assert len(out) == len(frame)
     assert isinstance(out.index, pd.DatetimeIndex)

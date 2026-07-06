@@ -57,6 +57,11 @@ def get_regime():
     return control_plane_status.get_regime()
 
 
+@router.get("/api/regime/series")
+def get_regime_series(symbol: str, timeframe: str = "1h", bars: int = 1000):
+    return control_plane_status.get_regime_series(symbol, timeframe=timeframe, bars=bars)
+
+
 @router.get("/api/risk")
 def get_risk():
     return control_plane_status.get_risk()

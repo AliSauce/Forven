@@ -43,6 +43,7 @@ def _score_rows() -> list[dict[str, Any]]:
         rows = conn.execute(
             """
             SELECT h.id,
+                   h.title,
                    h.status,
                    h.manager_state,
                    h.last_dispatched_at,
@@ -53,6 +54,11 @@ def _score_rows() -> list[dict[str, Any]]:
                            OR s.verdict LIKE '%paper_eligible%'
                          THEN 1 ELSE 0
                        END) AS positive_children,
+                   SUM(CASE
+                         WHEN s.stage IN ('paper', 'paper_trading', 'live_graduated', 'deployed')
+                         THEN 1 ELSE 0
+                       END) AS survivor_children,
+                   SUM(CASE WHEN s.stage = 'gauntlet' THEN 1 ELSE 0 END) AS gauntlet_children,
                    MAX(s.created_at) AS last_child_created_at,
                    SUM(CASE
                          WHEN h.last_dispatched_at IS NULL
@@ -60,12 +66,24 @@ def _score_rows() -> list[dict[str, Any]]:
                          THEN 1 ELSE 0
                        END) AS strategies_since_last_pick
             FROM hypotheses h
-            LEFT JOIN strategies s ON s.hypothesis_id = h.id
+            LEFT JOIN strategies s
+              ON COALESCE(NULLIF(TRIM(COALESCE(s.hypothesis_id, '')), ''), s.origin_crucible_id) = h.id
             WHERE h.manager_state = 'active'
             GROUP BY h.id
             """
         ).fetchall()
     now = datetime.now(timezone.utc)
+    # CRUX-1: score with the shared crucible value model — true stage survival
+    # dominates, family survival priors steer the (majority) zero-children
+    # candidates that the old formula scored as pure random.
+    from forven.crucible_allocator import (
+        cached_family_outcome_stats,
+        crucible_value_score,
+        smoothed_family_rate,
+    )
+    from forven.strategy_diversity import infer_strategy_family
+
+    family_stats = cached_family_outcome_stats()
     scored: list[dict[str, Any]] = []
     for row in rows:
         # 'proposed' crucibles are not yet refined — the crucible_planner owns
@@ -97,14 +115,16 @@ def _score_rows() -> list[dict[str, Any]]:
         if activity_dt.tzinfo is None:
             activity_dt = activity_dt.replace(tzinfo=timezone.utc)
         days_since = max(0.0, (now - activity_dt).total_seconds() / 86400.0)
-        score = (
-            3.0 * positive
-            + 0.5 * scored_children
-            - 0.1 * days_since
-            + random.uniform(0.0, 0.01)
-        )
-        if row["status"] == "proven":
-            score *= 1.5
+        family = infer_strategy_family(row["title"])
+        score = crucible_value_score(
+            status=str(row["status"] or ""),
+            survivor_children=int(row["survivor_children"] or 0),
+            gauntlet_children=int(row["gauntlet_children"] or 0),
+            positive_children=positive,
+            scored_children=scored_children,
+            days_since_activity=days_since,
+            family_survival_rate=smoothed_family_rate(family, family_stats),
+        ) + random.uniform(0.0, 0.01)  # tie-break jitter only
         scored.append({
             "id": str(row["id"]),
             "score": score,
@@ -168,22 +188,45 @@ def _dispatch_task(hypothesis: dict[str, Any]) -> int | None:
         "Use the exact provided hypothesis_id/crucible_id. Do not call create_hypothesis "
         "or create a replacement crucible. Then stop — one strategy per pick."
     )
+    input_data: dict[str, Any] = {
+        "origin_mode": "hypothesis_promotion_loop",
+        "action_kind": "develop_candidate",
+        "crucible_id": hypothesis_id,
+        "hypothesis_id": hypothesis_id,
+        "hypothesis_display_id": hypothesis.get("display_id"),
+        "revisit_count": revisit_count,
+        "siblings": siblings,
+        "canonical_coverage": coverage,
+    }
+    # CRUX-1 direction quota: a share of daily develops must explore the
+    # short/both side (graveyard audit: shorts net-positive in every regime).
+    try:
+        from forven.crucible_allocator import (
+            DATA_DIRECTIVE_TEXT,
+            SHORT_DIRECTIVE_TEXT,
+            next_data_directive,
+            next_trade_mode_directive,
+        )
+
+        directive = next_trade_mode_directive()
+        if directive:
+            input_data["trade_mode_directive"] = directive
+            description = description + SHORT_DIRECTIVE_TEXT
+        # CRUX-1 orthogonal-data quota: a share of daily develops must
+        # hypothesize over non-price enrichment columns.
+        data_directive = next_data_directive()
+        if data_directive:
+            input_data["data_directive"] = data_directive
+            description = description + DATA_DIRECTIVE_TEXT
+    except Exception:
+        log.exception("trade-mode directive stamp failed for %s", hypothesis_id)
     try:
         return int(assign_task(
             agent_id="strategy-developer",
             task_type="develop_candidate",
             title=f"Advance hypothesis {display_id}",
             description=description,
-            input_data={
-                "origin_mode": "hypothesis_promotion_loop",
-                "action_kind": "develop_candidate",
-                "crucible_id": hypothesis_id,
-                "hypothesis_id": hypothesis_id,
-                "hypothesis_display_id": hypothesis.get("display_id"),
-                "revisit_count": revisit_count,
-                "siblings": siblings,
-                "canonical_coverage": coverage,
-            },
+            input_data=input_data,
             priority=3,
         ))
     except Exception:
@@ -235,7 +278,14 @@ def run_promotion_loop(*, top_k: int = 3, max_in_flight: int = MAX_IN_FLIGHT_DEF
 
     task_index = CrucibleTaskIndex.build()
     now_iso = datetime.now(timezone.utc).isoformat()
+    # CRUX-1: hard daily develop budget shared with the crucible planner.
+    from forven.crucible_allocator import develop_budget_remaining
+
+    daily_budget_remaining = develop_budget_remaining()
     for candidate in picks:
+        if daily_budget_remaining <= 0:
+            skipped["daily_budget"] = skipped.get("daily_budget", 0) + 1
+            continue
         hypothesis = get_hypothesis(candidate["id"])
         if not hypothesis:
             continue
@@ -257,6 +307,7 @@ def run_promotion_loop(*, top_k: int = 3, max_in_flight: int = MAX_IN_FLIGHT_DEF
         task_id = _dispatch_task(hypothesis)
         if task_id is None:
             continue
+        daily_budget_remaining -= 1
         with get_db() as conn:
             conn.execute(
                 "UPDATE hypotheses SET last_dispatched_at = ? WHERE id = ?",

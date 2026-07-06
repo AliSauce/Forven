@@ -62,6 +62,8 @@ export interface PaperTrade {
 	slippage_usd?: number | null;
 	close_reason?: string | null;
 	close_incomplete?: boolean;
+	/** market regime at entry (causal classifier label) */
+	regime?: string | null;
 }
 
 export interface LiveIndicator {

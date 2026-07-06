@@ -38,6 +38,22 @@ export const NAV_HREFS = [
 	'/settings',
 ];
 
+// Deliberate allowlist (operator decision 2026-07-06): nav badges exist ONLY
+// for these routes. Everything else was ambient numerology (data ingestion
+// counts, running agents, task queues…) that trained the eye to ignore ALL
+// badges. Enforced here — the single choke point for both state indicators
+// and event pulses — so neither an older backend nor a stray pulse() call can
+// resurrect a badge elsewhere. Safety states still surface via toasts and the
+// Risk page banner.
+export const NAV_BADGE_HREFS = [
+	'/approval',
+	'/diagnostics',
+	'/integrations',
+	'/live-trades',
+	'/paper-trades',
+	'/bot-factory',
+];
+
 function createEmptyMetric(): NavMetric {
 	return {
 		kind: 'none',
@@ -90,6 +106,7 @@ export function setNavIndicators(indicators: Record<string, SystemNavIndicator> 
 	if (indicators && typeof indicators === 'object') {
 		for (const [href, indicator] of Object.entries(indicators)) {
 			if (!(href in next) || !indicator || typeof indicator !== 'object') continue;
+			if (!NAV_BADGE_HREFS.includes(href)) continue;
 			const kind = isKind(indicator.kind) ? indicator.kind : 'none';
 			const severity = isSeverity(indicator.severity) ? indicator.severity : 'neutral';
 			const seenKey = String(indicator.seen_key ?? '').trim();
@@ -151,7 +168,7 @@ export interface NavPulse {
 export const navEventPulses = writable<Record<string, NavPulse>>({});
 
 export function addNavPulse(href: string, severity: NavIndicatorSeverity, summary: string): void {
-	if (!NAV_HREFS.includes(href)) return;
+	if (!NAV_BADGE_HREFS.includes(href)) return;
 	navEventPulses.update((current) => {
 		const existing = current[href];
 		return {

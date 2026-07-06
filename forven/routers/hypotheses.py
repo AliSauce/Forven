@@ -117,6 +117,15 @@ def hypotheses_bucket_counts_endpoint():
     return {"counts": hypotheses_domain.get_hypothesis_bucket_counts()}
 
 
+@router.get("/api/hypotheses/allocator")
+def hypotheses_allocator_overview_endpoint(limit: int = 40):
+    """CRUX-1 allocator view: daily develop budget, short quota, and the
+    active pool ranked by value score — the Crucibles page intelligence strip."""
+    from forven.crucible_allocator import allocator_overview
+
+    return allocator_overview(limit=limit)
+
+
 @router.post("/api/hypotheses/preview_url")
 def preview_hypothesis_from_url_endpoint(payload: HypothesisFromUrlPreviewRequest):
     return hypotheses_domain.preview_hypothesis_from_url_payload(payload.url)

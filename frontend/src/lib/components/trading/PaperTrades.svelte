@@ -45,6 +45,8 @@
 	import ChartWorkspace from '$lib/components/chart/ChartWorkspace.svelte';
 	import Skeleton from '$lib/components/Skeleton.svelte';
 	import DataTable from '$lib/components/DataTable.svelte';
+	import RegimeChip from '$lib/components/regime/RegimeChip.svelte';
+	import RegimeStripe from '$lib/components/regime/RegimeStripe.svelte';
 	import { ORDERED_TIMEFRAME_VALUES } from '$lib/config/timeframes';
 	import { workspaceContext, selectedDataset as selectedDatasetStore } from '$lib/stores';
 	import { forvenLivePrices } from '$lib/stores/forvenWebSocket';
@@ -240,6 +242,7 @@
 		{ key: 'time', label: 'Time' },
 		{ key: 'market', label: 'Market' },
 		{ key: 'direction', label: 'Direction' },
+		{ key: 'regime', label: 'Regime' },
 		{ key: 'price', label: 'Price', align: 'right' as const },
 		{ key: 'size', label: 'Size', align: 'right' as const },
 		{ key: 'value', label: 'Trade Value', align: 'right' as const },
@@ -247,6 +250,7 @@
 		{ key: 'closed_pnl', label: 'Closed PNL', align: 'right' as const },
 	];
 
+	let showRegimeStripe = false;
 	let liveChartPoller: Poller | null = null;
 	let selectedSessionPoller: Poller | null = null;
 	let liveChartRefreshTimer: ReturnType<typeof setTimeout> | null = null;
@@ -3551,6 +3555,23 @@
 									</div>
 								{/if}
 							</div>
+							<!-- Regime timeline under the chart: same causal classifier as the
+							     backtest/trade stamps/entry gate. Off by default. -->
+							<div class="flex items-center border-t border-[#1a1a1a] bg-black">
+								<button
+									class="px-2 py-1 text-[9px] uppercase tracking-wider whitespace-nowrap {showRegimeStripe ? 'text-white' : 'text-[#555]'} hover:text-white"
+									on:click={() => (showRegimeStripe = !showRegimeStripe)}
+									title="Toggle the regime timeline (causal classifier labels under the price action)"
+								>
+									Regimes {showRegimeStripe ? '▾' : '▸'}
+								</button>
+								{#if showRegimeStripe && selectedSession}
+									<RegimeStripe
+										symbol={selectedSession.symbol}
+										timeframe={activeVisualChartTimeframe}
+									/>
+								{/if}
+							</div>
 						{:else}
 							<div class="flex items-center justify-center h-full text-gray-700">
 								<div class="text-center">
@@ -3646,6 +3667,12 @@
 												</span>
 											{/if}
 										</div>
+									{:else if column.key === 'regime'}
+										{#if fill.kind === 'open' && trade.regime}
+											<RegimeChip mini regime={trade.regime} />
+										{:else}
+											<span class="text-[#444]">—</span>
+										{/if}
 									{:else if column.key === 'price'}
 										<span class="text-gray-400">{formatPrice(fill.price)}</span>
 									{:else if column.key === 'size'}

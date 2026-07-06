@@ -41,6 +41,7 @@ _DEFAULT_JOB_IDS = {
     "forven-decay-tracker",
     "forven-weekly-review",
     "forven-regime-update",
+    "forven-regime-gate-mtm",
     "forven-slippage-monitor",
     "forven-scanner-signal",
     "forven-scanner-hourly",
@@ -1761,6 +1762,18 @@ async def run_job(job: dict) -> tuple[str, str | None]:
             log.info("Testnet execution harness: %s", status)
             return "ok", None
 
+        # Regime gate MTM follow-up — back-fill mark-to-market on gate ledger
+        # events whose 48h horizon has passed (REGIME-GATE-1 prove-it loop).
+        if kind == "regime_gate_mtm":
+            from forven.regime_gate import evaluate_pending_mtm
+            result = await _run_sync_job(evaluate_pending_mtm)
+            if isinstance(result, dict):
+                log.info(
+                    "Regime gate MTM follow-up: %s evaluated, %s pending",
+                    result.get("evaluated"), result.get("pending"),
+                )
+            return "ok", None
+
         # Ghost container scan — detect strategies with missing/broken containers
         if kind == "ghost_container_scan":
             from forven.db import run_daily_ghost_detection
@@ -3138,6 +3151,19 @@ def seed_forven_jobs():
             "provider": "openai",
             "model": default_openai_model,
         },
+    )
+
+    # 5.1. Regime gate MTM follow-up — every 30 minutes. Stamps blocked (or
+    # would-have-blocked) entries with the return they'd have made ~48h later,
+    # so the Risk page's gate panel proves the gate with data, not faith.
+    add_job(
+        job_id="forven-regime-gate-mtm",
+        name="Regime Gate MTM Follow-Up",
+        schedule_type="interval",
+        schedule_expr="1800000",
+        command="regime-gate-mtm",
+        timezone_str="UTC",
+        payload={"kind": "regime_gate_mtm"},
     )
 
     # 5.5. Execution Slippage Monitor — Every 30 minutes

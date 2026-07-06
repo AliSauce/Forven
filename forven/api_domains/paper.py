@@ -306,6 +306,9 @@ def _build_compat_paper_trade(trade_row: dict, strategy_name: str, symbol: str) 
         "slippage_usd": sd_slippage,
         "close_reason": close_reason,
         "close_incomplete": close_incomplete,
+        # Regime at entry: the persisted column on new rows, the kernel's
+        # signal_data stamp on rows opened before the column existed.
+        "regime": trade_row.get("regime") or signal_data.get("kernel_regime"),
     }
 
 

@@ -608,6 +608,57 @@ def _m_2026_07_bot_live_wallet(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE bot_configs ADD COLUMN live_wallet TEXT")
 
 
+def _m_2026_07_trade_regime_stamp(conn: sqlite3.Connection) -> None:
+    """Persist the market regime at entry on every trade.
+
+    The kernel already classifies the entry-bar regime (TREND_UP / TREND_DOWN /
+    RANGE_BOUND / HIGH_VOL) but the label was dropped at persistence, so every
+    per-regime analysis had to re-classify from candles (2026-07-05 graveyard
+    audit). NULL on historical rows = unstamped, rendered as an em dash.
+    """
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(trades)").fetchall()}
+    if "regime" not in cols:
+        conn.execute("ALTER TABLE trades ADD COLUMN regime TEXT")
+
+
+def _m_2026_07_regime_gate_events(conn: sqlite3.Connection) -> None:
+    """Ledger for the direction×regime entry gate.
+
+    One row per gate veto (enforce) or would-have-vetoed signal (observe).
+    mtm_pct is back-filled ~48h later by the follow-up job: the signed return
+    the blocked entry would have made, so the gate continuously proves (or
+    indicts) itself on the Risk page.
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS regime_gate_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%S+00:00', 'now')),
+            strategy_id TEXT NOT NULL,
+            asset TEXT NOT NULL,
+            direction TEXT NOT NULL,
+            regime TEXT NOT NULL,
+            confidence REAL,
+            mode TEXT NOT NULL,
+            decision TEXT NOT NULL,
+            execution_type TEXT,
+            ref_price REAL,
+            mtm_price REAL,
+            mtm_pct REAL,
+            mtm_evaluated_at TEXT
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_regime_gate_events_ts"
+        " ON regime_gate_events (ts DESC)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_regime_gate_events_pending_mtm"
+        " ON regime_gate_events (mtm_evaluated_at, ts)"
+    )
+
+
 # Append new migrations to the END of this list. Never reorder, rename, or
 # delete existing entries — doing so will cause migrations to re-run on
 # databases that already applied them under the old name, or to silently
@@ -659,6 +710,14 @@ MIGRATIONS: list[Migration] = [
     Migration(
         name="2026_07_bot_live_wallet",
         up=_m_2026_07_bot_live_wallet,
+    ),
+    Migration(
+        name="2026_07_trade_regime_stamp",
+        up=_m_2026_07_trade_regime_stamp,
+    ),
+    Migration(
+        name="2026_07_regime_gate_events",
+        up=_m_2026_07_regime_gate_events,
     ),
 ]
 

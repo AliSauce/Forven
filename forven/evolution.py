@@ -1858,6 +1858,40 @@ def _run_testing_step_impl(code_first: bool = True) -> dict:
                         strat_id, workflow_status,
                     )
                     continue
+                if workflow_status == "passed":
+                    # A PASSED workflow that predates the strategy's CURRENT
+                    # gauntlet entry is STALE evidence: the operator demoted it
+                    # back to gauntlet precisely to re-run the full suite, and a
+                    # fast-path promotion off the old artifacts silently defeats
+                    # that re-run (S05198/S05407/S04925/S03151, 2026-07-06
+                    # audit — re-promoted within minutes of a bulk demote-to-
+                    # rerun). The workflow backfill resets terminal workflows
+                    # to pending on its next tick; defer to that fresh run.
+                    completed_at = str(
+                        (latest_workflow or {}).get("completed_at")
+                        or (latest_workflow or {}).get("created_at")
+                        or ""
+                    )
+                    stage_changed_at = ""
+                    try:
+                        with get_db() as conn:
+                            row = conn.execute(
+                                "SELECT stage_changed_at FROM strategies WHERE id = ?",
+                                (strat_id,),
+                            ).fetchone()
+                            stage_changed_at = str((row["stage_changed_at"] if row else "") or "")
+                    except Exception:
+                        stage_changed_at = ""
+                    if completed_at and stage_changed_at and completed_at < stage_changed_at:
+                        stale_ids = list(outcome.get("workflow_stale_blocked_ids") or [])
+                        stale_ids.append(strat_id)
+                        outcome["workflow_stale_blocked_ids"] = stale_ids
+                        log.debug(
+                            "Evolution: %s blocked from fast-path promotion "
+                            "(passed workflow predates gauntlet re-entry)",
+                            strat_id,
+                        )
+                        continue
         except Exception as exc:
             log.warning("Evolution: workflow-deferral check failed for %s: %s", strat_id, exc)
 
