@@ -25,6 +25,7 @@ from croniter import croniter
 from forven.model_routing import get_default_model_for_provider
 from forven.db import create_pending_task, get_db, init_db, is_user_active, kv_get, kv_set, kv_set_best_effort, log_activity, reap_long_running_agent_tasks, recover_stale_running_tasks
 from forven.system_pause import is_autonomy_paused, is_generation_paused
+from forven.throughput_policy import THROUGHPUT_DEFAULTS
 from forven.task_timeouts import coerce_stale_recovery_minutes, recommended_agent_reaper_timeout_minutes, recommended_stale_recovery_minutes
 
 
@@ -368,27 +369,30 @@ def _load_runtime_scheduler_tuning() -> dict[str, int | bool]:
             1,
             100,
         ),
+        # Fallbacks come from the shared single-source constants (they used to be
+        # hardcoded 15/15/5 here — dead in practice, since startup seeding persists
+        # the api_core defaults into KV, but drift-prone for the settings UI).
         "ideation_interval_minutes": _coerce_int(
             settings.get("ideation_interval_minutes"),
-            15,
+            THROUGHPUT_DEFAULTS["ideation_interval_minutes"],
             1,
             1440,
         ),
         "coding_interval_minutes": _coerce_int(
             settings.get("coding_interval_minutes"),
-            15,
+            THROUGHPUT_DEFAULTS["coding_interval_minutes"],
             1,
             1440,
         ),
         "testing_interval_minutes": _coerce_int(
             settings.get("testing_interval_minutes"),
-            5,
+            THROUGHPUT_DEFAULTS["testing_interval_minutes"],
             1,
             1440,
         ),
         "graduation_interval_minutes": _coerce_int(
             settings.get("graduation_interval_minutes"),
-            120,
+            THROUGHPUT_DEFAULTS["graduation_interval_minutes"],
             1,
             10080,
         ),

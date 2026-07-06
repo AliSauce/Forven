@@ -29,6 +29,19 @@ vi.mock('../lib/settings/manifest', () => ({
 			description: '',
 			usedBy: [],
 		},
+		{
+			// Second backend section so multi-section saves have two PUTs to order.
+			id: 'research.crucible_daily_develop_budget',
+			label: 'Daily develop budget',
+			default: 150,
+			type: 'number',
+			area: 'system',
+			subsection: 'system-throughput',
+			backendSection: 'research',
+			backendPath: 'research_settings.hypothesis_discipline.crucible_daily_develop_budget',
+			description: '',
+			usedBy: [],
+		},
 	],
 	SETTINGS_AREAS: [],
 }));
@@ -182,6 +195,56 @@ describe('SettingsSaveBar', () => {
 		expect(dirty.has('orphan.unknown_id')).toBe(true);
 		expect(dirty.size).toBe(1);
 		expect(target.textContent || '').toContain('No saveable fields');
+	});
+
+	it('saves sections sequentially, never concurrently (same-KV lost-update guard)', async () => {
+		// Every section handler read-modify-writes the same forven:settings KV
+		// blob; two in-flight PUTs would race and silently drop one section.
+		let active = 0;
+		let maxActive = 0;
+		const order: string[] = [];
+		updateSettingsSectionMock.mockImplementation(async (section: string) => {
+			active += 1;
+			maxActive = Math.max(maxActive, active);
+			order.push(section);
+			await new Promise((r) => setTimeout(r, 5));
+			active -= 1;
+			return { status: 'ok' };
+		});
+
+		dirtyFields.set(new Set(['risk.max_daily_loss', 'research.crucible_daily_develop_budget']));
+		originalValues.set({
+			'risk.max_daily_loss': 200,
+			'research.crucible_daily_develop_budget': 150,
+		});
+		target = document.createElement('div');
+		document.body.appendChild(target);
+		instance = mount(SettingsSaveBar, {
+			target,
+			props: {
+				currentValues: {
+					'risk.max_daily_loss': 150,
+					'research.crucible_daily_develop_budget': 60,
+				},
+			},
+		});
+		await flush();
+
+		const buttons = Array.from(target.querySelectorAll('button')) as HTMLButtonElement[];
+		const saveBtn = buttons.find((b) => (b.textContent || '').includes('Save all'));
+		expect(saveBtn).toBeTruthy();
+		saveBtn!.click();
+		await new Promise((r) => setTimeout(r, 30));
+		await flush();
+
+		expect(updateSettingsSectionMock).toHaveBeenCalledTimes(2);
+		expect(maxActive).toBe(1);
+		expect(order.sort()).toEqual(['research', 'risk']);
+		// The dotted research path produced the full nested body.
+		expect(updateSettingsSectionMock).toHaveBeenCalledWith('research', {
+			research_settings: { hypothesis_discipline: { crucible_daily_develop_budget: 60 } },
+		});
+		expect(get(dirtyFields).size).toBe(0);
 	});
 
 	it('refuses to save while a numeric field is empty (null) and names the field', async () => {

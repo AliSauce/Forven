@@ -2326,6 +2326,11 @@ export interface ForvenSettings {
 	pipeline_gate_failure_archive_attempts: number;
 	agent_task_claim_limit: number;
 	brain_task_claim_limit: number;
+	// Throughput preset bundles + the DERIVED active name, both backend-computed
+	// (forven/throughput_policy.py) so the Settings dial can't drift from the
+	// values the backend compares against.
+	throughput_presets?: Record<string, Record<string, number>>;
+	throughput_preset_effective?: string;
 	auto_approve_code_edits: boolean;
 	auto_approve_promotions: boolean;
 	code_strategy_requires_approval: boolean;

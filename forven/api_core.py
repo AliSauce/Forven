@@ -57,6 +57,7 @@ from forven.scheduler import (
     seed_forven_jobs,
 )
 from forven.secret_storage import decrypt_secret, encrypt_secret
+from forven.throughput_policy import THROUGHPUT_DEFAULTS
 from forven import strategy_lifecycle as lifecycle_service
 from forven.workspace import read_workspace, write_workspace
 from forven.util import generate_pkce, generate_state, normalize_stage
@@ -1725,10 +1726,12 @@ _DEFAULT_SETTINGS_PAYLOAD = {
     "throughput_auto_scheduler_control": True,
     "adaptive_pipeline_throughput_enabled": False,
     "pipeline_target_clear_hours": 6,
-    "ideation_interval_minutes": 120,
-    "coding_interval_minutes": 60,
-    "testing_interval_minutes": 60,
-    "graduation_interval_minutes": 120,
+    # Throughput knobs (shared single-source defaults; the scheduler fallbacks
+    # and the "balanced" throughput preset reference the same constants).
+    "ideation_interval_minutes": THROUGHPUT_DEFAULTS["ideation_interval_minutes"],
+    "coding_interval_minutes": THROUGHPUT_DEFAULTS["coding_interval_minutes"],
+    "testing_interval_minutes": THROUGHPUT_DEFAULTS["testing_interval_minutes"],
+    "graduation_interval_minutes": THROUGHPUT_DEFAULTS["graduation_interval_minutes"],
     "scanner_signal_interval_minutes": 5,
     "scanner_execution_interval_minutes": 5,
     "scanner_allow_direct_market_fetch": True,
@@ -1746,9 +1749,9 @@ _DEFAULT_SETTINGS_PAYLOAD = {
     "backtest_matrix_workers": 4,
     # Process-wide cap on concurrent backtest SUBPROCESSES (memory ceiling all the
     # parallel pipeline levers queue on). See forven/strategies/concurrency.py.
-    "backtest_subprocess_budget": 4,
+    "backtest_subprocess_budget": THROUGHPUT_DEFAULTS["backtest_subprocess_budget"],
     # Gauntlet workflows advanced concurrently per tick (1 = serial drain).
-    "gauntlet_drain_workers": 3,
+    "gauntlet_drain_workers": THROUGHPUT_DEFAULTS["gauntlet_drain_workers"],
     "pipeline_saturation_threshold": 100,
     "pipeline_resume_threshold": 60,
     "pipeline_drain_max_seconds": 300,
@@ -1756,7 +1759,7 @@ _DEFAULT_SETTINGS_PAYLOAD = {
     "gauntlet_auto_quick_screen_enabled": True,
     "gauntlet_quick_screen_max_attempts": 3,
     "gauntlet_step_stale_minutes": 30,
-    "agent_task_claim_limit": 12,
+    "agent_task_claim_limit": THROUGHPUT_DEFAULTS["agent_task_claim_limit"],
     "brain_task_claim_limit": 12,
     # Soft cap on the pending brain_invoke queue before the scheduler prunes
     # (generic pings first, routine dispatches preserved; a hard ceiling backstops).
@@ -3120,15 +3123,15 @@ def _apply_settings_section(section: str, payload: dict) -> dict:
         raw_research_settings = payload.get("research_settings")
         if not isinstance(raw_research_settings, dict):
             raw_research_settings = payload
+        stored_research_settings = updates.get("research_settings")
+        if not isinstance(stored_research_settings, dict):
+            stored_research_settings = {}
+        # DEEP-merge the incoming partial over STORED values (the UI sends only
+        # the edited leaves). The previous shallow spread replaced whole nested
+        # dicts, so editing e.g. hypothesis_discipline.crucible_daily_develop_budget
+        # would silently reset its customized siblings back to defaults.
         updates["research_settings"] = _merge_research_settings_payload(
-            _merge_research_settings_payload(updates.get("research_settings"))
-            | {}
-        )
-        updates["research_settings"] = _merge_research_settings_payload(
-            {
-                **dict(updates.get("research_settings") or {}),
-                **dict(raw_research_settings or {}),
-            }
+            _deep_merge_dicts(stored_research_settings, dict(raw_research_settings or {}))
         )
 
     elif section in {"data-engine", "data_engine"}:
@@ -6565,6 +6568,18 @@ def get_settings():
             _name: pipeline_thresholds_for_display(_normalize_pipeline_config({"pipeline_preset": _name}))
             for _name in ("relaxed", "default", "strict")
         }
+    except Exception:
+        pass
+    # Throughput preset bundles + the DERIVED active name (value-compare; nothing
+    # named is persisted). The backend owns both so the Settings dial, the API
+    # payload, and telemetry can never disagree about which preset is in effect.
+    try:
+        from forven.throughput_policy import THROUGHPUT_PRESETS, effective_throughput_preset
+
+        payload["throughput_presets"] = {
+            _name: dict(_bundle) for _name, _bundle in THROUGHPUT_PRESETS.items()
+        }
+        payload["throughput_preset_effective"] = effective_throughput_preset(payload)
     except Exception:
         pass
     # Reflect the authoritative regime-gating values (config.json + env overrides),

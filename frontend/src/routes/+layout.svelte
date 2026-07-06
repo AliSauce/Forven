@@ -16,6 +16,7 @@
 	import LaunchBanner from '$lib/components/LaunchBanner.svelte';
 	import RiskDisclaimerBanner from '$lib/components/RiskDisclaimerBanner.svelte';
 	import AgentProviderBanner from '$lib/components/AgentProviderBanner.svelte';
+	import ThroughputSuggestionBanner from '$lib/components/ThroughputSuggestionBanner.svelte';
 	import ConnectionHealthBanner from '$lib/components/ConnectionHealthBanner.svelte';
 	import UpdateBanner from '$lib/components/UpdateBanner.svelte';
 	import PositionAlertWidget from '$lib/components/PositionAlertWidget.svelte';
@@ -272,6 +273,7 @@
 		<RiskDisclaimerBanner />
 		<UpdateBanner />
 		<AgentProviderBanner />
+		<ThroughputSuggestionBanner />
 		<ConnectionHealthBanner />
 		<LaunchBanner />
 		<GlobalControlStrip />

@@ -2349,6 +2349,16 @@ def handoff_execution_failure_to_developer(
     )
 
 
+def _safe_effective_throughput_preset() -> str:
+    """Effective throughput preset for telemetry; 'unknown' on ANY failure."""
+    try:
+        from forven.throughput_policy import effective_throughput_preset
+
+        return effective_throughput_preset()
+    except Exception:
+        return "unknown"
+
+
 def escalate_to_engineer(
     title: str,
     description: str,
@@ -2373,6 +2383,10 @@ def escalate_to_engineer(
         "severity": severity,
         "context": context or {},
         "reported_at": datetime.now(timezone.utc).isoformat(),
+        # Triage context: whether the instance was throttled (trickle/conserve)
+        # or running hot (max) when the bug surfaced is the first question for
+        # "pipeline is slow/stalled" reports. Never let the stamp break reporting.
+        "throughput_preset": _safe_effective_throughput_preset(),
     }
     # First-class operator notification — the triage queue. Deduped by title so a
     # repeated report of the same bug doesn't spam, while distinct bugs each show.

@@ -44,9 +44,18 @@
 			return;
 		}
 		const sections = Object.entries(grouped);
-		const results = await Promise.allSettled(
-			sections.map(([section, payload]) => updateSettingsSection(section, payload)),
-		);
+		// Save sections SEQUENTIALLY: every section handler read-modify-writes the
+		// same forven:settings KV blob, so concurrent PUTs are a lost-update race
+		// (a multi-section save — e.g. a throughput preset touching bot-operations
+		// AND research — would silently drop one section's values).
+		const results: PromiseSettledResult<unknown>[] = [];
+		for (const [section, payload] of sections) {
+			try {
+				results.push({ status: 'fulfilled', value: await updateSettingsSection(section, payload) });
+			} catch (reason) {
+				results.push({ status: 'rejected', reason });
+			}
+		}
 		const failed = results
 			.map((r, i) => ({ result: r, section: sections[i][0] }))
 			.filter((f) => f.result.status === 'rejected');

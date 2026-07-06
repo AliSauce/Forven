@@ -28,6 +28,21 @@ vi.mock('$lib/settings/manifest', () => ({
       description: '.',
       usedBy: ['x'],
     },
+    {
+      // Deep dotted path (3 levels) — the throughput preset's develop-budget
+      // entry writes research_settings.hypothesis_discipline.* via section
+      // 'research'; grouping must build the full nested body.
+      id: 'research.crucible_daily_develop_budget',
+      label: 'Daily develop budget',
+      default: 150,
+      type: 'number',
+      area: 'system',
+      subsection: 'system-throughput',
+      backendSection: 'research',
+      backendPath: 'research_settings.hypothesis_discipline.crucible_daily_develop_budget',
+      description: '.',
+      usedBy: ['x'],
+    },
   ],
 }));
 
@@ -88,6 +103,19 @@ describe('dirty store', () => {
     expect(Object.keys(grouped).sort()).toEqual(['pipeline', 'risk']);
     expect(grouped.risk).toEqual({ max_daily_loss: 150 });
     expect(grouped.pipeline).toEqual({ quick_screen: { min_sharpe: 0.8 } });
+  });
+
+  it('groups a deep dotted research path into the full nested body', () => {
+    originalValues.set({ 'research.crucible_daily_develop_budget': 150 });
+    markField('research.crucible_daily_develop_budget', 60);
+    const grouped = groupDirtyByBackendSection({
+      'research.crucible_daily_develop_budget': 60,
+    });
+    expect(grouped).toEqual({
+      research: {
+        research_settings: { hypothesis_discipline: { crucible_daily_develop_budget: 60 } },
+      },
+    });
   });
 
   it('groupDirtyByBackendSection returns empty object when nothing dirty', () => {
