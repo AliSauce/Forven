@@ -1258,10 +1258,14 @@ def check_promotion_readiness(strategy_id: str) -> dict:
     config = load_pipeline_config()
     gauntlet_cfg = config.get("gauntlet", {})
     required_tests = gauntlet_cfg.get("required_tests", [])
-    if required_tests:
-        _run_check("validation_artifacts", "gate_require_artifact_rows_enabled",
-                   "gate_require_artifact_rows_required",
-                   _check_artifact_rows_exist, strategy_id, required_tests)
+    # The GATE treats an empty required_tests as "enforce ALL" (strictest);
+    # the readiness report must mirror that, not skip validation entirely —
+    # otherwise an explicit [] shows ready:true over a persisted WFA FAIL
+    # (the 2026-07-03 false-green shape) while the real gate gets STRICTER.
+    _run_check("validation_artifacts", "gate_require_artifact_rows_enabled",
+               "gate_require_artifact_rows_required",
+               _check_artifact_rows_exist, strategy_id,
+               list(required_tests) or list(_GAUNTLET_VALIDATION_TYPES))
 
     ready = all(s["status"] in ("passed", "skipped", "warning") for s in steps)
     return {"ready": ready, "steps": steps, "strategy_id": strategy_id}

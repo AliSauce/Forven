@@ -137,17 +137,25 @@ def cached_family_outcome_stats() -> dict[str, dict[str, int]]:
 
 
 def fetch_crucible_child_signals(crucible_ids: list[str]) -> dict[str, dict[str, Any]]:
-    """One pass over strategies: per-crucible child stage/verdict aggregates."""
+    """One pass over strategies: per-crucible child stage/verdict aggregates.
+
+    Linkage key is hypothesis_id OR (when that's empty) origin_crucible_id —
+    mirroring the planner's _strategy_count semantics. Joining hypothesis_id
+    alone blind-spotted legacy/orphaned survivors that only carry
+    origin_crucible_id, which suppressed the exploit lane for exactly the
+    proven-family crucibles CRUX-1 targets (2026-07-06 audit finding).
+    """
     ids = [str(c) for c in crucible_ids if str(c or "").strip()]
     if not ids:
         return {}
     placeholders = ",".join("?" * len(ids))
     survivor_list = ",".join(f"'{s}'" for s in SURVIVOR_STAGES)
+    link = "COALESCE(NULLIF(TRIM(COALESCE(hypothesis_id, '')), ''), origin_crucible_id)"
     try:
         with get_db() as conn:
             rows = conn.execute(
                 f"""
-                SELECT hypothesis_id,
+                SELECT {link} AS crucible_key,
                        COUNT(*) AS children,
                        SUM(CASE WHEN stage IN ({survivor_list}) THEN 1 ELSE 0 END) AS survivor_children,
                        SUM(CASE WHEN stage = 'gauntlet' THEN 1 ELSE 0 END) AS gauntlet_children,
@@ -155,15 +163,15 @@ def fetch_crucible_child_signals(crucible_ids: list[str]) -> dict[str, dict[str,
                                   OR verdict LIKE '%paper_eligible%' THEN 1 ELSE 0 END) AS positive_children,
                        MAX(created_at) AS last_child_created_at
                 FROM strategies
-                WHERE hypothesis_id IN ({placeholders})
-                GROUP BY hypothesis_id
+                WHERE {link} IN ({placeholders})
+                GROUP BY {link}
                 """,
                 ids,
             ).fetchall()
     except Exception as exc:
         log.debug("crucible child signal query failed: %s", exc)
         return {}
-    return {str(r["hypothesis_id"]): dict(r) for r in rows}
+    return {str(r["crucible_key"]): dict(r) for r in rows}
 
 
 # ── daily develop budget (shared by both dispatch loops) ─────────────────────

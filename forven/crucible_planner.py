@@ -607,35 +607,16 @@ def _plan_for_crucible(
                 priority=2,
             )
 
-    protection_status = str(crucible.get("protection_status") or "").strip().lower()
-    if status == "proven" and protection_status in {"protected", "contested"}:
-        if _strategy_spawn_limit_exhausted(crucible_id):
-            return None
-        if index.prior_action_exists("expand_viable_crucible", crucible_id):
-            return None
-        # Defer to an in-flight promotion-loop develop_candidate for this
-        # hypothesis rather than expanding in parallel (single-owner dedup).
-        if index.open_action_exists("develop_candidate", crucible_id):
-            return None
-        return _action(
-            action_kind="expand_viable_crucible",
-            agent_id="strategy-developer",
-            task_type="develop_candidate",
-            title=f"Expand viable crucible {label}",
-            description=(
-                f"Develop an additional candidate around the protected thesis for {label}: {title}.\n\n"
-                "Call forven_create_strategy or register_strategy with the exact provided "
-                "hypothesis_id/crucible_id. Do not call create_hypothesis."
-            ),
-            crucible_id=crucible_id,
-            priority=4,
-        )
-
-    # CRUX-1 exploit lane: a crucible with a PROMOTED descendant (paper/live)
-    # is the only ground-truth signal of a working thesis, yet the old expand
-    # path required proven+protected — only 2 hypotheses ever qualified, so
-    # ~100% of budget went to exploration. Survivor crucibles may expand
-    # repeatedly (open-task dedup + the spawn limit still bound depth).
+    # CRUX-1 exploit lane FIRST: a crucible with a PROMOTED descendant
+    # (paper/live) is the only ground-truth signal of a working thesis, yet the
+    # old expand path required proven+protected — only 2 hypotheses ever
+    # qualified, so ~100% of budget went to exploration. Survivor crucibles may
+    # expand repeatedly (open-task dedup + the spawn limit still bound depth).
+    # This lane must run BEFORE the proven+protected one-shot block below:
+    # proven auto-sets protection_status='protected', so the one-shot
+    # prior_action_exists gate would otherwise permanently cap the HIGHEST-
+    # value crucibles (proven WITH survivors) at a single lifetime expansion
+    # (2026-07-06 audit finding).
     survivor_children = int((child_signals or {}).get("survivor_children") or 0)
     if survivor_children > 0 and status in {"researching", "proven"}:
         if _strategy_spawn_limit_exhausted(crucible_id):
@@ -660,6 +641,33 @@ def _plan_for_crucible(
             ),
             crucible_id=crucible_id,
             priority=5,
+        )
+
+    protection_status = str(crucible.get("protection_status") or "").strip().lower()
+    if status == "proven" and protection_status in {"protected", "contested"}:
+        # Proven WITHOUT a promoted descendant yet (verdict-proven only):
+        # one-shot expansion, as before. Survivor crucibles never reach this
+        # block — the exploit lane above owns them with repeatable expansion.
+        if _strategy_spawn_limit_exhausted(crucible_id):
+            return None
+        if index.prior_action_exists("expand_viable_crucible", crucible_id):
+            return None
+        # Defer to an in-flight promotion-loop develop_candidate for this
+        # hypothesis rather than expanding in parallel (single-owner dedup).
+        if index.open_action_exists("develop_candidate", crucible_id):
+            return None
+        return _action(
+            action_kind="expand_viable_crucible",
+            agent_id="strategy-developer",
+            task_type="develop_candidate",
+            title=f"Expand viable crucible {label}",
+            description=(
+                f"Develop an additional candidate around the protected thesis for {label}: {title}.\n\n"
+                "Call forven_create_strategy or register_strategy with the exact provided "
+                "hypothesis_id/crucible_id. Do not call create_hypothesis."
+            ),
+            crucible_id=crucible_id,
+            priority=4,
         )
 
     return None

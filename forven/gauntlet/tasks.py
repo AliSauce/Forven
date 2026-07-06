@@ -1551,6 +1551,11 @@ def run_paper_promotion_gate(workflow: dict[str, Any], step: dict[str, Any]) -> 
         or "stale validation" in _blocked_text
         or "engine version" in _blocked_text
         or "validation in flight" in _blocked_text
+        # Insufficient WFA fold evidence is a RETRYABLE absence, never a merit
+        # fail (commit 531e0943's intent): the trade-rate-aware window sizing
+        # re-runs judgeably on the next pass. Draining it to failed_gate
+        # archived genuinely-unjudged strategies via the workflow path.
+        or "window insufficient" in _blocked_text
     ):
         # PENDING RE-VALIDATION, not a merit failure. The gauntlet gate's artifact-
         # ordering / freshness check fails when a validation (walk_forward) is older

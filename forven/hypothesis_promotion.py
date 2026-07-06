@@ -66,7 +66,8 @@ def _score_rows() -> list[dict[str, Any]]:
                          THEN 1 ELSE 0
                        END) AS strategies_since_last_pick
             FROM hypotheses h
-            LEFT JOIN strategies s ON s.hypothesis_id = h.id
+            LEFT JOIN strategies s
+              ON COALESCE(NULLIF(TRIM(COALESCE(s.hypothesis_id, '')), ''), s.origin_crucible_id) = h.id
             WHERE h.manager_state = 'active'
             GROUP BY h.id
             """

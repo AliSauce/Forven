@@ -4826,6 +4826,27 @@ def create_strategy_container(
     same `hypothesis_id` as this new strategy — lineage cannot cross
     hypotheses. Raises ValueError on mismatch.
     """
+    # TRADE-MODE-1 (2026-07-06 audit): a class whose supported_trade_modes
+    # excludes long_only was silently backtested long_only anyway — the
+    # trade-mode resolver defaults to long_only when params carry no
+    # trade_mode, and long_only is always "supported" at resolution. Every
+    # short/both-only strategy therefore ran the whole funnel in the wrong
+    # direction (e.g. custom/adx_momentum_short). This is the single choke
+    # point every creation path funnels through, so inject the class's own
+    # preferred direction here. Best-effort: registry unavailable -> no-op.
+    params = dict(params or {})
+    if "trade_mode" not in params:
+        try:
+            from forven.strategies.registry import _TYPE_MAP, discover
+
+            discover()
+            cls = _TYPE_MAP.get(str(type_ or "").strip())
+            supported = getattr(cls, "supported_trade_modes", None) if cls else None
+            modes = {str(m).strip().lower() for m in supported} if supported else set()
+            if modes and "long_only" not in modes:
+                params["trade_mode"] = "both" if "both" in modes else sorted(modes)[0]
+        except Exception:
+            pass
     normalized_parent = str(parent_strategy_id or "").strip() or None
     if normalized_parent:
         parent_row = conn.execute(

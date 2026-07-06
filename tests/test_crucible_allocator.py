@@ -200,3 +200,78 @@ def test_fetch_crucible_child_signals():
     assert signals["HYP-a"]["survivor_children"] == 1
     assert signals["HYP-a"]["gauntlet_children"] == 1
     assert "HYP-missing" not in signals
+
+
+def test_child_signals_count_origin_crucible_only_links():
+    """Legacy/orphaned children carrying only origin_crucible_id must still
+    count — the hypothesis_id-only join blind-spotted exactly the promoted
+    survivors the exploit lane targets (2026-07-06 audit)."""
+    from forven.crucible_allocator import fetch_crucible_child_signals
+
+    _insert_hypothesis("HYP-o", title="o", created_at="2026-06-01T00:00:00+00:00")
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO strategies (id, name, type, symbol, timeframe, params, stage, status,"
+            " hypothesis_id, origin_crucible_id)"
+            " VALUES ('S_ORIG', 'S_ORIG', 'ema_cross', 'BTC', '1h', '{}', 'paper', 'paper',"
+            " NULL, 'HYP-o')"
+        )
+    signals = fetch_crucible_child_signals(["HYP-o"])
+    assert signals["HYP-o"]["survivor_children"] == 1
+
+
+def test_proven_protected_survivor_gets_repeatable_exploit_lane():
+    """A proven+protected crucible WITH a promoted descendant must take the
+    repeatable exploit lane, not the one-shot prior_action_exists block."""
+    import json as _json
+
+    from forven.crucible_planner import _plan_for_crucible
+
+    _insert_hypothesis("HYP-pp", title="proven winner", status="proven",
+                       created_at="2026-06-01T00:00:00+00:00")
+    with get_db() as conn:
+        conn.execute("UPDATE hypotheses SET protection_status='protected' WHERE id='HYP-pp'")
+        # A PRIOR completed expand exists — the one-shot gate would refuse.
+        conn.execute(
+            "INSERT INTO agent_tasks (agent_id, type, title, description, input_data, status)"
+            " VALUES ('strategy-developer', 'develop_candidate', 't', 'd', ?, 'reviewed')",
+            (_json.dumps({"action_kind": "expand_viable_crucible", "crucible_id": "HYP-pp"}),),
+        )
+    _insert_strategy("S_PP", "HYP-pp", "paper")
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO backtest_results (result_id, strategy_id, result_type, symbol, timeframe)"
+            " VALUES ('bt_pp', 'S_PP', 'backtest', 'BTC', '1h')"
+        )
+
+    crucible = {"id": "HYP-pp", "display_id": "HYP-pp", "title": "proven winner",
+                "status": "proven", "protection_status": "protected"}
+    action = _plan_for_crucible(crucible, child_signals={"survivor_children": 1})
+    assert action is not None
+    assert action.action_kind == "expand_viable_crucible"
+    assert "promoted (paper/live) descendant" in action.description
+
+
+def test_trade_mode_injected_for_short_only_class(monkeypatch):
+    """TRADE-MODE-1: creating a container for a class that cannot trade
+    long_only injects the class's preferred direction into stored params."""
+    import forven.strategies.registry as registry
+    from forven.db import create_strategy_container
+
+    class FakeShort:
+        supported_trade_modes = {"short_only", "both"}
+
+    monkeypatch.setattr(registry, "discover", lambda: None)
+    monkeypatch.setattr(registry, "_TYPE_MAP", {"fake_short": FakeShort})
+
+    with get_db() as conn:
+        sid, _, _ = create_strategy_container(
+            conn=conn, name="t", type_="fake_short", symbol="BTC",
+            timeframe="1h", params={"lookback": 20},
+        )
+        row = conn.execute("SELECT params FROM strategies WHERE id=?", (sid,)).fetchone()
+    import json as _json
+
+    params = _json.loads(row["params"])
+    assert params["trade_mode"] == "both"
+    assert params["lookback"] == 20
