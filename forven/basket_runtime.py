@@ -503,12 +503,20 @@ def _hl_funding_matrix(panel):
     from forven.basket_live import lake_symbol_to_exchange_asset
     from forven.dataeng.venue import load_hl_funding_series
 
+    last_label = panel.index[-1]
     columns = {}
     found = 0
     for symbol in panel.symbols:
         series = load_hl_funding_series(lake_symbol_to_exchange_asset(symbol))
         if series is not None and not series.empty:
-            columns[symbol] = series.reindex(panel.index, method=None)
+            # A snapshot taken THIS hour lands after the last CLOSED bar's
+            # label — clamp future-of-panel stamps onto the final label so the
+            # freshest rate survives exact reindexing (no lookahead: the tick
+            # ranks on data observed before it runs).
+            clamped = series.copy()
+            clamped.index = clamped.index.map(lambda t: min(t, last_label))
+            clamped = clamped[~clamped.index.duplicated(keep="last")]
+            columns[symbol] = clamped.reindex(panel.index, method=None)
             found += 1
         else:
             columns[symbol] = pd.Series(float("nan"), index=panel.index)
@@ -536,7 +544,10 @@ def _tick_hl_book(panel, now, config) -> dict | None:
         state = _fresh_state(get_now().isoformat())
         state["name"] = "funding_carry_hl"
     new_state, report = tick_basket(state, hl_panel, now, config)
-    if report.get("ticked"):
+    # Never persist an EMPTY first rebalance: it would lock the 24h cadence on
+    # a book that holds nothing (a thin-coverage tick should retry next hour).
+    established = bool(state.get("weights")) or bool(state.get("rebalances"))
+    if report.get("ticked") and (new_state.get("weights") or established):
         kv_set_best_effort(BASKET_HL_KV_KEY, new_state)
     return report
 

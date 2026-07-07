@@ -400,6 +400,50 @@ def test_hl_book_ticks_and_persists(forven_db, monkeypatch):
     assert basket_runtime.get_basket_state("binance") is None
 
 
+def test_hl_funding_matrix_clamps_snapshot_after_last_bar(monkeypatch):
+    # The live snapshot is stamped at the CURRENT hour, which lands after the
+    # panel's last closed bar. Exact reindexing dropped it (231 assets -> a
+    # 0-leg book on first real seed); it must clamp onto the final label.
+    import pandas as pd
+
+    from forven import basket_runtime
+    import forven.dataeng.venue as venue
+
+    panel = _panel()
+    off_grid = panel.index[-1] + pd.Timedelta(hours=1)
+
+    def _fake_series(coin):
+        if coin == "AAA":
+            return pd.Series([0.002], index=pd.DatetimeIndex([off_grid]))
+        return None
+
+    monkeypatch.setattr(venue, "load_hl_funding_series", _fake_series)
+    matrix, found = basket_runtime._hl_funding_matrix(panel)
+    assert found == 1
+    assert matrix["AAA-USDT"].loc[panel.index[-1]] == pytest.approx(0.002)
+
+
+def test_hl_book_empty_first_rebalance_not_persisted(forven_db, monkeypatch):
+    # Coverage guard passes (series exist) but every value is too stale to be
+    # eligible -> empty target. An empty FIRST rebalance must not persist, or
+    # it locks the 24h cadence on a book that holds nothing.
+    import pandas as pd
+
+    from forven import basket_runtime
+    import forven.dataeng.venue as venue
+
+    panel = _panel()
+    stale = panel.index[0]  # ~100h before now, far past the funding window
+
+    def _fake_series(coin):
+        return pd.Series([0.001], index=pd.DatetimeIndex([stale]))
+
+    monkeypatch.setattr(venue, "load_hl_funding_series", _fake_series)
+    report = basket_runtime._tick_hl_book(panel, _now(panel), _config(n_legs=1))
+    assert report and report["ticked"]
+    assert basket_runtime.get_basket_state("hyperliquid") is None
+
+
 def test_hl_book_refuses_thin_coverage(forven_db, monkeypatch):
     from forven import basket_runtime
     import forven.dataeng.venue as venue
