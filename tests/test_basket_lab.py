@@ -121,3 +121,32 @@ def test_funding_interval_hours_from_observed_grid(tmp_path, monkeypatch):
     assert basket_lab._funding_interval_hours("AAA-USDT") == 8.0
     assert basket_lab._funding_interval_hours("BBB-USDT") == 4.0
     assert basket_lab._funding_interval_hours("ZZZ-USDT") == 8.0  # no history -> default
+
+
+def test_per_hour_funding_expires_after_final_print(tmp_path, monkeypatch):
+    """A dead feed must go NaN one interval (+1h grace) past its final print —
+    unbounded forward-fill let a delisted symbol's weeks-old rate rank as
+    current forever (2026-07-07: TON-USDT, last print two weeks stale), and
+    the runtime's 9h staleness mask measures this matrix, so it never saw it.
+    Interior prints still fill normally up to the next print."""
+    import forven.basket_lab as basket_lab
+    import forven.data_manager as data_manager
+
+    monkeypatch.setattr(data_manager, "FUNDING_DIR", tmp_path)
+    d = tmp_path / "AAA-USDT"
+    d.mkdir()
+    prints = pd.date_range("2026-01-01", periods=4, freq="8h", tz="UTC")  # last: 01-02 00:00
+    pd.DataFrame({"timestamp": prints, "funding_rate": [0.0008] * 4}).to_parquet(
+        d / "history.parquet"
+    )
+    # Panel keeps ticking hourly for 3 more days after the feed dies.
+    index = pd.date_range("2026-01-01", "2026-01-05", freq="1h", tz="UTC")
+    series = basket_lab._per_hour_funding_series("AAA-USDT", index)
+
+    # Backed bars: per-print conversion (0.0008 / 8h) up to expiry.
+    assert series.loc["2026-01-01T12:00:00Z"] == pytest.approx(0.0001)
+    # Still current through final print + 8h interval + 1h grace...
+    assert series.loc["2026-01-02T09:00:00Z"] == pytest.approx(0.0001)
+    # ...and NaN after the final print expires.
+    assert pd.isna(series.loc["2026-01-02T10:00:00Z"])
+    assert series.loc["2026-01-02T10:00:00Z":].isna().all()

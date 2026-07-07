@@ -154,7 +154,18 @@ def _per_hour_funding_series(symbol: str, index: pd.DatetimeIndex) -> pd.Series 
             (frame["rate"] / hours).values,
             index=pd.DatetimeIndex(frame["ts"]).as_unit("ns"),
         )
-        return per_hour.reindex(pd.DatetimeIndex(index).as_unit("ns"), method="ffill")
+        aligned = per_hour.reindex(pd.DatetimeIndex(index).as_unit("ns"), method="ffill")
+        # A print is only CURRENT for its own interval (+1h collection grace).
+        # Interior prints self-terminate at the next print, but the FINAL one
+        # would otherwise carry forward unbounded — a dead/delisted feed reads
+        # as "fresh" forever, and the downstream staleness mask cannot catch it
+        # because it measures this already-filled matrix (its last_valid_index
+        # is just the symbol's last OHLCV bar). Expire the tail instead
+        # (2026-07-07: TON-USDT's June-23 print was still being ranked as the
+        # current rate two weeks later).
+        expiry = frame["ts"].iloc[-1] + pd.Timedelta(hours=float(hours.iloc[-1]) + 1.0)
+        aligned[aligned.index > expiry] = float("nan")
+        return aligned
     except Exception:
         log.debug("per-print funding conversion failed for %s", symbol, exc_info=True)
         return None
