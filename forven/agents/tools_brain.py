@@ -156,6 +156,20 @@ def _tool_assign_agent_task(params: dict) -> str:
         agent_id, task_type, title, description, input_data=input_data, strategy_id=strategy_id
     )
 
+    # Assignment guards (terminal-stage / dethrone-protection) cancel a task at
+    # creation; saying "Task assigned" for those teaches the Brain to re-dispatch
+    # the same impossible goal every cycle. Report the refusal and its reason.
+    try:
+        with get_db() as conn:
+            row = conn.execute(
+                "SELECT status, error FROM agent_tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+        if row and str(row["status"] or "").strip().lower() == "cancelled":
+            reason = str(row["error"] or "").strip() or "cancelled by an assignment guard"
+            return f"Task NOT dispatched: {reason}"
+    except Exception:
+        pass
+
     # Link the created task to the Brain decision that spawned it (when the
     # runtime worker recorded one for this cycle) so decision → task → outcome
     # joins work.

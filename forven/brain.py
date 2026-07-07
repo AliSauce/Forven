@@ -1392,6 +1392,73 @@ def _terminal_task_strategy_stage(conn, strategy_id: str | None) -> str | None:
     return stage if stage in _TERMINAL_TASK_STAGES else None
 
 
+_DETHRONE_TASK_INTENT_RE = re.compile(
+    r"\b(demote|demotion|dethrone|retire|retirement|archive|close[-\s]?out|scrub|flip\s+stage)\b"
+    r"|\bclose\b[^\n]{0,60}\b(trade|position|E\d{3,})\b",
+    re.IGNORECASE,
+)
+
+
+def _dethrone_protected_task_block(
+    conn, strategy_id: str | None, title: str, description: str
+) -> str | None:
+    """Refuse demotion/close-out tasks aimed at a dethrone-protected strategy.
+
+    The soak/cooldown guards block the stage transition itself, but the Brain
+    re-dispatches agents at the same blocked goal every cycle (observed: 4+
+    agent tasks in a day against one soak-protected strategy, each burning a
+    full agent run on a transition that cannot succeed). Park the goal at
+    assignment time with the same reason the transition gate gives.
+
+    The strategy id is re-resolved from the task text here because demotion
+    tasks arrive under task types (execution, risk_audit, ...) that
+    _resolve_task_strategy_id deliberately excludes from text inference.
+    Fail-open: resolution/config errors allow the assignment.
+    """
+    text = f"{title or ''}\n{description or ''}"
+    if not _DETHRONE_TASK_INTENT_RE.search(text):
+        return None
+    try:
+        sid = str(strategy_id or "").strip().upper()
+        if not sid:
+            for candidate in re.findall(r"\bS\d{3,}\b", text.upper()):
+                if conn.execute(
+                    "SELECT 1 FROM strategies WHERE id = ? LIMIT 1", (candidate,)
+                ).fetchone():
+                    sid = candidate
+                    break
+        if not sid:
+            return None
+        row = conn.execute(
+            "SELECT stage, status, stage_changed_at FROM strategies WHERE id = ? LIMIT 1",
+            (sid,),
+        ).fetchone()
+        if not row:
+            return None
+        current_stage = str(row["stage"] or row["status"] or "").strip().lower()
+        try:
+            cooldown_until = dethrone_cooldown_active_until(sid, conn=conn)
+        except Exception:
+            cooldown_until = None
+        if cooldown_until:
+            block = f"operator deny cooldown until {cooldown_until}"
+        else:
+            block = _paper_dethrone_soak_block(conn, sid, current_stage)
+        if not block:
+            return None
+        return (
+            f"{sid} is dethrone-protected ({block}). Its current stage is "
+            f"'{current_stage}' as of {row['stage_changed_at']} — earned through the "
+            f"normal pipeline, so any earlier archival you remember is stale. Do not "
+            f"re-assign demotion/close-out tasks for it; the protection expires on its "
+            f"own, and only the operator can demote sooner (manual demotions execute "
+            f"directly)."
+        )
+    except Exception:
+        log.warning("dethrone-protected task check failed", exc_info=True)
+        return None
+
+
 def transition_stage(
     strategy_id: str,
     target_stage: str,
@@ -3170,6 +3237,24 @@ def assign_task_direct(
                 resolved_strategy_id,
                 terminal_stage,
             )
+        elif str(task_type or "").strip().lower() not in ("post_mortem", "manual"):
+            dethrone_block = _dethrone_protected_task_block(
+                conn, resolved_strategy_id, title, description
+            )
+            if dethrone_block:
+                conn.execute(
+                    """UPDATE agent_tasks
+                       SET status = 'cancelled',
+                           completed_at = ?,
+                           error = ?
+                       WHERE id = ?""",
+                    (
+                        datetime.now(timezone.utc).isoformat(),
+                        dethrone_block,
+                        task_id,
+                    ),
+                )
+                log.info("Cancelled task %s: %s", display_id, dethrone_block)
 
         if needs_approval:
             conn.execute(

@@ -443,3 +443,114 @@ def test_approval_context_fail_soft_missing_strategy(forven_db):
 
     assert context["strategy_context"] is None
     assert context["approval"]["id"] == approval_id
+
+
+# --- dethrone-protected task dispatch brake ----------------------------------
+#
+# The 2026-07-07 E0113/S05799 loop: the Brain re-dispatched close-out/demotion
+# agent tasks every cycle against a soak-protected strategy (the transition
+# gate blocked each attempt, so the goal could never complete). Demotion-intent
+# tasks aimed at a dethrone-protected strategy are now cancelled at assignment
+# with the same reason the gate gives.
+
+
+def _assigned_task_state(task_id):
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT status, error FROM agent_tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+    return str(row["status"] or ""), str(row["error"] or "")
+
+
+def test_close_out_task_for_soak_protected_strategy_is_cancelled(forven_db):
+    from forven.brain import assign_task_direct
+
+    sid = _seed_strategy("S77790", stage_age_days=1.0)
+    task_id = assign_task_direct(
+        "risk-manager",
+        "execution",
+        f"R-1-01: close E0999 ({sid} SOL long, archived container)",
+        f"Close trade E0999 and flip {sid} stage to archived.",
+    )
+    status, error = _assigned_task_state(task_id)
+    assert status == "cancelled"
+    assert "dethrone-protected" in error
+    assert sid in error
+
+
+def test_non_demotion_task_for_soak_protected_strategy_dispatches(forven_db):
+    from forven.brain import assign_task_direct
+
+    sid = _seed_strategy("S77791", stage_age_days=1.0)
+    task_id = assign_task_direct(
+        "quant-researcher",
+        "analysis",
+        f"Review {sid} paper performance",
+        f"Summarize {sid} open-trade PnL and regime fit. No lifecycle action.",
+    )
+    status, _ = _assigned_task_state(task_id)
+    assert status != "cancelled"
+
+
+def test_close_out_task_after_soak_window_dispatches(forven_db):
+    from forven.brain import assign_task_direct
+
+    sid = _seed_strategy("S77792", stage_age_days=30.0)
+    task_id = assign_task_direct(
+        "risk-manager",
+        "execution",
+        f"Demote {sid}",
+        f"Demote {sid} to archived after repeated WFA failures.",
+    )
+    status, _ = _assigned_task_state(task_id)
+    assert status != "cancelled"
+
+
+def test_close_out_task_during_deny_cooldown_is_cancelled(forven_db):
+    from forven.brain import assign_task_direct
+
+    sid = _seed_strategy("S77793", stage_age_days=30.0)
+    record_dethrone_deny(sid)
+    task_id = assign_task_direct(
+        "risk-manager",
+        "risk_audit",
+        f"Retire {sid}",
+        f"Retire {sid}; the operator denied the last recommendation but metrics look bad.",
+    )
+    status, error = _assigned_task_state(task_id)
+    assert status == "cancelled"
+    assert "cooldown" in error.lower()
+
+
+def test_manual_close_out_task_for_protected_strategy_dispatches(forven_db):
+    from forven.brain import assign_task_direct
+
+    sid = _seed_strategy("S77794", stage_age_days=1.0)
+    task_id = assign_task_direct(
+        "full-stack-engineer",
+        "manual",
+        f"Operator: demote {sid}",
+        f"The operator asked via Discord to demote {sid}.",
+    )
+    status, _ = _assigned_task_state(task_id)
+    assert status != "cancelled"
+
+
+def test_assign_agent_task_tool_reports_cancelled_dispatch(forven_db):
+    from forven.agents import tools_brain
+
+    sid = _seed_strategy("S77795", stage_age_days=1.0)
+    with get_db() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO agents (id, name, role) VALUES ('risk-manager', 'Risk Manager', 'risk')"
+        )
+    result = tools_brain._tool_assign_agent_task(
+        {
+            "agent_id": "risk-manager",
+            "task_type": "execution",
+            "title": f"Close E0998 on {sid}",
+            "description": f"Close trade E0998 and archive {sid}.",
+        }
+    )
+    assert result.startswith("Task NOT dispatched:"), result
+    assert "dethrone-protected" in result
