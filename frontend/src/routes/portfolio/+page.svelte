@@ -143,6 +143,27 @@
 		}
 	}
 
+	let confirmingHlReset = false;
+	let hlResetBusy = false;
+	async function doHlReset() {
+		if (!confirmingHlReset) {
+			confirmingHlReset = true;
+			return;
+		}
+		confirmingHlReset = false;
+		hlResetBusy = true;
+		actionMessage = '';
+		try {
+			await resetPortfolioBasket('hyperliquid');
+			actionMessage = 'HL-native book reset — it re-initializes on the next tick.';
+			await load();
+		} catch (e) {
+			actionMessage = `HL reset failed: ${e instanceof Error ? e.message : e}`;
+		} finally {
+			hlResetBusy = false;
+		}
+	}
+
 	async function refreshAllocation() {
 		refreshBusy = true;
 		actionMessage = '';
@@ -595,7 +616,19 @@
 						<span class="ml-2 text-[10px] font-normal normal-case text-[#667]">ranks HL's own funding — live execution follows THIS book, never the Binance one</span>
 					</h3>
 					{#if hlBook?.exists}
-						<span class="text-[10px] text-[#667]">{hlBook.positions?.count ?? 0} positions · {hlBook.rebalances ?? 0} rebalances</span>
+						<span class="flex items-center gap-2 text-[10px] text-[#667]">
+							{hlBook.positions?.count ?? 0} positions · {hlBook.rebalances ?? 0} rebalances
+							<button
+								class={`border px-1.5 py-0.5 uppercase tracking-wider ${confirmingHlReset ? 'border-red-800 text-red-400' : 'border-[#1a2438] text-[#667] hover:text-[#99a]'}`}
+								disabled={hlResetBusy}
+								on:click={doHlReset}
+							>
+								{confirmingHlReset ? 'Confirm reset' : 'Reset'}
+							</button>
+							{#if confirmingHlReset}
+								<button class="text-[#666] hover:text-[#888]" on:click={() => (confirmingHlReset = false)}>cancel</button>
+							{/if}
+						</span>
 					{/if}
 				</div>
 				{#if hlBook?.exists}

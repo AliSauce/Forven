@@ -98,11 +98,15 @@ def post_portfolio_basket_tick():
 
 
 @router.post("/api/portfolio/basket/reset")
-def post_portfolio_basket_reset(body: ConfirmBody):
+def post_portfolio_basket_reset(body: ConfirmBody, venue: str = "binance"):
     _require_portfolio_layer()
+    from fastapi import HTTPException
+
     from forven.basket_runtime import reset_basket_state
 
-    return {"ok": reset_basket_state()}
+    if venue not in ("binance", "hyperliquid"):
+        raise HTTPException(status_code=400, detail=f"unknown basket venue: {venue}")
+    return {"ok": reset_basket_state(venue), "venue": venue}
 
 
 # PORT-LIVE-1: live basket execution arming. Mirrors GO-LIVE-1: typed

@@ -134,8 +134,10 @@ export async function tickPortfolioBasket(): Promise<{ ok: boolean; report: unkn
 	return fetchApi('/api/portfolio/basket/tick', { method: 'POST' });
 }
 
-export async function resetPortfolioBasket(): Promise<{ ok: boolean }> {
-	return fetchApi('/api/portfolio/basket/reset', {
+export async function resetPortfolioBasket(
+	venue: 'binance' | 'hyperliquid' = 'binance'
+): Promise<{ ok: boolean }> {
+	return fetchApi(`/api/portfolio/basket/reset?venue=${venue}`, {
 		method: 'POST',
 		headers: { 'Content-Type': 'application/json' },
 		body: JSON.stringify({ confirm: true }),
