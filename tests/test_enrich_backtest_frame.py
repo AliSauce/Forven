@@ -250,6 +250,51 @@ def test_enrich_stream_failure_logged_at_warning(tmp_path, caplog):
 
 
 # ---------------------------------------------------------------------------
+# _filter_backtest_frame_to_window must not strip enrichment columns
+# ---------------------------------------------------------------------------
+
+def test_window_filter_preserves_enrichment_columns():
+    """Optimizer repro (2026-07-07): grid_search pre-loads ENRICHED candles once
+    and re-windows them per trial via _filter_backtest_frame_to_window. The
+    filter used to route through _normalize_backtest_frame's OHLCV-only
+    projection, silently dropping iv_btc/taker/basis/... — aux-data strategies
+    then emitted zero signals and every trial 'Succeeded' with all-zero
+    metrics."""
+    from forven.strategies.backtest import _filter_backtest_frame_to_window
+
+    frame = _backtest_frame(n=500)
+    frame["iv_btc"] = np.linspace(30.0, 80.0, len(frame))
+    frame["taker_buy_sell_ratio"] = 1.0
+
+    out = _filter_backtest_frame_to_window(
+        frame,
+        start_date="2026-01-05",
+        end_date="2026-01-15",
+        warmup_bars=24,
+    )
+
+    assert not out.empty
+    assert "iv_btc" in out.columns, "enrichment column stripped by the window filter"
+    assert "taker_buy_sell_ratio" in out.columns
+    assert out["iv_btc"].notna().all()
+    # Window semantics unchanged: warmup before start, nothing after end.
+    assert out.index[-1] <= pd.Timestamp("2026-01-15", tz="UTC")
+    assert list(out.columns[:5]) == ["open", "high", "low", "close", "volume"]
+
+
+def test_normalize_backtest_frame_default_still_ohlcv_only():
+    """The default projection contract is unchanged for every other caller."""
+    from forven.strategies.backtest import _normalize_backtest_frame
+
+    frame = _backtest_frame()
+    frame["iv_btc"] = 40.0
+
+    out = _normalize_backtest_frame(frame)
+
+    assert list(out.columns) == ["open", "high", "low", "close", "volume"]
+
+
+# ---------------------------------------------------------------------------
 # load_backtest_candles end to end (dataset path)
 # ---------------------------------------------------------------------------
 

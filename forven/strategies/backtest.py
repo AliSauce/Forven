@@ -1118,7 +1118,7 @@ def _validate_backtest_execution_parity(
 
 
 
-def _normalize_backtest_frame(df: pd.DataFrame | None) -> pd.DataFrame:
+def _normalize_backtest_frame(df: pd.DataFrame | None, *, keep_extra_columns: bool = False) -> pd.DataFrame:
 
 
     columns = ["open", "high", "low", "close", "volume"]
@@ -1178,7 +1178,14 @@ def _normalize_backtest_frame(df: pd.DataFrame | None) -> pd.DataFrame:
     frame = frame.dropna(subset=columns)
 
 
-    frame = frame[columns]
+    if keep_extra_columns:
+        # Enrichment columns (iv_btc/iv_eth, funding_rate, taker flow, basis,
+        # liquidations, ...) must survive: aux-data strategies silently emit
+        # zero signals when their column is absent, so stripping here turns a
+        # windowed re-slice of an already-enriched frame into an all-zero run.
+        frame = frame[columns + [c for c in frame.columns if c not in columns]]
+    else:
+        frame = frame[columns]
 
 
     frame = frame[~frame.index.duplicated(keep="last")]
@@ -1457,7 +1464,10 @@ def _filter_backtest_frame_to_window(
 ) -> pd.DataFrame:
 
 
-    working = _normalize_backtest_frame(frame)
+    # keep_extra_columns: the caller may hand us an ALREADY-ENRICHED frame
+    # (grid_search pre-loads candles once and re-windows them per trial);
+    # normalizing must not strip the enrichment columns strategies key on.
+    working = _normalize_backtest_frame(frame, keep_extra_columns=True)
 
 
     if working.empty:
