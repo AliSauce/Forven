@@ -160,6 +160,40 @@
 			return iso;
 		}
 	};
+
+	// --- reference capital: render fractions as money ------------------------
+	// The engine works in fractions of 1.0 (so results scale to any capital),
+	// but fractions read as noise. Everything renders in dollars at a
+	// reference capital the operator picks; the underlying math is untouched.
+	let referenceCapital = 10_000;
+	onMount(() => {
+		const saved = localStorage.getItem('portfolio.referenceCapital');
+		if (saved && Number(saved) > 0) referenceCapital = Number(saved);
+	});
+	$: if (typeof localStorage !== 'undefined' && referenceCapital > 0) {
+		localStorage.setItem('portfolio.referenceCapital', String(referenceCapital));
+	}
+	const fmtUsd = (fraction: number | null | undefined, digits = 2) => {
+		if (fraction === null || fraction === undefined || Number.isNaN(fraction)) return '—';
+		const usd = fraction * referenceCapital;
+		const abs = Math.abs(usd);
+		const shown = abs >= 1000 ? usd.toLocaleString(undefined, { maximumFractionDigits: 0 }) : usd.toFixed(digits);
+		return `${usd < 0 ? '−' : ''}$${shown.replace('-', '')}`;
+	};
+
+	// Plain-language "what happened" over the last ~24h of ticks.
+	$: last24 = (basket?.recent_ticks ?? []).filter(
+		(t) => Date.now() - new Date(t.t).getTime() < 24 * 3_600_000
+	);
+	$: day = last24.reduce(
+		(acc, t) => ({
+			funding: acc.funding + t.funding_pnl,
+			price: acc.price + t.price_pnl,
+			cost: acc.cost + t.cost,
+			rebalances: acc.rebalances + (t.rebalanced ? 1 : 0),
+		}),
+		{ funding: 0, price: 0, cost: 0, rebalances: 0 }
+	);
 </script>
 
 <svelte:head>
@@ -171,11 +205,23 @@
 		<div>
 			<h1 class="text-lg font-bold uppercase tracking-wider text-white">Portfolio</h1>
 			<p class="text-[11px] text-[#666]">
-				The book above the strategies: measured-risk allocation and basket products. Paper
-				sandboxes are never scaled — everything here proves itself virtually before touching
-				live sizing.
+				The book above the strategies: measured-risk allocation across your strategy team, and
+				basket products run directly at the portfolio level. Everything proves itself on paper
+				before it can touch real sizing.
 			</p>
 		</div>
+		<label class="flex items-center gap-2 text-[11px] text-[#666] shrink-0">
+			Show amounts as if running
+			<span class="flex items-center border border-[#333] bg-[#0a0a0a] px-2 py-1">
+				$<input
+					type="number"
+					bind:value={referenceCapital}
+					min="100"
+					step="1000"
+					class="w-24 bg-transparent text-right text-white outline-none"
+				/>
+			</span>
+		</label>
 	</div>
 
 	{#if error}
@@ -244,28 +290,42 @@
 					</div>
 				{/if}
 
+				<!-- plain-language day summary: the sentence a person actually wants -->
+				{#if last24.length > 0}
+					<div class="border border-[#1a2438] bg-[#050a12] px-3 py-2 text-[11px] text-[#9ab]">
+						<span class="font-bold text-white">Last 24h:</span>
+						collected <span class="text-emerald-400">{fmtUsd(day.funding)}</span> in funding,
+						<span class={day.price >= 0 ? 'text-emerald-400' : 'text-red-400'}>{fmtUsd(day.price)}</span> from price moves,
+						<span class="text-red-300">{day.cost > 0 ? `−${fmtUsd(day.cost)}` : '$0.00'}</span> in costs
+						{#if day.rebalances > 0}· rebalanced {day.rebalances}×{/if}
+						<span class="text-[#556]"> (at ${referenceCapital.toLocaleString()} reference)</span>
+					</div>
+				{/if}
+
 				<div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-2 text-center">
-					<div class="border border-[#222] bg-[#0a0a0a] p-2">
-						<div class="text-[10px] uppercase tracking-wider text-[#666]">Equity</div>
-						<div class="text-base font-bold text-white">{fmtNum(basket.equity, 5)}</div>
+					<div class="border border-[#222] bg-[#0a0a0a] p-2" title="The paper account's value at your reference capital. It started at exactly the reference amount.">
+						<div class="text-[10px] uppercase tracking-wider text-[#666]">Book value</div>
+						<div class="text-base font-bold text-white">{fmtUsd(basket.equity ?? 1)}</div>
 					</div>
 					<div class="border border-[#222] bg-[#0a0a0a] p-2">
-						<div class="text-[10px] uppercase tracking-wider text-[#666]">Total return</div>
+						<div class="text-[10px] uppercase tracking-wider text-[#666]">Total P&L</div>
 						<div
 							class={`text-base font-bold ${(basket.total_return_pct ?? 0) >= 0 ? 'text-emerald-400' : 'text-red-400'}`}
 						>
-							{fmtNum(basket.total_return_pct, 3)}%
+							{fmtUsd((basket.equity ?? 1) - 1)}
+							<span class="block text-[10px] font-normal text-[#666]">{fmtNum(basket.total_return_pct, 3)}%</span>
 						</div>
 					</div>
 					<div
 						class="border border-[#222] bg-[#0a0a0a] p-2"
-						title="Sum of −weight × current funding across the legs, annualized — what the book earns if rates and prices hold. The reason this basket exists."
+						title="What the book earns per year if funding rates and prices hold — the fees it collects for taking the unpopular side. The reason this basket exists."
 					>
-						<div class="text-[10px] uppercase tracking-wider text-[#666]">Expected carry /yr</div>
+						<div class="text-[10px] uppercase tracking-wider text-[#666]">Expected income /yr</div>
 						<div
 							class={`text-base font-bold ${(basket.expected_carry_annualized ?? 0) >= 0 ? 'text-emerald-400' : 'text-red-400'}`}
 						>
-							{fmtPct(basket.expected_carry_annualized, 1)}
+							{fmtUsd(basket.expected_carry_annualized)}
+							<span class="block text-[10px] font-normal text-[#666]">{fmtPct(basket.expected_carry_annualized, 1)}</span>
 						</div>
 					</div>
 					<div class="border border-[#222] bg-[#0a0a0a] p-2">
@@ -325,21 +385,21 @@
 						{/if}
 					</div>
 					<div class="grid grid-cols-3 gap-2 text-center text-[11px]">
-						<div class="border border-[#222] bg-[#0a0a0a] p-2">
-							<div class="text-[#666]">Funding</div>
+						<div class="border border-[#222] bg-[#0a0a0a] p-2" title="Fees collected from (or paid to) the other side of the market — the income this basket exists to harvest. Should dominate.">
+							<div class="text-[#666]">Fees collected (funding)</div>
 							<div class={decomposition.funding >= 0 ? 'text-emerald-400' : 'text-red-400'}>
-								{fmtNum(decomposition.funding, 6)}
+								{fmtUsd(decomposition.funding)}
 							</div>
 						</div>
-						<div class="border border-[#222] bg-[#0a0a0a] p-2">
-							<div class="text-[#666]">Price</div>
+						<div class="border border-[#222] bg-[#0a0a0a] p-2" title="Profit or loss from prices moving. The long and short sides mostly cancel — this should stay small relative to funding.">
+							<div class="text-[#666]">Price moves</div>
 							<div class={decomposition.price >= 0 ? 'text-emerald-400' : 'text-red-400'}>
-								{fmtNum(decomposition.price, 6)}
+								{fmtUsd(decomposition.price)}
 							</div>
 						</div>
-						<div class="border border-[#222] bg-[#0a0a0a] p-2">
-							<div class="text-[#666]">Costs</div>
-							<div class="text-red-300">−{fmtNum(decomposition.cost, 6)}</div>
+						<div class="border border-[#222] bg-[#0a0a0a] p-2" title="Simulated trading fees + slippage paid at each rebalance.">
+							<div class="text-[#666]">Trading costs</div>
+							<div class="text-red-300">−{fmtUsd(decomposition.cost)}</div>
 						</div>
 					</div>
 				</div>
@@ -350,7 +410,7 @@
 					<div>
 						<div class="flex items-baseline justify-between mb-1">
 							<span class="text-[10px] uppercase tracking-wider text-emerald-500">Long (lowest funding)</span>
-							<span class="text-[9px] uppercase tracking-wider text-[#555]">weight · funding /yr · carry /yr</span>
+							<span class="text-[9px] uppercase tracking-wider text-[#555]">weight · funding /yr · earns /yr</span>
 						</div>
 						{#each longLegs as leg (leg.symbol)}
 							<div
@@ -363,10 +423,10 @@
 										{fmtPct(annualizeHourly(leg.funding_rate_hourly), 1)}
 									</span>
 									<span
-										class={`w-14 text-right ${(leg.carry_annualized ?? 0) >= 0 ? 'text-emerald-400' : 'text-red-400'}`}
-										title="This leg's expected carry contribution, annualized"
+										class={`w-20 text-right ${(leg.carry_annualized ?? 0) >= 0 ? 'text-emerald-400' : 'text-red-400'}`}
+										title="What this leg earns per year at current rates, at your reference capital"
 									>
-										{fmtPct(leg.carry_annualized, 1)}
+										{leg.carry_annualized !== null ? fmtUsd(leg.carry_annualized) : '—'}
 									</span>
 								</span>
 							</div>
@@ -377,7 +437,7 @@
 					<div>
 						<div class="flex items-baseline justify-between mb-1">
 							<span class="text-[10px] uppercase tracking-wider text-red-500">Short (highest funding)</span>
-							<span class="text-[9px] uppercase tracking-wider text-[#555]">weight · funding /yr · carry /yr</span>
+							<span class="text-[9px] uppercase tracking-wider text-[#555]">weight · funding /yr · earns /yr</span>
 						</div>
 						{#each shortLegs as leg (leg.symbol)}
 							<div
@@ -390,10 +450,10 @@
 										{fmtPct(annualizeHourly(leg.funding_rate_hourly), 1)}
 									</span>
 									<span
-										class={`w-14 text-right ${(leg.carry_annualized ?? 0) >= 0 ? 'text-emerald-400' : 'text-red-400'}`}
-										title="This leg's expected carry contribution, annualized"
+										class={`w-20 text-right ${(leg.carry_annualized ?? 0) >= 0 ? 'text-emerald-400' : 'text-red-400'}`}
+										title="What this leg earns per year at current rates, at your reference capital"
 									>
-										{fmtPct(leg.carry_annualized, 1)}
+										{leg.carry_annualized !== null ? fmtUsd(leg.carry_annualized) : '—'}
 									</span>
 								</span>
 							</div>
@@ -423,15 +483,15 @@
 									{#each recentTicks as tick (tick.t)}
 										<tr class="border-b border-[#151515] text-[#999]">
 											<td class="py-1 pr-2">{fmtWhen(tick.t)}</td>
-											<td class="py-1 pr-2 text-right text-[#bbb]">{fmtNum(tick.equity, 5)}</td>
+											<td class="py-1 pr-2 text-right text-[#bbb]">{fmtUsd(tick.equity)}</td>
 											<td class={`py-1 pr-2 text-right ${tick.funding_pnl > 0 ? 'text-emerald-400' : tick.funding_pnl < 0 ? 'text-red-400' : 'text-[#555]'}`}>
-												{fmtPct(tick.funding_pnl, 4)}
+												{tick.funding_pnl !== 0 ? fmtUsd(tick.funding_pnl) : '—'}
 											</td>
 											<td class={`py-1 pr-2 text-right ${tick.price_pnl > 0 ? 'text-emerald-400' : tick.price_pnl < 0 ? 'text-red-400' : 'text-[#555]'}`}>
-												{fmtPct(tick.price_pnl, 4)}
+												{tick.price_pnl !== 0 ? fmtUsd(tick.price_pnl) : '—'}
 											</td>
 											<td class={`py-1 pr-2 text-right ${tick.cost > 0 ? 'text-red-300' : 'text-[#555]'}`}>
-												{tick.cost > 0 ? `−${fmtPct(tick.cost, 4)}` : '—'}
+												{tick.cost > 0 ? `−${fmtUsd(tick.cost)}` : '—'}
 											</td>
 											<td class="py-1 text-right">
 												{#if tick.rebalanced}
