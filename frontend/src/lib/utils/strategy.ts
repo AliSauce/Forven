@@ -29,6 +29,8 @@ export interface ManagerRow {
 	in_sample_sharpe: number | null;
 	out_of_sample_sharpe: number | null;
 	robustness_score: number | null;
+	// Last computed Deflated Sharpe snapshot (0-1); null = never computed.
+	deflated_sharpe: number | null;
 	total_return: number | null;
 	max_drawdown: number | null;
 	win_rate: number | null;
@@ -296,6 +298,7 @@ export function parseManagerRow(raw: any, deletedAt?: string): ManagerRow {
 		in_sample_sharpe: inSampleSharpe,
 		out_of_sample_sharpe: outOfSampleSharpe,
 		robustness_score: robustness,
+		deflated_sharpe: readMetricFromSources(row, metricSources, ['deflated_sharpe']),
 		total_return: ret,
 		max_drawdown: dd,
 		win_rate: wr,

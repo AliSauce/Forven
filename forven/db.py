@@ -1952,6 +1952,10 @@ def _run_migrations(conn: sqlite3.Connection):
     _ensure_column(conn, "strategies", "stage_changed_at", "TEXT")
     _ensure_column(conn, "strategies", "compatible_regimes", "JSON")
     _ensure_column(conn, "strategies", "hypothesis_id", "TEXT")
+    # Write-through snapshot of the last computed Deflated Sharpe (advisory;
+    # list views display it without paying the per-strategy computation).
+    _ensure_column(conn, "strategies", "deflated_sharpe", "REAL")
+    _ensure_column(conn, "strategies", "deflated_sharpe_at", "TEXT")
     _ensure_column(conn, "hypotheses", "display_id", "TEXT")
     _ensure_column(conn, "hypotheses", "manager_state", "TEXT NOT NULL DEFAULT 'active'")
     _ensure_column(conn, "hypotheses", "archived_at", "TEXT")

@@ -333,6 +333,21 @@ def compute_strategy_dsr(strategy_id: str, *, default_trials: int | None = None)
         )
         result["n_trials_base"] = int(n_trials_base)
         result["swarm_cluster_attempts"] = int(swarm_attempts)
+        # Write-through snapshot: list views display the last computed DSR
+        # without ever paying this function's cost per row. Strategies whose
+        # DSR was never computed have no value to show.
+        try:
+            dsr_value = result.get("dsr")
+            if dsr_value is not None:
+                from datetime import datetime, timezone
+
+                with get_db() as conn:
+                    conn.execute(
+                        "UPDATE strategies SET deflated_sharpe = ?, deflated_sharpe_at = ? WHERE id = ?",
+                        (float(dsr_value), datetime.now(timezone.utc).isoformat(), strategy_id),
+                    )
+        except Exception:
+            pass
         return result
     except Exception:
         return None

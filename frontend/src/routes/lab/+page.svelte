@@ -33,7 +33,7 @@
 	import type { StrategyImportResult } from '$lib/api';
 
 	type Bucket = 'active' | 'parked' | 'trash';
-	type SortField = 'created' | 'cagr' | 'in_sample_cagr' | 'out_of_sample_cagr' | 'return' | 'sharpe' | 'in_sample_sharpe' | 'out_of_sample_sharpe' | 'robustness' | 'drawdown' | 'win_rate' | 'trades' | 'profit_factor';
+	type SortField = 'created' | 'cagr' | 'in_sample_cagr' | 'out_of_sample_cagr' | 'return' | 'sharpe' | 'in_sample_sharpe' | 'out_of_sample_sharpe' | 'robustness' | 'dsr' | 'drawdown' | 'win_rate' | 'trades' | 'profit_factor';
 	type SortDirection = 'asc' | 'desc';
 	type GraveyardStrategyLimitMode = 'capped' | 'unlimited';
 	const STRATEGY_FETCH_PAGE_SIZE = 1000;
@@ -253,6 +253,15 @@
 		return value.toFixed(decimals);
 	}
 
+	function dsrClass(value: number | null): string {
+		// Same informational thresholds as the Gauntlet Status card: ~0.95 is the
+		// conventional significance bar for the Deflated Sharpe probability.
+		if (value === null || !Number.isFinite(value)) return 'text-[#555]';
+		if (value >= 0.95) return 'text-emerald-400';
+		if (value >= 0.8) return 'text-yellow-400';
+		return 'text-red-400';
+	}
+
 	function metricClass(kind: 'return' | 'sharpe' | 'robustness' | 'drawdown' | 'win_rate' | 'profit_factor', value: number | null): string {
 		if (value === null || !Number.isFinite(value)) return 'text-[#555]';
 		switch (kind) {
@@ -349,6 +358,9 @@
 			case 'in_sample_sharpe': return row.in_sample_sharpe ?? Number.NEGATIVE_INFINITY;
 			case 'out_of_sample_sharpe': return row.out_of_sample_sharpe ?? Number.NEGATIVE_INFINITY;
 			case 'robustness': return row.robustness_score ?? Number.NEGATIVE_INFINITY;
+			// Never-computed DSR sinks below genuinely low probabilities on a
+			// descending sort (same treatment as missing Sharpe above).
+			case 'dsr': return row.deflated_sharpe ?? Number.NEGATIVE_INFINITY;
 			// Drawdown is a positive magnitude where lower is better, so unmeasured rows
 			// must sort to the worst (highest) end rather than masquerade as a perfect 0%.
 			case 'drawdown': return row.max_drawdown ?? Number.POSITIVE_INFINITY;
@@ -1239,6 +1251,7 @@
 								<SortableTh field="trades" label="Trades" active={sortBy === 'trades'} direction={sortDirection} on:sort={(e) => toggleSort(e.detail as SortField)} title="Total completed trades across IS + OOS." />
 								<SortableTh field="profit_factor" label="PF" active={sortBy === 'profit_factor'} direction={sortDirection} on:sort={(e) => toggleSort(e.detail as SortField)} title="Full-window profit factor = combined gross profit / combined gross loss. ≥1.5 good, ≥1.0 marginal. ∞ if no losing trades." />
 								<SortableTh field="robustness" label="Rob%" active={sortBy === 'robustness'} direction={sortDirection} on:sort={(e) => toggleSort(e.detail as SortField)} title="Gauntlet robustness score; below 70 fails gate." />
+								<SortableTh field="dsr" label="DSR" active={sortBy === 'dsr'} direction={sortDirection} on:sort={(e) => toggleSort(e.detail as SortField)} title="Deflated Sharpe (0-1): probability the edge survives optimizer selection bias. ≥0.95 significant, ≥0.80 marginal. Shows the last computed value; '-' means it has not been computed yet." />
 								<SortableTh field="out_of_sample_cagr" label="OOS CAGR" active={sortBy === 'out_of_sample_cagr'} direction={sortDirection} on:sort={(e) => toggleSort(e.detail as SortField)} thClass="border-l border-[#222] pl-3" title="Out-of-sample CAGR (annualized). Short windows are shown with muted styling." />
 								<SortableTh field="out_of_sample_sharpe" label="OOS Sharpe" active={sortBy === 'out_of_sample_sharpe'} direction={sortDirection} on:sort={(e) => toggleSort(e.detail as SortField)} title="Out-of-sample annualized Sharpe. Low-trade samples are shown with muted styling." />
 								<SortableTh field="created" label="Created" active={sortBy === 'created'} direction={sortDirection} on:sort={(e) => toggleSort(e.detail as SortField)} />
@@ -1247,9 +1260,9 @@
 						</thead>
 						<tbody>
 							{#if loading}
-								<tr><td colspan="15" class="py-8 text-center text-[#555]">Loading containers...</td></tr>
+								<tr><td colspan="16" class="py-8 text-center text-[#555]">Loading containers...</td></tr>
 							{:else if activeFiltered.length === 0}
-								<tr><td colspan="15" class="py-8 text-center text-[#555]">No active containers match this view.</td></tr>
+								<tr><td colspan="16" class="py-8 text-center text-[#555]">No active containers match this view.</td></tr>
 							{:else}
 								{#each activePageRows as row (row.id)}
 									{@const recovery = recoveryBadge(row)}
@@ -1299,6 +1312,7 @@
 										<td class="py-2 px-2 font-mono text-[#888]">{formatNumber(row.total_trades, 0)}</td>
 										<td class={`py-2 px-2 font-mono ${row.profit_factor_is_infinite ? 'text-emerald-400' : metricClass('profit_factor', row.profit_factor)}`} title={row.profit_factor_is_infinite ? 'No losing trades — profit factor is mathematically infinite' : 'Full-window profit factor'}>{row.profit_factor_is_infinite ? '∞' : formatNumber(row.profit_factor, 2)}</td>
 										<td class={`py-2 px-2 font-mono ${metricClass('robustness', row.robustness_score)}`}>{formatPercent(row.robustness_score, 1)}</td>
+										<td class={`py-2 px-2 font-mono ${dsrClass(row.deflated_sharpe)}`} title="Deflated Sharpe (last computed value)">{formatNumber(row.deflated_sharpe, 2)}</td>
 										<td class={`py-2 px-2 font-mono border-l border-[#222] pl-3 ${row.cagr_is_reliable ? metricClass('return', row.out_of_sample_cagr) : 'text-[#666] italic'}`} title={row.cagr_is_reliable ? 'Out-of-sample CAGR (annualized)' : 'OOS window too short (<1 month) — annualized value may be unreliable'}>{formatPercent(row.out_of_sample_cagr, 2)}</td>
 										<td class={`py-2 px-2 font-mono ${row.sharpe_is_reliable ? metricClass('sharpe', row.out_of_sample_sharpe) : 'text-[#666]'}`} title={row.sharpe_is_reliable ? 'Out-of-sample annualized Sharpe' : 'Low trade count (<20) — Sharpe may be noisy'}>{formatNumber(row.out_of_sample_sharpe, 2)}</td>
 										<td class="py-2 px-2 text-[#666]">{formatDateTime(row.created_at)}</td>
@@ -1342,6 +1356,7 @@
 								<SortableTh field="trades" label="Trades" active={sortBy === 'trades'} direction={sortDirection} on:sort={(e) => toggleSort(e.detail as SortField)} title="Total completed trades across IS + OOS." />
 								<SortableTh field="profit_factor" label="PF" active={sortBy === 'profit_factor'} direction={sortDirection} on:sort={(e) => toggleSort(e.detail as SortField)} title="Full-window profit factor. ≥1.5 good, ≥1.0 marginal. ∞ if no losing trades." />
 								<SortableTh field="robustness" label="Rob%" active={sortBy === 'robustness'} direction={sortDirection} on:sort={(e) => toggleSort(e.detail as SortField)} title="Gauntlet robustness score; below 70 fails gate." />
+								<SortableTh field="dsr" label="DSR" active={sortBy === 'dsr'} direction={sortDirection} on:sort={(e) => toggleSort(e.detail as SortField)} title="Deflated Sharpe (0-1): probability the edge survives optimizer selection bias. ≥0.95 significant, ≥0.80 marginal. Shows the last computed value; '-' means it has not been computed yet." />
 								<SortableTh field="out_of_sample_cagr" label="OOS CAGR" active={sortBy === 'out_of_sample_cagr'} direction={sortDirection} on:sort={(e) => toggleSort(e.detail as SortField)} thClass="border-l border-[#222] pl-3" title="Out-of-sample CAGR (annualized). Short windows are shown with muted styling." />
 								<SortableTh field="out_of_sample_sharpe" label="OOS Sharpe" active={sortBy === 'out_of_sample_sharpe'} direction={sortDirection} on:sort={(e) => toggleSort(e.detail as SortField)} title="Out-of-sample annualized Sharpe. Low-trade samples are shown with muted styling." />
 								<SortableTh field="created" label="Created" active={sortBy === 'created'} direction={sortDirection} on:sort={(e) => toggleSort(e.detail as SortField)} />
@@ -1350,9 +1365,9 @@
 						</thead>
 						<tbody>
 							{#if loading}
-								<tr><td colspan="15" class="py-8 text-center text-[#555]">Loading parked containers...</td></tr>
+								<tr><td colspan="16" class="py-8 text-center text-[#555]">Loading parked containers...</td></tr>
 							{:else if parkedFiltered.length === 0}
-								<tr><td colspan="15" class="py-8 text-center text-[#555]">No parked strategies.</td></tr>
+								<tr><td colspan="16" class="py-8 text-center text-[#555]">No parked strategies.</td></tr>
 							{:else}
 								{#each parkedPageRows as row (row.id)}
 									<tr class="border-t border-[#181818] hover:bg-[#0f0f0f]">
@@ -1382,6 +1397,7 @@
 										<td class="py-2 px-2 font-mono text-[#888]">{formatNumber(row.total_trades, 0)}</td>
 										<td class={`py-2 px-2 font-mono ${row.profit_factor_is_infinite ? 'text-emerald-400' : metricClass('profit_factor', row.profit_factor)}`} title={row.profit_factor_is_infinite ? 'No losing trades — profit factor is mathematically infinite' : 'Full-window profit factor'}>{row.profit_factor_is_infinite ? '∞' : formatNumber(row.profit_factor, 2)}</td>
 										<td class={`py-2 px-2 font-mono ${metricClass('robustness', row.robustness_score)}`}>{formatPercent(row.robustness_score, 1)}</td>
+										<td class={`py-2 px-2 font-mono ${dsrClass(row.deflated_sharpe)}`} title="Deflated Sharpe (last computed value)">{formatNumber(row.deflated_sharpe, 2)}</td>
 										<td class={`py-2 px-2 font-mono border-l border-[#222] pl-3 ${row.cagr_is_reliable ? metricClass('return', row.out_of_sample_cagr) : 'text-[#666] italic'}`} title={row.cagr_is_reliable ? 'Out-of-sample CAGR (annualized)' : 'OOS window too short (<1 month) — annualized value may be unreliable'}>{formatPercent(row.out_of_sample_cagr, 2)}</td>
 										<td class={`py-2 px-2 font-mono ${row.sharpe_is_reliable ? metricClass('sharpe', row.out_of_sample_sharpe) : 'text-[#666]'}`} title={row.sharpe_is_reliable ? 'Out-of-sample annualized Sharpe' : 'Low trade count (<20) — Sharpe may be noisy'}>{formatNumber(row.out_of_sample_sharpe, 2)}</td>
 										<td class="py-2 px-2 text-[#666]">{formatDateTime(row.created_at)}</td>
@@ -1416,6 +1432,7 @@
 								<SortableTh field="trades" label="Trades" active={sortBy === 'trades'} direction={sortDirection} on:sort={(e) => toggleSort(e.detail as SortField)} title="Total completed trades across IS + OOS." />
 								<SortableTh field="profit_factor" label="PF" active={sortBy === 'profit_factor'} direction={sortDirection} on:sort={(e) => toggleSort(e.detail as SortField)} title="Full-window profit factor = combined gross profit / combined gross loss. ≥1.5 good, ≥1.0 marginal. ∞ if no losing trades." />
 								<SortableTh field="robustness" label="Rob%" active={sortBy === 'robustness'} direction={sortDirection} on:sort={(e) => toggleSort(e.detail as SortField)} title="Gauntlet robustness score; below 70 fails gate." />
+								<SortableTh field="dsr" label="DSR" active={sortBy === 'dsr'} direction={sortDirection} on:sort={(e) => toggleSort(e.detail as SortField)} title="Deflated Sharpe (0-1): probability the edge survives optimizer selection bias. ≥0.95 significant, ≥0.80 marginal. Shows the last computed value; '-' means it has not been computed yet." />
 								<SortableTh field="out_of_sample_cagr" label="OOS CAGR" active={sortBy === 'out_of_sample_cagr'} direction={sortDirection} on:sort={(e) => toggleSort(e.detail as SortField)} thClass="border-l border-[#222] pl-3" title="Out-of-sample CAGR (annualized). Short windows are shown with muted styling." />
 								<SortableTh field="out_of_sample_sharpe" label="OOS Sharpe" active={sortBy === 'out_of_sample_sharpe'} direction={sortDirection} on:sort={(e) => toggleSort(e.detail as SortField)} title="Out-of-sample annualized Sharpe. Low-trade samples are shown with muted styling." />
 								<SortableTh field="created" label="Created" active={sortBy === 'created'} direction={sortDirection} on:sort={(e) => toggleSort(e.detail as SortField)} />
@@ -1424,9 +1441,9 @@
 						</thead>
 						<tbody>
 							{#if loading || graveyardLoading}
-								<tr><td colspan="15" class="py-8 text-center text-[#555]">Loading graveyard...</td></tr>
+								<tr><td colspan="16" class="py-8 text-center text-[#555]">Loading graveyard...</td></tr>
 							{:else if trashFiltered.length === 0}
-								<tr><td colspan="15" class="py-8 text-center text-[#555]">Graveyard is empty.</td></tr>
+								<tr><td colspan="16" class="py-8 text-center text-[#555]">Graveyard is empty.</td></tr>
 							{:else}
 								{#each trashPageRows as row (row.id)}
 									<tr class="border-t border-[#181818] hover:bg-[#0f0f0f]">
@@ -1468,6 +1485,7 @@
 										<td class="py-2 px-2 font-mono text-[#888]">{formatNumber(row.total_trades, 0)}</td>
 										<td class={`py-2 px-2 font-mono ${row.profit_factor_is_infinite ? 'text-emerald-400' : metricClass('profit_factor', row.profit_factor)}`} title={row.profit_factor_is_infinite ? 'No losing trades — profit factor is mathematically infinite' : 'Full-window profit factor'}>{row.profit_factor_is_infinite ? '∞' : formatNumber(row.profit_factor, 2)}</td>
 										<td class={`py-2 px-2 font-mono ${metricClass('robustness', row.robustness_score)}`}>{formatPercent(row.robustness_score, 1)}</td>
+										<td class={`py-2 px-2 font-mono ${dsrClass(row.deflated_sharpe)}`} title="Deflated Sharpe (last computed value)">{formatNumber(row.deflated_sharpe, 2)}</td>
 										<td class={`py-2 px-2 font-mono border-l border-[#222] pl-3 ${row.cagr_is_reliable ? metricClass('return', row.out_of_sample_cagr) : 'text-[#666] italic'}`} title={row.cagr_is_reliable ? 'Out-of-sample CAGR (annualized)' : 'OOS window too short (<1 month) — annualized value may be unreliable'}>{formatPercent(row.out_of_sample_cagr, 2)}</td>
 										<td class={`py-2 px-2 font-mono ${row.sharpe_is_reliable ? metricClass('sharpe', row.out_of_sample_sharpe) : 'text-[#666]'}`} title={row.sharpe_is_reliable ? 'Out-of-sample annualized Sharpe' : 'Low trade count (<20) — Sharpe may be noisy'}>{formatNumber(row.out_of_sample_sharpe, 2)}</td>
 										<td class="py-2 px-2 text-[#666]">
