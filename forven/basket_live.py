@@ -78,6 +78,40 @@ def lake_symbol_to_exchange_asset(symbol: str) -> str:
     return _HL_ASSET_ALIASES.get(base, base)
 
 
+# Hard bound on the paper book's summed |weights| the executor will mirror —
+# a corrupted/mis-set gross_leverage must never scale a live wallet unbounded.
+MAX_LIVE_GROSS_WEIGHT = 3.0
+
+
+def _signed_positions(snap: dict | None) -> dict[str, float]:
+    """Wallet positions as ``{ASSET: signed units}`` from a get_positions snapshot.
+
+    ``get_positions`` returns Hyperliquid's raw ``assetPositions`` wrappers —
+    ``{"position": {"coin": ..., "szi": ...}}`` (the shape the kill-switch
+    flatten unwraps at risk.close_all_positions). A flat ``{"asset"/"coin",
+    "size", "direction"}`` row is accepted too so an upstream normalization
+    can't silently blind this module again.
+    """
+    held: dict[str, float] = {}
+    for pos in (snap.get("positions", []) if isinstance(snap, dict) else []):
+        if not isinstance(pos, dict):
+            continue
+        info = pos.get("position", pos)
+        if not isinstance(info, dict):
+            continue
+        asset = str(info.get("coin") or info.get("asset") or "").strip().upper()
+        raw_size = info.get("szi", info.get("size"))
+        try:
+            size = float(raw_size or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if str(info.get("direction") or "").strip().lower() == "short":
+            size = -abs(size)
+        if asset and size != 0.0 and math.isfinite(size):
+            held[asset] = held.get(asset, 0.0) + size
+    return held
+
+
 # ------------------------------------------------------------------- arming
 
 
@@ -212,13 +246,13 @@ def _flatten_wallet(address: str) -> list[dict]:
     except Exception as exc:
         _ledger_append({"event": "flatten_failed", "error": str(exc)})
         return out
-    for pos in snap.get("positions", []) if isinstance(snap, dict) else []:
-        asset = str(pos.get("asset") or pos.get("coin") or "").strip()
-        size = abs(float(pos.get("size") or 0.0))
-        direction = str(pos.get("direction") or ("long" if float(pos.get("size") or 0) > 0 else "short"))
-        if not asset or size <= 0:
-            continue
-        side = "sell" if direction == "long" else "buy"
+    held = _signed_positions(snap)
+    if not held:
+        _ledger_append({"event": "flatten_noop", "reason": "no open positions found in wallet snapshot"})
+        return out
+    for asset, units in sorted(held.items()):
+        size = abs(units)
+        side = "sell" if units > 0 else "buy"
         try:
             result = close_position(asset, size, side, testnet=testnet, vault_address=address)
             ok = not (isinstance(result, dict) and result.get("error"))
@@ -249,19 +283,36 @@ def reconcile_basket_live() -> dict | None:
         _ledger_append({"event": "reconcile_skipped", "reason": "layer or basket disabled"})
         return {"skipped": "layer or basket disabled"}
 
-    from forven.exchange.risk import check_live_strategy_ceiling, is_trading_allowed
+    from forven.exchange.risk import (
+        check_live_strategy_ceiling,
+        get_live_notional_ceilings,
+        is_trading_allowed,
+    )
 
     allowed, why = is_trading_allowed()
     if not allowed:
         _ledger_append({"event": "reconcile_skipped", "reason": f"trading halted: {why}"})
         return {"skipped": f"trading halted: {why}"}
 
+    # Fail CLOSED if the arming ceiling vanished (check_live_strategy_ceiling
+    # alone fails OPEN with no entry) — an armed basket must never trade capless.
+    if not isinstance(get_live_notional_ceilings().get(CEILING_ID), dict):
+        _ledger_append({"event": "reconcile_skipped",
+                        "reason": "arming ceiling missing — disarm and re-arm to restore it"})
+        return {"skipped": "arming ceiling missing"}
+
     state = get_basket_state("hyperliquid") or {}
     weights: dict[str, float] = state.get("weights") or {}
     capital = float(arming.get("capital_usd") or 0.0)
     address = str(arming.get("wallet_address") or "")
-    if not weights or capital <= 0 or not address:
+    if not weights or capital <= 0 or not math.isfinite(capital) or not address:
         return {"skipped": "no targets or malformed arming"}
+    gross_weight = sum(abs(float(w or 0.0)) for w in weights.values())
+    if not math.isfinite(gross_weight) or gross_weight > MAX_LIVE_GROSS_WEIGHT:
+        _ledger_append({"event": "reconcile_skipped",
+                        "reason": f"paper book gross weight {gross_weight:.2f} exceeds the "
+                                  f"{MAX_LIVE_GROSS_WEIGHT}x live bound — refusing to mirror it"})
+        return {"skipped": "gross weight bound exceeded"}
 
     from forven.exchange.hyperliquid import (
         close_position,
@@ -279,30 +330,24 @@ def reconcile_basket_live() -> dict | None:
         _ledger_append({"event": "reconcile_failed", "error": f"snapshot: {exc}"})
         return {"skipped": f"exchange snapshot failed: {exc}"}
 
-    held: dict[str, float] = {}  # asset -> signed units
-    for pos in snap.get("positions", []) if isinstance(snap, dict) else []:
-        asset = str(pos.get("asset") or pos.get("coin") or "").strip().upper()
-        try:
-            size = float(pos.get("size") or 0.0)
-        except (TypeError, ValueError):
-            continue
-        sign = -1.0 if str(pos.get("direction") or "").lower() == "short" else 1.0
-        if asset:
-            held[asset] = held.get(asset, 0.0) + math.copysign(abs(size), sign * (size or 1.0))
+    held = _signed_positions(snap)  # asset -> signed units
 
     targets: dict[str, float] = {}  # asset -> signed target units
     unlistable: list[str] = []
     for symbol, weight in weights.items():
-        asset = lake_symbol_to_exchange_asset(symbol)
-        mid = None
+        # get_all_mids uppercases its keys, so alias assets ("kPEPE") must be
+        # looked up (and keyed) uppercase or every 1000x leg reads as unlisted.
+        asset = lake_symbol_to_exchange_asset(symbol).upper()
         try:
+            weight = float(weight or 0.0)
             mid = float((mids or {}).get(asset) or 0.0)
         except (TypeError, ValueError):
-            mid = 0.0
-        if not mid or mid <= 0:
             unlistable.append(symbol)
             continue
-        targets[asset] = float(weight) * capital / mid
+        if not math.isfinite(weight) or weight == 0.0 or not math.isfinite(mid) or mid <= 0:
+            unlistable.append(symbol)
+            continue
+        targets[asset] = weight * capital / mid
 
     orders: list[dict] = []
     for asset in sorted(set(targets) | set(held)):
@@ -343,9 +388,13 @@ def reconcile_basket_live() -> dict | None:
             continue
         side = "buy" if delta_units > 0 else "sell"
         try:
+            # Hour-bucketed key: a doubled reconcile (scheduler + manual tick)
+            # re-sends the SAME delta with the same key and dedupes; a genuine
+            # new delta within the hour differs in units and passes.
+            dedupe_hour = get_now().strftime("%Y-%m-%dT%H")
             result = market_order(
                 asset, side, abs(delta_units), testnet=testnet, vault_address=address,
-                idempotency_key=f"basket:{asset}:{get_now().isoformat()}",
+                idempotency_key=f"basket:{asset}:{side}:{round(abs(delta_units), 6)}:{dedupe_hour}",
             )
             ok = not (isinstance(result, dict) and result.get("error"))
             orders.append({
@@ -366,13 +415,21 @@ def reconcile_basket_live() -> dict | None:
         "orders_failed": sum(1 for o in orders if not o.get("ok")),
         "unlistable_symbols": unlistable,
     }
-    arming["last_reconcile"] = {
-        "t": report["t"],
-        "orders_ok": report["orders_ok"],
-        "orders_failed": report["orders_failed"],
-        "unlistable": len(unlistable),
-    }
-    kv_set_best_effort(ARMING_KV_KEY, arming)
+    # Re-read the arming record before writing telemetry back: a disarm issued
+    # while this reconcile was placing orders must win — writing the stale
+    # armed=True dict captured at entry would silently re-arm a capless basket.
+    fresh_arming = get_arming()
+    if fresh_arming.get("armed"):
+        fresh_arming["last_reconcile"] = {
+            "t": report["t"],
+            "orders_ok": report["orders_ok"],
+            "orders_failed": report["orders_failed"],
+            "unlistable": len(unlistable),
+        }
+        kv_set_best_effort(ARMING_KV_KEY, fresh_arming)
+    else:
+        _ledger_append({"event": "reconcile_note",
+                        "reason": "disarmed while reconcile was in flight — disarm preserved"})
     if unlistable:
         log.warning("basket live: %d paper legs unlistable on venue: %s", len(unlistable), unlistable)
     return report

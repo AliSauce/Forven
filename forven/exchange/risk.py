@@ -1099,7 +1099,11 @@ def revoke_dead_strategy_ceilings() -> list[str]:
     Bot ceilings (``bot:{id}`` keys) are managed by the Bot Factory and skipped.
     """
     ceilings = get_live_notional_ceilings()
-    sids = [s for s in ceilings if not str(s).startswith("bot:")]
+    # Bot ceilings are managed by the Bot Factory; basket ceilings by the
+    # basket arming/disarm lifecycle. Neither id exists in the strategies
+    # table, so sweeping them here would revoke a LIVE armed cap — after
+    # which check_live_strategy_ceiling fails open.
+    sids = [s for s in ceilings if not str(s).startswith(("bot:", "basket:"))]
     if not sids:
         return []
     stages = _ceiling_stage_map(sids)
@@ -4039,13 +4043,17 @@ def close_all_positions() -> list[dict]:
         close_accounts: list[str | None] = [None]
         try:
             from forven.exchange import books as _books_mod
-            if _books_mod.books_enabled():
-                seen_acc: set[str] = set()
-                for _lbl, _addr in _books_mod.active_book_addresses():
-                    key = str(_addr).strip().lower() if _addr else ""
-                    if key and key not in seen_acc:
-                        seen_acc.add(key)
-                        close_accounts.append(_addr)
+            # active_book_addresses covers direction books (when enabled) AND
+            # named wallets, which hold real positions (live bots, the armed
+            # basket) regardless of the direction-books switch — an emergency
+            # flatten that only empties the master with books off would leave
+            # every named-wallet position running. Sweep it unconditionally.
+            seen_acc: set[str] = set()
+            for _lbl, _addr in _books_mod.active_book_addresses():
+                key = str(_addr).strip().lower() if _addr else ""
+                if key and key not in seen_acc:
+                    seen_acc.add(key)
+                    close_accounts.append(_addr)
         except Exception:
             pass
 

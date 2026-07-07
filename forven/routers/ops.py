@@ -104,8 +104,19 @@ def post_portfolio_basket_reset(body: ConfirmBody, venue: str = "binance"):
 
     from forven.basket_runtime import reset_basket_state
 
+    if not bool(body.confirm):
+        raise HTTPException(status_code=400, detail="confirmation required to reset the basket book")
     if venue not in ("binance", "hyperliquid"):
         raise HTTPException(status_code=400, detail=f"unknown basket venue: {venue}")
+    # Live execution follows the HL book: resetting it while armed would strand
+    # the wallet's open positions unmanaged, then trade against a 1-tick book.
+    from forven.basket_live import basket_live_armed
+
+    if venue == "hyperliquid" and basket_live_armed():
+        raise HTTPException(
+            status_code=409,
+            detail="basket live execution is ARMED and follows the HL book — disarm (and flatten) first",
+        )
     return {"ok": reset_basket_state(venue), "venue": venue}
 
 

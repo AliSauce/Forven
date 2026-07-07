@@ -412,12 +412,10 @@
 					</div>
 					<div
 						class="border border-[#222] bg-[#0a0a0a] p-2"
-						title="What the book earns per year if funding rates and prices hold — the fees it collects for taking the unpopular side. The reason this basket exists."
+						title="This tick's funding rates extrapolated to a year, BEFORE trading costs — historically costs consumed the whole gross carry (clean-data re-validation: net −24% to −42%/yr). Judge the book by its realized equity curve, not this number."
 					>
-						<div class="text-[10px] uppercase tracking-wider text-[#666]">Expected income /yr</div>
-						<div
-							class={`text-base font-bold ${(basket.expected_carry_annualized ?? 0) >= 0 ? 'text-emerald-400' : 'text-red-400'}`}
-						>
+						<div class="text-[10px] uppercase tracking-wider text-[#666]">Gross carry /yr (excl. costs)</div>
+						<div class="text-base font-bold text-[#999]">
 							{fmtUsd(basket.expected_carry_annualized)}
 							<span class="block text-[10px] font-normal text-[#666]">{fmtPct(basket.expected_carry_annualized, 1)}</span>
 						</div>

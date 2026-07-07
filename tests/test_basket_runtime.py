@@ -486,3 +486,33 @@ def test_hl_funding_snapshot_writes_and_dedupes(forven_db, monkeypatch, tmp_path
     assert second["rows_added"] == 0
     series = venue.load_hl_funding_series("BBB")
     assert series is not None and series.iloc[-1] == pytest.approx(-0.00005)
+
+
+def test_funding_accrues_when_labels_lag_wall_clock():
+    """Production timing: bar labels reach the lake 1-4h after their label time
+    and ticks run hourly. Funding must accrue when the label ARRIVES (label
+    anchor), not when a wall-clock window happens to contain it — it never
+    does (the 2026-07-07 audit found 9/9 production ticks at funding 0.0)."""
+    import pandas as pd
+
+    cfg = _config(rebalance_hours=1000, max_stale_hours=100)
+    panel_t0 = _panel(end=pd.Timestamp("2026-07-01T00:00:00Z"))
+    # Tick 1 runs 2h after the freshest label (the lake lags the clock).
+    t1 = _now(panel_t0) + timedelta(hours=2)
+    state, _ = tick_basket(_fresh_state("x"), panel_t0, t1, _config(max_stale_hours=100))
+    assert state["weights"]
+    assert state["last_accrued_label"] == "2026-07-01T00:00:00+00:00"
+    # Tick 2, one hour later, same panel: no new bar landed -> nothing accrues.
+    t2 = t1 + timedelta(hours=1)
+    state, report = tick_basket(state, panel_t0, t2, cfg)
+    assert report["funding_pnl"] == pytest.approx(0.0, abs=1e-12)
+    # Tick 3: ONE new bar landed whose label is still hours older than tick 2 —
+    # the old wall-clock window could never contain it; the anchor books it.
+    panel_t1 = _panel(n_bars=101, end=pd.Timestamp("2026-07-01T01:00:00Z"))
+    t3 = t2 + timedelta(hours=1)
+    state, report = tick_basket(state, panel_t1, t3, cfg)
+    assert report["funding_pnl"] == pytest.approx(0.001, rel=1e-9)
+    assert state["last_accrued_label"] == "2026-07-01T01:00:00+00:00"
+    # Tick 4, same panel again: the bar must accrue exactly once.
+    state, report = tick_basket(state, panel_t1, t3 + timedelta(hours=1), cfg)
+    assert report["funding_pnl"] == pytest.approx(0.0, abs=1e-12)

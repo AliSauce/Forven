@@ -60,10 +60,26 @@ class _Exchange:
         import forven.exchange.hyperliquid as hl
 
         monkeypatch.setattr(hl, "resolve_configured_testnet", lambda *a, **k: True)
-        monkeypatch.setattr(hl, "get_all_mids", lambda testnet=True: dict(self.mids))
+        # get_all_mids uppercases keys in production — mirror that here.
+        monkeypatch.setattr(
+            hl, "get_all_mids",
+            lambda testnet=True: {str(k).upper(): v for k, v in self.mids.items()},
+        )
+
+        def _wrap(p):
+            # Tests author flat {asset, size, direction}; the wire returns
+            # Hyperliquid's raw assetPositions wrapper with a STRING szi —
+            # feed production code the real shape (the original flat mock is
+            # exactly how the schema-blindness bug survived its tests).
+            szi = abs(float(p.get("size") or 0.0))
+            if str(p.get("direction") or "").lower() == "short":
+                szi = -szi
+            return {"position": {"coin": p.get("asset"), "szi": str(szi), "entryPx": "1.0"},
+                    "type": "oneWay"}
+
         monkeypatch.setattr(
             hl, "get_positions",
-            lambda testnet=True, account_address=None: {"positions": list(self.positions)},
+            lambda testnet=True, account_address=None: {"positions": [_wrap(p) for p in self.positions]},
         )
 
         def _market_order(asset, side, size, **kw):
@@ -252,3 +268,106 @@ def test_alias_mapping():
     assert lake_symbol_to_exchange_asset("1000PEPE-USDT") == "kPEPE"
     assert lake_symbol_to_exchange_asset("BTC-USDT") == "BTC"
     assert lake_symbol_to_exchange_asset("ETH/USDT") == "ETH"
+
+
+# ------------------------------------------- audit fixes (2026-07-07)
+
+
+def test_reconcile_noop_when_wallet_matches_targets(forven_db, monkeypatch):
+    """The runaway scenario: a wallet already AT target must produce zero
+    orders — the schema-blindness bug made every tick re-open the full book."""
+    _settings()
+    _paper_book({"AAA-USDT": 0.1, "BBB-USDT": -0.1})
+    _arm(10_000.0)
+    venue = _Exchange(
+        mids={"AAA": 10.0, "BBB": 20.0},
+        positions=[{"asset": "AAA", "size": 100.0, "direction": "long"},
+                   {"asset": "BBB", "size": 50.0, "direction": "short"}],
+    ).install(monkeypatch)
+    report = reconcile_basket_live()
+    assert report["orders"] == []
+    assert venue.market_orders == [] and venue.closes == []
+
+
+def test_reconcile_closes_leg_no_longer_in_targets(forven_db, monkeypatch):
+    _settings()
+    _paper_book({"AAA-USDT": 0.1})
+    _arm(10_000.0)
+    venue = _Exchange(
+        mids={"AAA": 10.0, "BBB": 20.0},
+        positions=[{"asset": "BBB", "size": 50.0, "direction": "long"}],
+    ).install(monkeypatch)
+    report = reconcile_basket_live()
+    assert len(venue.closes) == 1 and venue.closes[0]["asset"] == "BBB"
+    assert venue.closes[0]["side"] == "sell"
+
+
+def test_reconcile_fails_closed_when_ceiling_missing(forven_db, monkeypatch):
+    """check_live_strategy_ceiling fails OPEN with no entry; an armed basket
+    whose ceiling was revoked (the reaper bug) must refuse to trade instead."""
+    from forven.exchange.risk import set_live_notional_ceiling
+
+    _settings()
+    _paper_book({"AAA-USDT": 0.1})
+    _arm(10_000.0)
+    set_live_notional_ceiling(CEILING_ID, None, actor="test-reaper")
+    venue = _Exchange(mids={"AAA": 10.0}).install(monkeypatch)
+    report = reconcile_basket_live()
+    assert report["skipped"] == "arming ceiling missing"
+    assert venue.market_orders == []
+
+
+def test_reconcile_refuses_excessive_gross_weight(forven_db, monkeypatch):
+    _settings()
+    _paper_book({"AAA-USDT": 2.0, "BBB-USDT": -1.5})  # gross 3.5 > 3.0 bound
+    _arm(10_000.0)
+    venue = _Exchange(mids={"AAA": 10.0, "BBB": 20.0}).install(monkeypatch)
+    report = reconcile_basket_live()
+    assert report["skipped"] == "gross weight bound exceeded"
+    assert venue.market_orders == []
+
+
+def test_reconcile_preserves_midflight_disarm(forven_db, monkeypatch):
+    """A disarm landing while orders are in flight must win — the stale
+    armed=True dict captured at reconcile entry must not clobber it."""
+    import forven.exchange.hyperliquid as hl
+
+    _settings()
+    _paper_book({"AAA-USDT": 0.1})
+    _arm(10_000.0)
+    _Exchange(mids={"AAA": 10.0}).install(monkeypatch)
+
+    def disarming_market_order(asset, side, size, **kw):
+        kv_set(ARMING_KV_KEY, {**kv_get(ARMING_KV_KEY, {}), "armed": False})
+        return {"order_id": "X1"}
+
+    monkeypatch.setattr(hl, "market_order", disarming_market_order)
+    report = reconcile_basket_live()
+    assert report["orders_ok"] >= 1
+    assert kv_get(ARMING_KV_KEY, {}).get("armed") is False  # disarm preserved
+
+
+def test_reconcile_prices_alias_assets(forven_db, monkeypatch):
+    """get_all_mids uppercases keys; alias legs (kPEPE) must still price."""
+    _settings()
+    _paper_book({"1000PEPE-USDT": -0.1})
+    _arm(10_000.0)
+    venue = _Exchange(mids={"kPEPE": 0.01}).install(monkeypatch)
+    report = reconcile_basket_live()
+    assert report["unlistable_symbols"] == []
+    assert len(venue.market_orders) == 1
+    assert venue.market_orders[0]["asset"] == "KPEPE"
+    assert venue.market_orders[0]["side"] == "sell"
+
+
+def test_dead_strategy_reaper_spares_basket_ceiling(forven_db):
+    from forven.exchange.risk import (
+        get_live_notional_ceilings,
+        revoke_dead_strategy_ceilings,
+        set_live_notional_ceiling,
+    )
+
+    set_live_notional_ceiling(CEILING_ID, 2000.0, actor="test")
+    revoked = revoke_dead_strategy_ceilings()
+    assert CEILING_ID not in revoked
+    assert CEILING_ID in get_live_notional_ceilings()

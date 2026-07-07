@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import logging
 import math
+import threading
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -77,7 +78,10 @@ MAX_HISTORY_POINTS = 2400  # ~100 days of hourly ticks
 def _float_setting(settings: dict, key: str, default: float) -> float:
     try:
         raw = settings.get(key)
-        return float(raw) if raw is not None else float(default)
+        value = float(raw) if raw is not None else float(default)
+        # float("nan")/inf parse fine but poison every downstream comparison
+        # (deadbands, ceilings, and quantize guards are all False-on-NaN).
+        return value if math.isfinite(value) else float(default)
     except (TypeError, ValueError):
         return float(default)
 
@@ -109,7 +113,10 @@ def _basket_config(settings: dict) -> dict:
         "rebalance_hours": max(_float_setting(settings, "basket_rebalance_hours", DEFAULT_REBALANCE_HOURS), 1.0),
         "n_legs": max(int(_float_setting(settings, "basket_n_legs", DEFAULT_N_LEGS)), 1),
         "rank_buffer": max(int(_float_setting(settings, "basket_rank_buffer", DEFAULT_RANK_BUFFER)), 0),
-        "gross_leverage": max(_float_setting(settings, "basket_gross_leverage", DEFAULT_GROSS_LEVERAGE), 0.01),
+        # Clamped [0.01, 3.0]: the live executor mirrors these weights into a
+        # real wallet, so a fat-fingered knob must not scale gross unbounded
+        # (basket_live enforces the same 3x bound independently).
+        "gross_leverage": min(max(_float_setting(settings, "basket_gross_leverage", DEFAULT_GROSS_LEVERAGE), 0.01), 3.0),
         "universe_min_bars": max(int(_float_setting(settings, "basket_universe_min_bars", DEFAULT_UNIVERSE_MIN_BARS)), 720),
         "trade_cost": (fee_bps + slippage_bps) / 10_000.0,
         "fee_bps": fee_bps,
@@ -225,11 +232,16 @@ def tick_basket(state: dict, panel, now: datetime, config: dict) -> tuple[dict, 
         return state, report
     now_iso = now.isoformat()
 
-    # --- mark-to-market the held weights since the previous tick
+    # --- mark-to-market the held weights since the previous tick.
+    # Funding accrues OUTSIDE the weights guard so the label anchor advances
+    # even while the book holds nothing (a flat spell must not back-accrue).
     price_pnl = 0.0
-    funding_pnl = 0.0
+    funding_pnl, accrued_label = _accrue_funding(
+        state["weights"], panel, state.get("last_accrued_label"), now
+    )
+    if accrued_label:
+        state["last_accrued_label"] = accrued_label
     if state["weights"]:
-        prev_tick_at = state.get("last_tick_at")
         for symbol, weight in state["weights"].items():
             current = closes.get(symbol)
             prev_mark = state["marks"].get(symbol)
@@ -239,7 +251,6 @@ def tick_basket(state: dict, panel, now: datetime, config: dict) -> tuple[dict, 
             if prev_mark and float(prev_mark) > 0:
                 price_pnl += float(weight) * (current / float(prev_mark) - 1.0)
             state["marks"][symbol] = current
-        funding_pnl = _accrue_funding(state["weights"], panel, prev_tick_at, now)
         state["equity"] = float(state["equity"]) * (1.0 + price_pnl + funding_pnl)
         state["cum_price_pnl"] = float(state.get("cum_price_pnl", 0.0)) + price_pnl
         state["cum_funding_pnl"] = float(state.get("cum_funding_pnl", 0.0)) + funding_pnl
@@ -360,35 +371,52 @@ def _check_beta_drift(state: dict) -> None:
         log.debug("beta-drift check failed", exc_info=True)
 
 
-def _accrue_funding(weights: dict, panel, prev_tick_iso: str | None, now: datetime) -> float:
-    """Funding accrued on held weights over the bars since the previous tick.
+def _accrue_funding(
+    weights: dict, panel, last_accrued_iso: str | None, now: datetime
+) -> tuple[float, str | None]:
+    """Funding accrued on held weights, anchored on PANEL LABELS, not tick clocks.
 
-    Sums −w·funding_rate·bar_hours across the elapsed panel bars — the exact
-    accrual run_basket books per bar. Falls back to zero when the window is
-    empty (first tick after a rebalance-only initialization)."""
-    if not weights:
-        return 0.0
+    Sums −w·funding_rate·bar_hours across the not-yet-accrued panel bars — the
+    exact accrual run_basket books per bar. The window must anchor on the last
+    ACCRUED LABEL: funding rows carry bar-open labels that reach the lake 1-4h
+    after their label time, so a wall-clock window (prev_tick, now] can never
+    contain them under steady hourly ticking — the book booked zero funding
+    forever (confirmed on 9/9 production ticks, 2026-07-07). With a label
+    anchor, each late-arriving bar is accrued exactly once, whenever it lands.
+
+    First call initializes the anchor to the panel's freshest label without
+    accruing history (a new book must not book funding from before it held
+    anything). Returns (funding_pnl, new_anchor_iso); the anchor also advances
+    while the book holds nothing, so a flat spell never back-accrues later.
+    """
     try:
-        if prev_tick_iso:
-            since = datetime.fromisoformat(str(prev_tick_iso))
-        else:
-            return 0.0
+        if panel.funding is None or panel.funding.empty:
+            return 0.0, last_accrued_iso
+        if not last_accrued_iso:
+            # Initialize to the freshest label ALREADY ELAPSED at this tick —
+            # never the panel's absolute last row, which a sim/backdated tick
+            # may not have reached yet.
+            eligible = panel.funding.index[panel.funding.index <= now]
+            if not len(eligible):
+                return 0.0, None
+            return 0.0, eligible[-1].isoformat()
+        since = datetime.fromisoformat(str(last_accrued_iso))
         window = panel.funding.loc[panel.funding.index > since]
         window = window.loc[window.index <= now]
         if window.empty:
-            return 0.0
+            return 0.0, last_accrued_iso
         total = 0.0
-        for symbol, weight in weights.items():
+        for symbol, weight in (weights or {}).items():
             if symbol not in window.columns:
                 continue
             rates = window[symbol].dropna()
             if rates.empty:
                 continue
             total += -float(weight) * float(rates.sum()) * float(panel.bar_hours)
-        return total
+        return total, window.index.max().isoformat()
     except Exception:
         log.warning("basket funding accrual failed — booking 0 this tick", exc_info=True)
-        return 0.0
+        return 0.0, last_accrued_iso
 
 
 def _rebalance_due(last_rebalance_iso: str | None, now: datetime, rebalance_hours: float) -> bool:
@@ -459,6 +487,12 @@ def _target_weights(
 # ------------------------------------------------------------ persisted entry
 
 
+# One tick at a time: the hourly scheduler job and the manual /tick endpoint
+# would otherwise read the same exchange snapshot, compute identical deltas,
+# and double-place every live order.
+_TICK_LOCK = threading.Lock()
+
+
 def run_basket_tick(force: bool = False) -> dict | None:
     """Load the universe, tick the basket, persist. The scheduler entry point.
 
@@ -467,6 +501,9 @@ def run_basket_tick(force: bool = False) -> dict | None:
     """
     settings = _load_settings()
     if not force and not basket_enabled(settings):
+        return None
+    if not _TICK_LOCK.acquire(blocking=False):
+        log.warning("basket tick already in flight — skipping the overlapping run")
         return None
     try:
         from forven.basket_lab import build_panel
@@ -523,6 +560,8 @@ def run_basket_tick(force: bool = False) -> dict | None:
     except Exception:
         log.warning("basket tick failed", exc_info=True)
         return None
+    finally:
+        _TICK_LOCK.release()
 
 
 def _hl_funding_matrix(panel):
