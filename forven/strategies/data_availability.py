@@ -24,9 +24,9 @@ This module makes that failure LOUD and PRE-EMPTIVE:
   * BLOCK the backtest with a clear error when a required feed is genuinely
     unavailable, instead of silently zero-filling.
 
-The only intentional failure mode is the explicit unfetchable-block. Any
-*internal* error here fails OPEN (returns ``ok``) so a bug in the guard can
-never brick the backtester.
+The guard fails closed when it cannot establish availability. Running a
+strategy against silently incomplete data is a correctness failure, so callers
+receive a retryable-looking block with the probe error instead of an ``ok``.
 """
 
 from __future__ import annotations
@@ -319,8 +319,9 @@ def _present_columns(symbol: str, timeframe: str) -> frozenset[str]:
             present.update(spec.output_columns)
     except Exception as exc:  # pragma: no cover - defensive
         log.debug("enrichment-spec probe failed for %s/%s: %s", symbol, timeframe, exc)
-        # Fail open: an unknown availability set must not block.
-        return frozenset(_KNOWN_COLUMNS)
+        raise RuntimeError(
+            f"could not inspect enrichment feeds for {symbol} {timeframe}: {exc}"
+        ) from exc
     result = frozenset(present)
     with _AVAIL_LOCK:
         _AVAIL_CACHE[key] = (now, result)
@@ -391,7 +392,8 @@ def evaluate_data_availability(
     Returns a ``DataAvailabilityResult``. ``blocked=True`` with ``error`` set
     means the caller must NOT run the backtest (required feed genuinely
     unavailable). Otherwise it is safe to proceed; ``warnings`` may note feeds
-    that were auto-fetched. Fails OPEN (ok) on any internal error.
+    that were auto-fetched. Internal errors fail closed because an unknown feed
+    set cannot safely certify a backtest input.
 
     ``strategy_cls`` lets registration-time callers probe a class that is not
     yet resolvable through the runtime registry.
@@ -404,7 +406,15 @@ def evaluate_data_availability(
 
             cls = _resolve_strategy_class(strategy_type)
         if cls is None:
-            return result
+            who = strategy_id or strategy_type or "strategy"
+            return DataAvailabilityResult(
+                ok=False,
+                blocked=True,
+                error=(
+                    f"Cannot verify data availability for {who}: "
+                    "strategy class could not be resolved."
+                ),
+            )
 
         # XASSET-1: a cross-asset/second-leg design can never fire on the
         # single-symbol backtest frame — block it before any fetch logic.
@@ -487,6 +497,11 @@ def evaluate_data_availability(
             f"Backtest aborted rather than run on silently zero-filled data."
         )
         return result
-    except Exception as exc:  # pragma: no cover - defensive, must never brick backtests
-        log.warning("data-availability precheck errored (failing open): %s", exc)
-        return DataAvailabilityResult()
+    except Exception as exc:  # pragma: no cover - defensive
+        who = strategy_id or strategy_type or "strategy"
+        log.warning("data-availability precheck errored (failing closed): %s", exc)
+        return DataAvailabilityResult(
+            ok=False,
+            blocked=True,
+            error=f"Cannot verify data availability for {who}: {exc}",
+        )

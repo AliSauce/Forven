@@ -17,6 +17,7 @@ from fastapi import HTTPException
 from forven import strategy_lifecycle as lifecycle
 from forven.db import create_strategy_container, get_db
 from forven.strategies import custom as custom_pkg
+from forven.strategies import imported as imported_pkg
 from forven.strategies import intake as intake_mod
 from forven.strategies import registry
 
@@ -204,11 +205,37 @@ def test_import_unregistered_type_without_source_hints_reexport(forven_db, monke
 
 
 def test_export_bundles_source_code_for_code_class(forven_db, monkeypatch, tmp_path):
+    from forven.sandbox import strategy_worker
+
     temp_custom_dir = _isolate_custom_dir(monkeypatch, tmp_path)
+    temp_imported_dir = tmp_path / "imported"
+    temp_imported_dir.mkdir()
+    imported_init = temp_imported_dir / "__init__.py"
+    imported_init.write_text("", encoding="utf-8")
+    monkeypatch.setattr(imported_pkg, "__file__", str(imported_init))
     type_name = "portability_probe_export"
     strategy_file = temp_custom_dir / f"{type_name}.py"
     _write_custom_strategy(strategy_file, type_name=type_name)
     sys.modules.pop(f"forven.strategies.custom.{type_name}", None)
+    params = {"risk_pct": 0.01, "leverage": 1.0}
+    monkeypatch.setattr(
+        strategy_worker,
+        "validate_custom_module_isolated",
+        lambda *_args, **_kwargs: {
+            "ok": True,
+            "type_name": type_name,
+            "default_params": params,
+            "canonical_params": params,
+            "asset": "BTC",
+            "data_requirements": [{"asset": "BTC"}],
+            "parameter_space": {},
+            "certified": True,
+            "cert_error": None,
+            "lookahead_blocked": False,
+            "lookahead_reason": None,
+            "execution_crash_reason": None,
+        },
+    )
 
     reg = intake_mod.register_custom_strategy_file(file_path=str(strategy_file), source="ai_dropzone")
     source_id = reg["strategy_id"]
@@ -221,6 +248,7 @@ def test_export_bundles_source_code_for_code_class(forven_db, monkeypatch, tmp_p
     assert sc["filename"] == f"{type_name}.py"
     assert "STRATEGY_CLASS" in sc["content"]
     assert f"TYPE_NAME = '{type_name}'" in sc["content"]
+    assert f"forven.strategies.custom.{type_name}" not in sys.modules
 
 
 _SANDBOX_PROBE_SRC = "\n".join(

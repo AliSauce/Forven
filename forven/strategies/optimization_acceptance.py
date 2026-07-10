@@ -434,8 +434,13 @@ def apply_optimized_params_if_accepted(
                 "reason": "strategy is operator-owned (paper/live); optimizer params not applied",
                 "decision": None,
             }
-    except Exception:
-        pass
+    except Exception as exc:
+        return {
+            "applied": False,
+            "code": "param_lock_unavailable",
+            "reason": f"could not verify operator-owned parameter lock: {exc}",
+            "decision": None,
+        }
 
     decision = evaluate_optimization_candidate(
         strategy_id=strategy_id,

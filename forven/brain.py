@@ -1644,7 +1644,7 @@ def transition_stage(
 
                 unloadable = runtime_unloadable_reason(row["type"], row["runtime_type"])
             except Exception as exc:
-                unloadable = None
+                unloadable = f"runtime loadability check unavailable: {exc}"
                 log.warning("Runtime loadability check errored for %s: %s", strategy_id, exc)
             if unloadable:
                 log.error("RUNTIME UNLOADABLE BLOCKED: %s -> %s - %s", strategy_id, normalized_target, unloadable)
@@ -1660,6 +1660,7 @@ def transition_stage(
         # longs 4.5s apart). Operator force bypasses, like the other admission gates.
         if (not force) and normalized_target in {"paper", "deployed", "live_graduated"}:
             _dup_id = None
+            _dup_error = None
             try:
                 from forven.db import find_duplicate_trading_strategy
 
@@ -1677,8 +1678,13 @@ def transition_stage(
                         exclude_id=strategy_id,
                     )
             except Exception as exc:
-                _dup_id = None
+                _dup_error = str(exc)
                 log.warning("Duplicate-strategy check errored for %s: %s", strategy_id, exc)
+            if _dup_error:
+                return _record_blocked_transition(
+                    f"Duplicate-strategy gate unavailable: {_dup_error}",
+                    "duplicate_gate_unavailable",
+                )
             if _dup_id:
                 log.error("DUPLICATE STRATEGY BLOCKED: %s -> %s (identical to trading %s)",
                           strategy_id, normalized_target, _dup_id)
@@ -1705,7 +1711,12 @@ def transition_stage(
                 has_cap, current_count, cap, cap_reason = check_stage_wip_capacity(normalized_target)
             except Exception as cap_exc:  # pragma: no cover - defensive
                 log.warning("WIP cap check failed for %s: %s", normalized_target, cap_exc)
-                has_cap, current_count, cap, cap_reason = True, 0, None, "cap_check_errored"
+                has_cap, current_count, cap, cap_reason = (
+                    False,
+                    0,
+                    None,
+                    f"WIP capacity gate unavailable: {cap_exc}",
+                )
             if not has_cap:
                 log.warning(
                     "WIP CAP BLOCKED %s: %s (%s/%s)",
@@ -1841,6 +1852,60 @@ def transition_stage(
             )
             blocked["approval_id"] = str(approval_id)
             return blocked
+
+        # Gates above deliberately run without a held writer lock because several
+        # open their own DB connections. Serialize only the short commit section,
+        # then revalidate the lifecycle version before the first write. Without
+        # this late check, two callers can both gate the same old stage and record
+        # duplicate or contradictory transitions; the last writer silently wins.
+        conn.execute("BEGIN IMMEDIATE")
+        commit_row = conn.execute(
+            "SELECT stage, status, stage_changed_at, display_id, owner "
+            "FROM strategies WHERE id = ?",
+            (strategy_id,),
+        ).fetchone()
+        commit_stage = (
+            _normalize_stage(commit_row["stage"] or commit_row["status"])
+            if commit_row
+            else None
+        )
+        lifecycle_changed = (
+            not commit_row
+            or commit_stage != current_stage
+            or str(commit_row["stage_changed_at"] or "")
+            != str(row["stage_changed_at"] or "")
+        )
+        if lifecycle_changed:
+            if commit_row and commit_stage == normalized_target:
+                log.info(
+                    "Concurrent transition already completed %s -> %s",
+                    strategy_id,
+                    normalized_target,
+                )
+                return {
+                    "strategy_id": strategy_id,
+                    "from": current_stage,
+                    "to": commit_stage,
+                    "display_id": commit_row["display_id"],
+                    "owner": commit_row["owner"],
+                    "reason_code": "concurrent_idempotent",
+                }
+            actual_stage = commit_stage or "missing"
+            conflict_reason = (
+                f"Lifecycle changed concurrently from {current_stage} to {actual_stage}; "
+                f"the requested transition to {normalized_target} was not applied"
+            )
+            log.warning("Stage transition conflict for %s: %s", strategy_id, conflict_reason)
+            return {
+                "strategy_id": strategy_id,
+                "from": current_stage,
+                "to": actual_stage,
+                "requested_to": normalized_target,
+                "display_id": commit_row["display_id"] if commit_row else row["display_id"],
+                "owner": commit_row["owner"] if commit_row else row["owner"],
+                "blocked_reason": conflict_reason,
+                "reason_code": "lifecycle_conflict",
+            }
 
         now = datetime.now(timezone.utc).isoformat()
         new_owner = STAGE_TO_AGENT.get(normalized_target)
@@ -3686,10 +3751,37 @@ def update_strategy_params(strategy_id: str, params: dict, *, actor: str = "syst
     canonical_params = dict(certification.canonical_params)
     now = datetime.now(timezone.utc).isoformat()
     with get_db() as conn:
-        conn.execute(
-            "UPDATE strategies SET params = ?, updated_at = ? WHERE id = ?",
-            (json.dumps(canonical_params), now, strategy_id),
-        )
+        if str(actor or "").strip().lower() in _USER_ACTORS:
+            updated = conn.execute(
+                "UPDATE strategies SET params = ?, updated_at = ? WHERE id = ?",
+                (json.dumps(canonical_params), now, strategy_id),
+            )
+        else:
+            updated = conn.execute(
+                """UPDATE strategies
+                   SET params = ?, updated_at = ?
+                   WHERE id = ?
+                     AND LOWER(TRIM(COALESCE(stage, status, ''))) NOT IN
+                         ('paper', 'paper_trading', 'live_graduated', 'deployed')""",
+                (json.dumps(canonical_params), now, strategy_id),
+            )
+        if updated.rowcount != 1:
+            locked_row = conn.execute(
+                "SELECT stage, status FROM strategies WHERE id = ?",
+                (strategy_id,),
+            ).fetchone()
+            locked_stage = (
+                str(locked_row["stage"] or locked_row["status"] or "").strip().lower()
+                if locked_row
+                else "missing"
+            )
+            log.warning(
+                "params locked: strategy %s changed to stage %s before write by %r",
+                strategy_id,
+                locked_stage,
+                actor,
+            )
+            return {"locked": True, "strategy_id": strategy_id, "stage": locked_stage}
     log.info("Updated params for strategy: %s", strategy_id)
     log_activity("info", "brain", f"Updated strategy params: {strategy_id}")
 
@@ -3997,7 +4089,8 @@ def try_research_recovery(strategy_id: str) -> dict:
     # re-certify instantly and bounce back into quick_screen while still
     # untestable (S05838 was un-parked 18s after the brain parked it,
     # 2026-07-04). Runs outside the DB context — the probe may synchronously
-    # auto-fetch fetchable feeds. Fails open on internal errors.
+    # auto-fetch fetchable feeds. A probe error is not evidence that the feed is
+    # available, so recovery remains parked until the precondition can be checked.
     try:
         from forven.strategies.data_availability import evaluate_data_availability
 
@@ -4009,7 +4102,13 @@ def try_research_recovery(strategy_id: str) -> dict:
         )
     except Exception as exc:
         log.warning("Research recovery data-availability probe errored for %s: %s", strategy_id, exc)
-        _avail = None
+        block_reason = f"data-availability check unavailable: {exc}"
+        with get_db() as conn:
+            conn.execute(
+                "UPDATE strategies SET status_reason = ? WHERE id = ?",
+                (f"data_check_error: {block_reason[:400]}", strategy_id),
+            )
+        return {"promoted": False, "reason": block_reason}
     if _avail is not None and _avail.blocked:
         block_reason = _avail.error or "required data feed unavailable"
         with get_db() as conn:

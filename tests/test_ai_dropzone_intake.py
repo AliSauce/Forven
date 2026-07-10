@@ -1,17 +1,57 @@
 from __future__ import annotations
 
 import importlib
+import re
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 
 import forven.brain as brain_mod
 from forven.db import create_strategy_container, get_db
 from forven.strategies import custom as custom_pkg
+from forven.strategies import imported as imported_pkg
 from forven.strategies import intake as intake_mod
 from forven.strategies import registry
 from forven.strategy_lifecycle import StrategyPromoteBody, promote_strategy, read_strategies
+
+
+@pytest.fixture(autouse=True)
+def isolated_custom_validation(monkeypatch, tmp_path):
+    from forven.sandbox import strategy_worker
+
+    imported_dir = tmp_path / "imported"
+    imported_dir.mkdir()
+    imported_init = imported_dir / "__init__.py"
+    imported_init.write_text("", encoding="utf-8")
+    monkeypatch.setattr(imported_pkg, "__file__", str(imported_init))
+
+    def validate(module_name: str, *, package: str = "custom", timeout: int = 0):
+        del timeout
+        package_obj = custom_pkg if package == "custom" else imported_pkg
+        module_path = package_obj.__file__
+        source = (module_path and (Path(module_path).resolve().parent / f"{module_name}.py"))
+        text = source.read_text(encoding="utf-8") if source and source.exists() else ""
+        match = re.search(r"^TYPE_NAME\s*=\s*['\"]([^'\"]+)", text, re.MULTILINE)
+        type_name = match.group(1) if match else module_name
+        params = {"risk_pct": 0.01, "leverage": 1.0}
+        return {
+            "ok": True,
+            "type_name": type_name,
+            "default_params": params,
+            "canonical_params": params,
+            "asset": "BTC",
+            "data_requirements": [{"asset": "BTC"}],
+            "parameter_space": {},
+            "certified": True,
+            "cert_error": None,
+            "lookahead_blocked": False,
+            "lookahead_reason": None,
+            "execution_crash_reason": None,
+        }
+
+    monkeypatch.setattr(strategy_worker, "validate_custom_module_isolated", validate)
 
 
 def _write_custom_strategy(
@@ -80,19 +120,25 @@ def test_register_custom_strategy_file_creates_quick_screen_ai_row(forven_db, mo
     assert result["module_name"] == "btc_ai_dropzone_wave_test"
     assert result["stage"] == "quick_screen"
     assert result["source"] == "ai_dropzone"
-    assert result["source_ref"] == str(strategy_file.resolve())
+    assert Path(result["source_ref"]).parent == Path(imported_pkg.__file__).resolve().parent
     assert result["strategy_id"]
 
     with get_db() as conn:
         row = conn.execute(
-            "SELECT stage, source, source_ref FROM strategies WHERE id = ?",
+            "SELECT stage, source, source_ref, type, runtime_type, sandbox_only "
+            "FROM strategies WHERE id = ?",
             (result["strategy_id"],),
         ).fetchone()
 
     assert row is not None
     assert str(row["stage"]) == "quick_screen"
     assert str(row["source"]) == "ai_dropzone"
-    assert str(row["source_ref"]) == str(strategy_file.resolve())
+    assert str(row["source_ref"]) == result["source_ref"]
+    assert str(row["type"]) == "ai_dropzone_wave_test"
+    assert str(row["runtime_type"]).startswith("imported__dropzone_")
+    assert row["sandbox_only"] == 1
+    assert strategy_file.exists() is False
+    assert "forven.strategies.custom.btc_ai_dropzone_wave_test" not in sys.modules
 
 
 def test_scan_custom_strategies_registers_active_file_once(forven_db, monkeypatch, tmp_path):
@@ -113,6 +159,7 @@ def test_scan_custom_strategies_registers_active_file_once(forven_db, monkeypatc
     assert dry_result["scanned"] == 1
     assert dry_result["new_count"] == 1
     assert dry_result["registered"] is False
+    assert "forven.strategies.custom.btc_ai_dropzone_wave_test" not in sys.modules
 
     with get_db() as conn:
         rows = conn.execute("SELECT id FROM strategies").fetchall()

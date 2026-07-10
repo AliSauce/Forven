@@ -307,6 +307,21 @@ def test_param_locked_strategy_not_mutated():
     assert mock.call_count == 0  # locked -> no bake-off, no write
 
 
+def test_param_lock_check_error_fails_closed():
+    with patch("forven.brain.stage_is_param_locked", side_effect=RuntimeError("lock state unavailable")):
+        out, writes, mock = _apply(
+            {"rsi_entry": 30},
+            {"rsi_entry": 35},
+            _wfa([0.5]),
+            _wfa([2.0]),
+            from_state="paper",
+        )
+    assert out["applied"] is False
+    assert out["code"] == "param_lock_unavailable"
+    assert writes == []
+    assert mock.call_count == 0
+
+
 # ---------------------------------------------------------------------------
 # Integration: both real apply paths route through the chokepoint
 # ---------------------------------------------------------------------------

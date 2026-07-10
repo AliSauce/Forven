@@ -68,22 +68,20 @@ class DataEngineSettings(BaseModel):
             "macro_minutes": 1440,
         }
     )
-    # Cross-venue source-reconciliation promotion gate. Ships OFF: the out-of-band
+    # Cross-venue source-reconciliation promotion gate. The out-of-band
     # forven-source-reconciliation job pre-computes price divergence between the
     # backtest source and the live trade venue; when enabled, the promotion gate
-    # refuses paper/live entry above max_divergence_pct. block_when_missing=False
-    # keeps the funnel fail-open when no divergence has been computed yet.
+    # refuses paper/live entry above max_divergence_pct. Missing/stale evidence
+    # blocks by default; operators can explicitly opt out when accepting that risk.
     source_reconciliation: dict[str, Any] = Field(
         default_factory=lambda: {
             # Enabled by default: the backtest validates on Binance while paper/live
             # trade HyperLiquid, so this gate flags + blocks promotion when the two
-            # series diverge above max_divergence_pct. It stays FAIL-OPEN
-            # (block_when_missing=False) until the reconciliation job has computed a
-            # reading, so it never jams a never-reconciled strategy — it only bites a
-            # real, measured divergence (the safety net for the accepted venue gap).
+            # series diverge above max_divergence_pct. Until the reconciliation job
+            # has computed a usable reading, capital entry stays parked by default.
             "enabled": True,
             "max_divergence_pct": 2.0,
-            "block_when_missing": False,
+            "block_when_missing": True,
             "staleness_hours": 24,
             "min_overlap_bars": 20,
         }

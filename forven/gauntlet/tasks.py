@@ -192,7 +192,14 @@ def _data_quality_block(symbol: str, timeframe: str, required_days: int) -> dict
         )
     except Exception as exc:  # the gate itself must never break the pipeline
         log.warning("data-quality gate errored for %s %s: %s", symbol, timeframe, exc)
-        return None
+        return {
+            "status": "blocked_data",
+            "message": f"data quality could not be verified for {symbol} {timeframe}: {exc}",
+            "retryable": True,
+            # Reuse the non-draining data precondition code: an infrastructure
+            # error is transient absence of evidence, never a strategy failure.
+            "reason_code": "awaiting_data_backfill",
+        }
     if verdict.ok:
         return None
     return {
@@ -310,7 +317,10 @@ def _persist_strategy_symbol(strategy_id: str, symbol: str) -> None:
                 conn, strategy_id, sym, source="gauntlet_quick_screen"
             ):
                 conn.execute(
-                    "UPDATE strategies SET symbol = ?, updated_at = ? WHERE id = ?",
+                    """UPDATE strategies SET symbol = ?, updated_at = ?
+                       WHERE id = ?
+                         AND LOWER(TRIM(COALESCE(stage, status, ''))) IN
+                             ('quick_screen', 'researching', 'developing', 'gauntlet', 'backtesting')""",
                     (sym, now, strategy_id),
                 )
     except Exception as exc:  # noqa: BLE001
@@ -694,7 +704,10 @@ def _persist_quick_screen_winner(strategy_id: str, timeframe: str, metrics: dict
         now = datetime.now(timezone.utc).isoformat()
         with get_db() as conn:
             conn.execute(
-                "UPDATE strategies SET timeframe = ?, metrics = ?, updated_at = ? WHERE id = ?",
+                """UPDATE strategies SET timeframe = ?, metrics = ?, updated_at = ?
+                   WHERE id = ?
+                     AND LOWER(TRIM(COALESCE(stage, status, ''))) IN
+                         ('quick_screen', 'researching', 'developing', 'gauntlet', 'backtesting')""",
                 (tf, json.dumps(metrics), now, strategy_id),
             )
     except Exception as exc:  # noqa: BLE001 - never block the gate on a metrics write
@@ -877,7 +890,7 @@ def run_apply_optimized_defaults(workflow: dict[str, Any], step: dict[str, Any])
         if optimized_timeframe:
             applied_metrics["gauntlet_optimized_timeframe"] = optimized_timeframe
         with get_db() as conn:
-            conn.execute(
+            updated = conn.execute(
                 """
                 UPDATE strategies
                 SET params = ?,
@@ -885,6 +898,8 @@ def run_apply_optimized_defaults(workflow: dict[str, Any], step: dict[str, Any])
                     metrics = ?,
                     updated_at = datetime('now')
                 WHERE id = ?
+                  AND LOWER(TRIM(COALESCE(stage, status, ''))) IN
+                      ('quick_screen', 'researching', 'developing', 'gauntlet', 'backtesting')
                 """,
                 (
                     json.dumps(new_params, sort_keys=True),
@@ -893,6 +908,10 @@ def run_apply_optimized_defaults(workflow: dict[str, Any], step: dict[str, Any])
                     strategy_id,
                 ),
             )
+            if updated.rowcount != 1:
+                raise RuntimeError(
+                    "strategy entered an operator-owned or terminal stage before optimized params could be applied"
+                )
         add_artifact(
             workflow_id=str(workflow.get("id") or ""),
             step_id=str(step.get("id") or "") or None,
@@ -1429,10 +1448,17 @@ def _select_and_persist_execution_profile(workflow: dict[str, Any], strategy_id:
     metrics["gauntlet_selected_execution_profile"] = marker
 
     with get_db() as conn:
-        conn.execute(
-            "UPDATE strategies SET params = ?, metrics = ?, updated_at = datetime('now') WHERE id = ?",
+        updated = conn.execute(
+            """UPDATE strategies SET params = ?, metrics = ?, updated_at = datetime('now')
+               WHERE id = ?
+                 AND LOWER(TRIM(COALESCE(stage, status, ''))) IN
+                     ('quick_screen', 'researching', 'developing', 'gauntlet', 'backtesting')""",
             (json.dumps(new_params, sort_keys=True), json.dumps(metrics, sort_keys=True), strategy_id),
         )
+        if updated.rowcount != 1:
+            raise RuntimeError(
+                "strategy entered an operator-owned or terminal stage during execution-profile selection"
+            )
     log.info(
         "execution-profile selection for %s: chose %s (%s=%.4f over %d candidates, %d eligible)",
         strategy_id, selection.get("chosen_label"), selection.get("objective"),

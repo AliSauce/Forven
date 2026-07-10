@@ -2024,10 +2024,19 @@ def _recalculate_robustness_score(strategy_id: str) -> None:
                 # resurrect a stale value from a prior (better) run.
                 metrics["robustness_score"] = score
                 metrics["robustness"] = round(score / 100.0, 4)
-                conn.execute(
-                    "UPDATE strategies SET metrics = ? WHERE id = ?",
+                updated = conn.execute(
+                    """UPDATE strategies SET metrics = ?
+                       WHERE id = ?
+                         AND LOWER(TRIM(COALESCE(stage, status, ''))) NOT IN
+                             ('paper', 'paper_trading', 'live_graduated', 'deployed')""",
                     (json.dumps(metrics), strategy_id),
                 )
+                if updated.rowcount != 1:
+                    log.info(
+                        "metrics locked: %s entered an operator-owned stage during robustness sync",
+                        strategy_id,
+                    )
+                    return
                 log.info(
                     "Robustness score updated for %s: %d/%d tests passed = %.1f/100",
                     strategy_id, passed, total, score,

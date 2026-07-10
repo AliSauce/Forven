@@ -1746,16 +1746,26 @@ def _sync_strategy_metrics_and_promote_if_eligible(
             if integrity_anomalies:
                 metrics[DATA_QUALITY_FLAGS_KEY] = integrity_anomalies
 
-            conn.execute(
+            updated = conn.execute(
 
 
-                "UPDATE strategies SET metrics = ?, updated_at = ? WHERE id = ?",
+                """UPDATE strategies
+                   SET metrics = ?, updated_at = ?
+                   WHERE id = ?
+                     AND LOWER(TRIM(COALESCE(stage, status, ''))) NOT IN
+                         ('paper', 'paper_trading', 'live_graduated', 'deployed')""",
 
 
                 (json.dumps(metrics), datetime.now(timezone.utc).isoformat(), strategy_id),
 
 
             )
+            if updated.rowcount != 1:
+                log.info(
+                    "metrics locked: %s entered an operator-owned stage during backtest sync",
+                    strategy_id,
+                )
+                return
 
 
     except Exception as exc:
@@ -8496,10 +8506,16 @@ def backtest_strategy(
         _avail = evaluate_data_availability(
             original_strategy_type, asset, resolved_timeframe, strategy_id=strategy_id
         )
-    except Exception as _avail_exc:  # defensive: never let the guard brick a backtest
-        log.warning("data-availability precheck raised (skipping): %s", _avail_exc)
-        _avail = None
-    if _avail is not None and _avail.blocked:
+    except Exception as _avail_exc:  # defensive: an unknown feed set cannot certify input
+        from forven.strategies.data_availability import DataAvailabilityResult
+
+        log.warning("data-availability precheck raised (failing closed): %s", _avail_exc)
+        _avail = DataAvailabilityResult(
+            ok=False,
+            blocked=True,
+            error=f"Cannot verify data availability for {strategy_id}: {_avail_exc}",
+        )
+    if _avail.blocked:
         log.warning("Data availability BLOCK for %s: %s", strategy_id, _avail.error)
         return {
             "error": _avail.error,
@@ -11785,16 +11801,32 @@ def save_backtest_results(results: dict):
             # Update existing strategy or insert new one
 
 
-            existing = conn.execute("SELECT id FROM strategies WHERE id = ?", (strat_id,)).fetchone()
+            existing = conn.execute(
+                "SELECT id, stage, status FROM strategies WHERE id = ?",
+                (strat_id,),
+            ).fetchone()
 
 
             if existing:
+                from forven.brain import stage_is_param_locked
 
+                existing_stage = existing["stage"] or existing["status"]
+                if stage_is_param_locked(existing_stage):
+                    log.info(
+                        "metrics locked: %s at %s; bulk backtest save skipped",
+                        strat_id,
+                        existing_stage,
+                    )
+                    continue
 
                 conn.execute(
 
 
-                    "UPDATE strategies SET metrics = ?, updated_at = ? WHERE id = ?",
+                    """UPDATE strategies
+                       SET metrics = ?, updated_at = ?
+                       WHERE id = ?
+                         AND LOWER(TRIM(COALESCE(stage, status, ''))) NOT IN
+                             ('paper', 'paper_trading', 'live_graduated', 'deployed')""",
 
 
                     (json.dumps(metrics), now, strat_id),

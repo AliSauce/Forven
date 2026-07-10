@@ -91,6 +91,42 @@ def test_strict_reject_passes_clean_strategy(forven_db):
     assert _strict_robustness_reject("st-clean", _row("st-clean"), {}, load_pipeline_config()) is None
 
 
+def test_strict_reject_fails_closed_when_evidence_extraction_errors(forven_db, monkeypatch):
+    import forven.policy as policy
+
+    _insert_strategy("st-extract-error")
+    monkeypatch.setattr(
+        policy,
+        "_extract_gauntlet_verdict_payloads",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("artifact store busy")),
+    )
+
+    reason = _strict_robustness_reject(
+        "st-extract-error",
+        _row("st-extract-error"),
+        {},
+        load_pipeline_config(),
+    )
+
+    assert reason is not None
+    assert "robustness evidence unavailable" in reason.lower()
+    assert "artifact store busy" in reason
+
+
+def test_strict_reject_fails_closed_without_gauntlet_artifacts(forven_db):
+    _insert_strategy("st-no-artifacts")
+
+    reason = _strict_robustness_reject(
+        "st-no-artifacts",
+        _row("st-no-artifacts"),
+        {},
+        load_pipeline_config(),
+    )
+
+    assert reason is not None
+    assert "no usable gauntlet artifacts" in reason.lower()
+
+
 # --- lean paper gate: strict failures do NOT block ->paper -----------------
 
 def test_paper_gate_allows_strategy_that_fails_strict_live(forven_db):

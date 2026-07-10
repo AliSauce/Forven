@@ -217,7 +217,7 @@ class TestDataEngineNestedPartialSave:
         assert sr["enabled"] is True
         assert sr["max_divergence_pct"] == 5.0
         # Untouched siblings keep their defaults.
-        assert sr["block_when_missing"] is False
+        assert sr["block_when_missing"] is True
         assert sr["staleness_hours"] == 24
 
     def test_editing_one_source_priority_preserves_other_streams(self, forven_db):

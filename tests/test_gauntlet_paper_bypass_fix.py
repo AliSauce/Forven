@@ -65,11 +65,23 @@ def _insert_gauntlet(conn, sid, metrics):
     conn.commit()
 
 
-def _stub_prereqs(monkeypatch, payloads):
+def _stub_prereqs(monkeypatch, payloads, *, fill_required=True):
+    effective_payloads = {
+        "walk_forward": {"status": "pass", "passed": True, "folds": 4, "pass_rate": 1.0},
+        "monte_carlo": {"status": "pass", "passed": True, "max_dd_p95": 0.2, "n_trades": 60},
+        "param_jitter": {"status": "pass", "passed": True, "pass_rate": 0.9},
+        "cost_stress": {"status": "pass", "passed": True},
+        "regime_split": {"status": "pass", "passed": True},
+    } if fill_required else {}
+    effective_payloads.update(payloads)
     monkeypatch.setattr(policy, "_load_gauntlet_artifact_counts", lambda sid: {"optimization": 1, "walk_forward": 1})
     monkeypatch.setattr(policy, "_check_artifact_ordering", lambda sid, req=None: (True, "ok"))
     monkeypatch.setattr(policy, "_check_validation_freshness", lambda sid, req=None: (True, "ok"))
-    monkeypatch.setattr(policy, "_extract_gauntlet_verdict_payloads", lambda sid, row, metrics: (payloads, "pass"))
+    monkeypatch.setattr(
+        policy,
+        "_extract_gauntlet_verdict_payloads",
+        lambda sid, row, metrics: (effective_payloads, "pass"),
+    )
     monkeypatch.setattr(
         policy, "_load_pipeline_settings",
         lambda: {"gate_multi_tf_sweep_enabled": False, "gate_require_artifact_rows_enabled": False},
@@ -160,9 +172,28 @@ def test_robustness_floor_default_permissive(forven_db, monkeypatch):
     assert passed, msg
 
 
-def test_robustness_floor_operator_reenforced(forven_db, monkeypatch):
-    # Operator RAISES the safety floor to 50 — the relaxed gauntlet threshold is clamped
-    # up and a robustness=10 strategy is rejected at 50.
+def test_empty_required_tests_requires_the_full_persisted_battery(forven_db, monkeypatch):
+    _stub_prereqs(
+        monkeypatch,
+        {"walk_forward": {"status": "pass", "passed": True, "folds": 4, "pass_rate": 1.0}},
+        fill_required=False,
+    )
+    cfg = _cfg(required_tests=[], min_robustness_score=0)
+    with get_db() as conn:
+        _insert_gauntlet(conn, "enforce-all-artifacts", _PASS_METRICS)
+
+    passed, msg = _evaluate_gauntlet_gate("enforce-all-artifacts", cfg)
+
+    assert not passed
+    assert "missing required verdict tests" in msg.lower()
+    assert "monte_carlo" in msg
+    assert "param_jitter" in msg
+
+
+def test_complete_passing_battery_repairs_stale_low_robustness_score(forven_db, monkeypatch):
+    # Empty required_tests now means all five persisted verdicts are mandatory. If
+    # every current verdict passes, the gate derives 100/100 rather than trusting a
+    # stale strategy-row score left by an older partial battery.
     _stub_prereqs(monkeypatch, {})
     cfg = _cfg(safety_floors={"min_robustness_score": 50}, required_tests=[], min_robustness_score=0)
     metrics = copy.deepcopy(_PASS_METRICS)
@@ -170,9 +201,7 @@ def test_robustness_floor_operator_reenforced(forven_db, monkeypatch):
     with get_db() as conn:
         _insert_gauntlet(conn, "rob-reenforced", metrics)
     passed, msg = _evaluate_gauntlet_gate("rob-reenforced", cfg)
-    assert not passed, msg
-    assert "robustness too low" in msg.lower()
-    assert "50" in msg
+    assert passed, msg
 
 
 # ---------------------------------------------------------------------------
@@ -325,6 +354,26 @@ def test_floored_gate_still_passes_legit_strategy(forven_db, monkeypatch):
         _insert_gauntlet(conn, "ok-strat", _PASS_METRICS)
     passed, msg = _evaluate_gauntlet_gate("ok-strat", cfg)
     assert passed, msg
+
+
+def test_enabled_dsr_gate_blocks_when_dsr_cannot_be_computed(forven_db, monkeypatch):
+    from forven.gauntlet import deflated_sharpe
+
+    _stub_prereqs(monkeypatch, {})
+    cfg = _cfg(required_tests=[])
+    cfg["robustness_thresholds"]["deflated_sharpe_gate_enabled"] = True
+    monkeypatch.setattr(
+        deflated_sharpe,
+        "compute_strategy_dsr",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("trial ledger unavailable")),
+    )
+    with get_db() as conn:
+        _insert_gauntlet(conn, "dsr-unavailable", _PASS_METRICS)
+
+    passed, msg = _evaluate_gauntlet_gate("dsr-unavailable", cfg)
+
+    assert not passed
+    assert "DSR gate unavailable" in msg
 
 
 # ---------------------------------------------------------------------------

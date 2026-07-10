@@ -758,6 +758,7 @@ export interface GauntletStatus {
 	required_tests: GauntletTestKey[];
 	missing_required: GauntletTestKey[];
 	ready_for_paper: boolean;
+	promotion_reason?: string | null;
 	error?: string;
 }
 

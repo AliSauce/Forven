@@ -199,6 +199,37 @@ def test_route_allows_empty_params_for_certified_family(forven_db):
     assert response["ok"] is True
 
 
+def test_route_parks_when_data_availability_is_unknown(forven_db, monkeypatch):
+    from forven.routers.backtesting import create_backtesting_strategy
+    from forven.strategies import data_availability
+
+    monkeypatch.setattr(
+        data_availability,
+        "evaluate_data_availability",
+        lambda *_args, **_kwargs: data_availability.DataAvailabilityResult(
+            ok=False,
+            blocked=True,
+            error="feed catalog unavailable",
+        ),
+    )
+
+    response = create_backtesting_strategy(
+        name="catalog guard",
+        type="ema_cross",
+        symbol="BTC/USDT",
+        timeframe="1h",
+        body={"type": "ema_cross", "params": {}, "hypothesis_id": _mint_hypothesis()},
+    )
+
+    assert response["status"] == "research_only"
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT notes FROM strategies WHERE id = ?",
+            (response["strategy_id"],),
+        ).fetchone()
+    assert "feed catalog unavailable" in str(row["notes"])
+
+
 def test_route_response_symbol_matches_stored_row(forven_db):
     from forven.routers.backtesting import create_backtesting_strategy
 

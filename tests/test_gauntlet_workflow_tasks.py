@@ -479,6 +479,10 @@ def test_paper_promotion_gate_uses_unified_status_and_transition(forven_db, monk
         return {"from": "gauntlet", "to": "paper"}
 
     monkeypatch.setattr("forven.gauntlet.tasks._transition_to_paper", _fake_transition)
+    monkeypatch.setattr(
+        "forven.gauntlet.tasks._select_and_persist_execution_profile",
+        lambda *_args, **_kwargs: {"skipped": True, "reason": "test"},
+    )
     gate_step = next(item for item in detail["steps"] if item["step_key"] == "paper_promotion_gate")
 
     from forven.gauntlet.tasks import run_paper_promotion_gate

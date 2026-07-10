@@ -168,6 +168,24 @@ class TestGauntletHelpers:
         data_mod.save_parquet(_bars(_closed_start(60), 61), SYMBOL, TF)
         assert _data_quality_block(SYMBOL, TF, 2) is None
 
+    def test_quality_check_error_blocks_instead_of_scoring_unverified_data(self, lake, monkeypatch):
+        from forven.dataeng import quality_gate
+        from forven.gauntlet.tasks import _data_quality_block
+
+        monkeypatch.setattr(
+            quality_gate,
+            "check_series_quality",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("catalog unavailable")),
+        )
+
+        block = _data_quality_block(SYMBOL, TF, 30)
+
+        assert block is not None
+        assert block["status"] == "blocked_data"
+        assert block["retryable"] is True
+        assert block["reason_code"] == "awaiting_data_backfill"
+        assert "could not be verified" in block["message"]
+
     def test_workflow_as_of_respects_flag(self, monkeypatch):
         from forven.gauntlet import tasks as tasks_mod
 

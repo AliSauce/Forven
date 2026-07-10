@@ -163,7 +163,18 @@ def _stub_gauntlet_prerequisites(monkeypatch):
     )
     monkeypatch.setattr(policy, "_check_artifact_ordering", lambda sid, req=None: (True, "ok"))
     monkeypatch.setattr(policy, "_check_validation_freshness", lambda sid, req=None: (True, "ok"))
-    monkeypatch.setattr(policy, "_extract_gauntlet_verdict_payloads", lambda sid, row, metrics: ({}, "pass"))
+    passing_payloads = {
+        "walk_forward": {"status": "pass", "passed": True, "folds": 4, "pass_rate": 1.0},
+        "monte_carlo": {"status": "pass", "passed": True, "max_dd_p95": 0.2, "n_trades": 60},
+        "param_jitter": {"status": "pass", "passed": True, "pass_rate": 0.9},
+        "cost_stress": {"status": "pass", "passed": True},
+        "regime_split": {"status": "pass", "passed": True},
+    }
+    monkeypatch.setattr(
+        policy,
+        "_extract_gauntlet_verdict_payloads",
+        lambda sid, row, metrics: (passing_payloads, "pass"),
+    )
     monkeypatch.setattr(
         policy,
         "_load_pipeline_settings",

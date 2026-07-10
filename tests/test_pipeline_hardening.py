@@ -2292,11 +2292,13 @@ def test_backtest_sync_updates_metrics_and_promotes_quick_screen_when_gate_passe
         "in_sample": {
             "sharpe": 1.8,
             "profit_factor": 1.8,
+            "total_trades": 72,
         },
         "out_of_sample": {
             "sharpe": 1.4,
             "profit_factor": 1.5,
             "win_rate": 52.0,
+            "total_trades": 48,
         },
     }
 

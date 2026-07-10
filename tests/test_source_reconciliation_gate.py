@@ -200,6 +200,17 @@ def test_gate_missing_blocks_when_block_when_missing(forven_db):
     assert "pending" in reason
 
 
+def test_gate_missing_blocks_by_default_when_setting_is_omitted(forven_db):
+    _seed_strategy()
+    settings = _settings()
+    del settings["data_engine_settings"]["source_reconciliation"]["block_when_missing"]
+
+    ok, reason = _evaluate_source_divergence_gate("S-DIV", settings)
+
+    assert ok is False
+    assert "pending" in reason
+
+
 def test_gate_blocks_high_divergence(forven_db):
     _seed_strategy()
     _seed_divergence("BTC/USDT", "1h", status="ok", max_pct=5.0)
@@ -232,6 +243,19 @@ def test_gate_stale_payload_fails_open(forven_db):
     # Stale -> treated as missing -> fail-open (does NOT block despite 9% > 2%).
     assert ok is True
     assert "stale" in reason
+
+
+def test_gate_unparseable_timestamp_blocks_when_missing_is_strict(forven_db):
+    _seed_strategy()
+    _seed_divergence("BTC/USDT", "1h", status="ok", max_pct=0.3, checked_at="not-a-time")
+
+    ok, reason = _evaluate_source_divergence_gate(
+        "S-DIV",
+        _settings(block_when_missing=True),
+    )
+
+    assert ok is False
+    assert "unparseable timestamp" in reason
 
 
 def test_reason_code_divergence():
@@ -281,3 +305,80 @@ def test_evaluate_promotion_divergence_gate_inert_when_disabled(forven_db):
     # gate decides, the reason must not be a divergence rejection.
     ok, reason = evaluate_promotion("S-DIV", "gauntlet", "paper")
     assert "divergence" not in reason.lower()
+
+
+# --------------------------- rejection-record hygiene ---------------------------
+# PR-60 verification archived a HEALTHY gauntlet strategy in ~2 minutes: the
+# Forge status endpoint (polled every 10s per open detail page) evaluated the
+# gate with record_rejection=False, but the divergence gate logged rejections
+# unconditionally, and "pending (no data)" text-matched the COUNTING
+# source_divergence_reject code — 4 page views + 1 promote = 5x = auto-archive.
+
+
+def _rejection_rows(strategy_id):
+    with get_db() as conn:
+        return conn.execute(
+            "SELECT reason_code FROM gate_rejections WHERE strategy_id = ?",
+            (strategy_id,),
+        ).fetchall()
+
+
+def _stage(strategy_id):
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT stage FROM strategies WHERE id = ?", (strategy_id,)
+        ).fetchone()
+    return row["stage"] if row else None
+
+
+def test_reason_code_pending_is_evidence_absence():
+    from forven.policy import _EVIDENCE_ABSENCE_REASON_CODES
+
+    code = _extract_reason_code(
+        "Source reconciliation pending (no data) — divergence not yet computed for BTC 1h"
+    )
+    assert code == "source_reconciliation_pending"
+    assert code in _EVIDENCE_ABSENCE_REASON_CODES
+    # The measured-divergence rejection keeps its counting code.
+    assert (
+        _extract_reason_code("Source price divergence max 5.00% (mean 1.20%) exceeds 2.00%")
+        == "source_divergence_reject"
+    )
+
+
+def test_read_only_evaluations_never_record_divergence_rejections(forven_db):
+    """record_rejection=False evaluations must leave NO gate_rejections rows and
+    must never move the strategy — regardless of how often the UI polls."""
+    _seed_strategy(stage="gauntlet")
+    kv_set("forven:settings", _settings(block_when_missing=True))
+    for _ in range(6):
+        ok, reason = evaluate_promotion("S-DIV", "gauntlet", "paper", record_rejection=False)
+        assert ok is False
+        assert "source reconciliation pending" in reason.lower()
+    assert _rejection_rows("S-DIV") == []
+    assert _stage("S-DIV") == "gauntlet"
+
+
+def test_recorded_pending_rejections_never_auto_archive(forven_db):
+    """Recorded pending rejections (real promote attempts) use the counter-exempt
+    evidence-absence code, so repeated attempts stay in gauntlet."""
+    _seed_strategy(stage="gauntlet")
+    kv_set("forven:settings", _settings(block_when_missing=True))
+    for _ in range(6):
+        ok, _ = evaluate_promotion("S-DIV", "gauntlet", "paper", record_rejection=True)
+        assert ok is False
+    rows = _rejection_rows("S-DIV")
+    assert len(rows) == 6
+    assert {r["reason_code"] for r in rows} == {"source_reconciliation_pending"}
+    assert _stage("S-DIV") == "gauntlet"
+
+
+def test_measured_divergence_rejection_still_counts(forven_db):
+    """A MEASURED divergence above threshold keeps feeding the repeated-failure
+    counter — only evidence-absence was exempted."""
+    _seed_strategy(stage="gauntlet")
+    _seed_divergence("BTC/USDT", "1h", status="ok", max_pct=7.5)
+    kv_set("forven:settings", _settings(max_pct=2.0))
+    ok, _ = evaluate_promotion("S-DIV", "gauntlet", "paper", record_rejection=True)
+    assert ok is False
+    assert {r["reason_code"] for r in _rejection_rows("S-DIV")} == {"source_divergence_reject"}

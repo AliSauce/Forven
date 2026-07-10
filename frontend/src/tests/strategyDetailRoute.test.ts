@@ -1855,6 +1855,41 @@ describe('/lab/strategy/[id] backtest history', () => {
 		await waitForCondition(() => target.querySelector('[data-testid="runner-body-param_jitter"]') !== null);
 	});
 
+	it('uses backend promotion readiness instead of deriving it from the composite score', async () => {
+		apiMocks.getStrategyContainer.mockResolvedValue(buildContainer(['B1001']));
+		lifecycleMocks.getGauntletStatus.mockResolvedValue({
+			...gauntletStatus,
+			composite_robustness_score: 10,
+			min_robustness_score: 60,
+			missing_required: [],
+			ready_for_paper: true,
+			promotion_reason: 'Passed robustness gauntlet',
+		});
+
+		app = mount(StrategyDetailPage, { target });
+		await openRobustnessTab(target);
+		await waitForCondition(() => target.querySelector('[data-testid="gauntlet-ready-for-paper"]') !== null);
+
+		expect(target.textContent).toContain('Backend promotion gate passed');
+		expect(target.textContent).not.toContain('composite 10.0 is below');
+	});
+
+	it('surfaces the backend promotion rejection reason', async () => {
+		apiMocks.getStrategyContainer.mockResolvedValue(buildContainer(['B1001']));
+		lifecycleMocks.getGauntletStatus.mockResolvedValue({
+			...gauntletStatus,
+			missing_required: [],
+			ready_for_paper: false,
+			promotion_reason: 'Cost stress verdict failed under current Settings',
+		});
+
+		app = mount(StrategyDetailPage, { target });
+		await openRobustnessTab(target);
+		await waitForCondition(() => target.querySelector('[data-testid="gauntlet-promotion-blocked"]') !== null);
+
+		expect(target.textContent).toContain('Cost stress verdict failed under current Settings');
+	});
+
 	it('marks the gauntlet status tile with the completed runner verdict', async () => {
 		apiMocks.getStrategyContainer.mockResolvedValue(buildContainer(['B1001']));
 		backtestingMocks.submitWalkForwardRobustness.mockResolvedValue({

@@ -15,9 +15,10 @@ at an interior bar, the strategy reads the future. This is high-precision
 (near-zero false positives) -- a correctly written causal strategy is invariant
 under right-truncation by construction.
 
-The probe NEVER raises: any error (the strategy throwing, an un-normalizable
-payload) returns ``None`` so a probe failure can't block legitimate
-registration. The bug is the leak, not the probe.
+The probe never raises. Exceptions originating in untrusted strategy code are
+rejections; probe-infrastructure faults remain inconclusive. This distinction
+prevents a generated module from evading the lookahead gate by throwing only on
+the deterministic probe frame.
 """
 
 from __future__ import annotations
@@ -144,14 +145,16 @@ def detect_lookahead(strategy_obj) -> str | None:
     unchanged. Any flip means the bar-``t`` signal depended on bars after ``t``
     (a lookahead leak, e.g. ``.shift(-1)``).
 
-    Graceful: returns ``None`` (never raises) if the strategy lacks
-    ``generate_signals``, throws, or produces an un-normalizable payload -- a
-    probe error must not block registration.
+    Returns ``None`` when the strategy has no vectorized entry point or when the
+    probe infrastructure itself is inconclusive. An exception raised by the
+    strategy's own module rejects registration because otherwise throwing on the
+    known probe frame is a trivial bypass.
     """
     if strategy_obj is None or not hasattr(strategy_obj, "generate_signals"):
         # Nothing to probe vectorized; the per-bar path is checked elsewhere.
         return None
 
+    strategy_file = _strategy_source_file(strategy_obj)
     try:
         df = _build_synthetic_ohlcv()
         index = df.index
@@ -189,8 +192,13 @@ def detect_lookahead(strategy_obj) -> str | None:
                         f"reads future data (e.g. a .shift(-1)); rejected"
                     )
         return None
-    except Exception as exc:  # never block registration on a probe error
-        log.warning("Lookahead probe error (treated as inconclusive): %s", exc)
+    except Exception as exc:
+        if _raised_in_strategy_module(exc, strategy_file):
+            return (
+                f"Lookahead probe failed inside strategy code: {type(exc).__name__}: "
+                f"{exc}; rejected because causal execution could not be verified"
+            )
+        log.warning("Lookahead probe infrastructure error (treated as inconclusive): %s", exc)
         return None
 
 

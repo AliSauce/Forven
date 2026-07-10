@@ -185,12 +185,13 @@ def test_detect_lookahead_none_without_generate_signals():
     assert detect_lookahead(_NoVectorized()) is None
 
 
-def test_detect_lookahead_swallows_probe_errors():
+def test_detect_lookahead_blocks_strategy_originated_probe_errors():
     class _Boom:
         strategy_id = "boom"
 
         def generate_signals(self, df):
             raise RuntimeError("kaboom")
 
-    # A throwing strategy must NOT block registration — probe returns None.
-    assert detect_lookahead(_Boom()) is None
+    reason = detect_lookahead(_Boom())
+    assert reason is not None
+    assert "causal execution could not be verified" in reason

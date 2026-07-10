@@ -1664,6 +1664,7 @@ def _resolve_container_source_code(strategy_type: str, source_ref: str | None) -
     and cannot be reconstructed from params alone — without the source, a re-import
     on another machine has no registered class for the runtime type.
     """
+    import re
     import sys
     from pathlib import Path
 
@@ -1671,39 +1672,46 @@ def _resolve_container_source_code(strategy_type: str, source_ref: str | None) -
     if not type_name:
         return None
     try:
-        from forven.strategies import custom, registry
+        from forven.strategies import custom, imported, registry
         custom_dir = Path(custom.__file__).resolve().parent
+        imported_dir = Path(imported.__file__).resolve().parent
     except Exception:
         return None
 
     source_path: Path | None = None
-    try:
-        if type_name not in registry._TYPE_MAP:
-            registry.discover(include_custom=True)
-        cls = registry._TYPE_MAP.get(type_name)
-        if cls is not None:
-            module = sys.modules.get(str(getattr(cls, "__module__", "") or ""))
-            module_file = getattr(module, "__file__", None)
-            if module_file:
-                candidate = Path(module_file).resolve()
-                try:
-                    candidate.relative_to(custom_dir)  # only bundle custom files, not built-ins
+    # Sandboxed generated strategies deliberately have no trusted-parent class.
+    # Prefer their persisted source_ref so export never calls registry discovery
+    # (which would import the untrusted custom module merely to locate its file).
+    ref = str(source_ref or "").strip()
+    if ref:
+        try:
+            candidate = Path(ref).expanduser().resolve()
+            if candidate.exists() and candidate.suffix.lower() == ".py":
+                if any(
+                    candidate.is_relative_to(root)
+                    for root in (custom_dir, imported_dir)
+                ):
                     source_path = candidate
-                except ValueError:
-                    source_path = None
-    except Exception:
-        source_path = None
+        except Exception:
+            source_path = None
 
     if source_path is None:
-        ref = str(source_ref or "").strip()
-        if ref:
-            try:
-                candidate = Path(ref).expanduser().resolve()
-                if candidate.exists() and candidate.suffix.lower() == ".py":
-                    candidate.relative_to(custom_dir)
-                    source_path = candidate
-            except Exception:
-                source_path = None
+        try:
+            if type_name not in registry._TYPE_MAP:
+                registry.discover(include_custom=True)
+            cls = registry._TYPE_MAP.get(type_name)
+            if cls is not None:
+                module = sys.modules.get(str(getattr(cls, "__module__", "") or ""))
+                module_file = getattr(module, "__file__", None)
+                if module_file:
+                    candidate = Path(module_file).resolve()
+                    try:
+                        candidate.relative_to(custom_dir)
+                        source_path = candidate
+                    except ValueError:
+                        source_path = None
+        except Exception:
+            source_path = None
 
     if source_path is None or not source_path.exists():
         return None
@@ -1714,8 +1722,8 @@ def _resolve_container_source_code(strategy_type: str, source_ref: str | None) -
     if not content.strip():
         return None
     return {
-        "module_name": source_path.stem,
-        "filename": source_path.name,
+        "module_name": type_name if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", type_name) else source_path.stem,
+        "filename": f"{type_name}.py" if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", type_name) else source_path.name,
         "content": content,
     }
 

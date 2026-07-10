@@ -58,14 +58,6 @@
 	$: displayMissingRequired = status
 		? status.required_tests.filter((key) => !isPassed(displayTests[key]))
 		: [];
-	// ready_for_paper only means required-test verdicts passed + stage; the real
-	// transition gate also enforces the robustness floor (and drawdown/return/etc.).
-	// Surface the most common additional failure — composite below floor — so the
-	// banner isn't falsely green.
-	$: meetsRobustnessFloor =
-		!status || status.composite_robustness_score == null || status.min_robustness_score == null
-			? true
-			: Number(status.composite_robustness_score) >= Number(status.min_robustness_score);
 	$: hasInFlight = !!status && TEST_ORDER.some((k) => {
 		const s = (displayTests[k]?.status ?? '').toLowerCase();
 		return s === 'submitted' || s === 'running' || s === 'queued' || s === 'pending';
@@ -407,22 +399,20 @@
 		{:else if status.ready_for_paper}
 			<div
 				data-testid="gauntlet-ready-for-paper"
-				class={`flex items-center justify-between gap-2 border px-2.5 py-2 text-[11px] ${meetsRobustnessFloor ? 'border-emerald-900 bg-emerald-500/5 text-emerald-400' : 'border-yellow-900 bg-yellow-500/5 text-yellow-400'}`}
+				class="flex items-center justify-between gap-2 border border-emerald-900 bg-emerald-500/5 px-2.5 py-2 text-[11px] text-emerald-400"
 			>
-				<span>
-					{#if meetsRobustnessFloor}
-						Required robustness tests passed — run the final promotion check.
-					{:else}
-						Required tests passed, but composite {formatScore(status.composite_robustness_score)} is below the {status.min_robustness_score} floor — the promotion check will likely reject.
-					{/if}
-				</span>
+				<span>Backend promotion gate passed — submit the stage change.</span>
 				<button
 					type="button"
 					on:click={() => status && dispatch('promote', { status })}
-					class={`border px-2 py-0.5 text-[10px] font-bold uppercase tracking-widest transition-colors ${meetsRobustnessFloor ? 'border-emerald-900 bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/20' : 'border-yellow-900 bg-yellow-500/10 text-yellow-400 hover:bg-yellow-500/20'}`}
+					class="border border-emerald-900 bg-emerald-500/10 px-2 py-0.5 text-[10px] font-bold uppercase tracking-widest text-emerald-400 transition-colors hover:bg-emerald-500/20"
 				>
-					Run check
+					Promote
 				</button>
+			</div>
+		{:else if isGauntlet && status.promotion_reason}
+			<div data-testid="gauntlet-promotion-blocked" class="border border-yellow-900 bg-yellow-500/5 px-2.5 py-2 text-[11px] text-yellow-400">
+				Backend promotion gate: {status.promotion_reason}
 			</div>
 		{/if}
 	{/if}

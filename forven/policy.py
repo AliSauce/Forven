@@ -2040,9 +2040,18 @@ def _extract_gauntlet_verdict_payloads(strategy_id: str, row, metrics: dict) -> 
             ):
                 stale_engine_types.add(normalized_type)
                 continue
-        except Exception:
-            # Provenance faults must never block verdict reads.
-            pass
+        except Exception as exc:
+            # Provenance is part of the verdict's trust boundary. If it cannot be
+            # checked, this row has no current verdict; an older/cached payload must
+            # not backfill the type and turn an unverifiable artifact into a pass.
+            log.warning(
+                "Data-provenance check failed for %s/%s: %s",
+                strategy_id,
+                normalized_type,
+                exc,
+            )
+            stale_engine_types.add(normalized_type)
+            continue
         status = str(metrics_blob.get("status") or config_blob.get("status") or "").strip().lower()
         if status in {"pending", "queued", "running", "started", "submitted"}:
             continue
@@ -2195,10 +2204,9 @@ def _evaluate_source_divergence_gate(strategy_id: str, general_settings: Any) ->
     a blocking write reachable from here would self-deadlock against that deferred
     writer for the full busy-timeout. Cache-only reads preserve that invariant.
 
-    Fail-open by design: a missing / stale / insufficient-overlap reading allows the
-    promotion (unless the operator sets ``block_when_missing``) so a never-reconciled
-    strategy never jams the funnel. Enabled by default (the Binance↔HyperLiquid venue
-    gap is real); fail-open keeps it from blocking until a divergence is measured.
+    Missing / stale / insufficient-overlap readings block by default. Operators can
+    explicitly set ``block_when_missing=false`` to accept unknown source divergence,
+    but the capital path never opts into that risk implicitly.
     """
     cfg: dict[str, Any] = {}
     if isinstance(general_settings, dict):
@@ -2210,7 +2218,7 @@ def _evaluate_source_divergence_gate(strategy_id: str, general_settings: Any) ->
     if not cfg.get("enabled"):
         return True, "source reconciliation disabled"
 
-    block_when_missing = bool(cfg.get("block_when_missing", False))
+    block_when_missing = bool(cfg.get("block_when_missing", True))
 
     def _coerce(value: Any, fallback: float) -> float:
         try:
@@ -2256,7 +2264,7 @@ def _evaluate_source_divergence_gate(strategy_id: str, general_settings: Any) ->
             if age_hours > staleness_hours:
                 return _missing(f"stale {age_hours:.0f}h")
         except (TypeError, ValueError):
-            pass
+            return _missing("unparseable timestamp")
 
     max_div = _coerce(payload.get("max_divergence_pct"), -1.0)
     if max_div < 0:
@@ -2295,7 +2303,13 @@ def _paper_slot_competition_enabled(settings: object = None) -> bool:
     return bool(settings.get("paper_slot_competition_enabled", False)) if isinstance(settings, dict) else False
 
 
-def evaluate_promotion(strategy_id: str, from_stage: str, to_stage: str) -> tuple[bool, str]:
+def evaluate_promotion(
+    strategy_id: str,
+    from_stage: str,
+    to_stage: str,
+    *,
+    record_rejection: bool = True,
+) -> tuple[bool, str]:
     """Single source of truth for all promotion decisions in the 4-step gauntlet."""
     config = load_pipeline_config()
     normalized_from = _normalize_pipeline_stage(from_stage)
@@ -2363,7 +2377,13 @@ def evaluate_promotion(strategy_id: str, from_stage: str, to_stage: str) -> tupl
         div_ok, div_reason = _evaluate_source_divergence_gate(strategy_id, general_settings)
         if not div_ok:
             stage_label = "gauntlet" if normalized_to == "paper" else "paper"
-            _log_gate_rejection_record(strategy_id, stage_label, div_reason, config)
+            # Honor record_rejection like every other gate site: read-only
+            # evaluations (the Forge status endpoint polls this every 10s per
+            # open detail page) must never feed the gate_rejections log — an
+            # unconditional write here let 5 page VIEWS of a pending-
+            # reconciliation strategy trip the repeated-failure auto-archive.
+            if record_rejection:
+                _log_gate_rejection_record(strategy_id, stage_label, div_reason, config)
             return False, div_reason
 
     # Guardrail 6: Active strategy correlation check (S00291)
@@ -2423,7 +2443,7 @@ def evaluate_promotion(strategy_id: str, from_stage: str, to_stage: str) -> tupl
                 _maybe_auto_apply_dethrone(approval_id, general_settings)
 
         result = _evaluate_quick_screen_gate(strategy_id, config)
-        if not result[0]:
+        if record_rejection and not result[0]:
             _log_gate_rejection_record(strategy_id, "quick_screen", result[1], config)
         return result
     if normalized_to == "paper":
@@ -2459,12 +2479,12 @@ def evaluate_promotion(strategy_id: str, from_stage: str, to_stage: str) -> tupl
                             f"(same {my_symbol} {my_timeframe}) — awaiting dethrone"
                         )
         result = _evaluate_gauntlet_gate(strategy_id, config)
-        if not result[0]:
+        if record_rejection and not result[0]:
             _log_gate_rejection_record(strategy_id, "gauntlet", result[1], config)
         return result
     if normalized_to == "live_graduated":
         result = _evaluate_paper_gate(strategy_id, config)
-        if not result[0]:
+        if record_rejection and not result[0]:
             _log_gate_rejection_record(strategy_id, "paper", result[1], config)
         return result
     if normalized_to in {"archived", "rejected"}:
@@ -2517,6 +2537,15 @@ def _extract_reason_code(reason_text: str) -> str:
     # text matching that previously carved these out of the dethrone counter.
     if text.startswith("insufficient paper"):
         return "insufficient_paper_evidence"
+    # Source-reconciliation evidence-ABSENCE: the out-of-band job has not computed
+    # (or has let go stale) a divergence reading for this symbol/timeframe. That
+    # says nothing about edge quality or actual venue divergence, so it must not
+    # share the counting source_divergence_reject bucket — with block_when_missing
+    # defaulting on, a never-reconciled pair would otherwise mass-archive its
+    # whole gauntlet cohort in 5 routine evaluations. A MEASURED divergence above
+    # threshold still counts below.
+    if "source reconciliation pending" in text or "source reconciliation unavailable" in text:
+        return "source_reconciliation_pending"
     if "divergence" in text:
         return "source_divergence_reject"
     if "overfit" in text:
@@ -2672,6 +2701,11 @@ _EVIDENCE_ABSENCE_REASON_CODES = {
     # was undersized for the strategy's trade cadence. Re-runnable, says nothing
     # about edge quality (S06127 2026-07-06).
     "wfa_window_insufficient",
+    # The source-reconciliation job hasn't produced a fresh divergence reading for
+    # the strategy's symbol/timeframe (block_when_missing default). Resolves when
+    # the job runs — never a merit failure. Measured divergence rejections keep
+    # the counting source_divergence_reject code.
+    "source_reconciliation_pending",
 }
 _DETHRONE_APPROVAL_TYPE = "strategy_dethrone_recommendation"
 _DETHRONE_MANUAL_STAGES = {"paper", "paper_trading", "live_graduated", "deployed"}
@@ -3601,16 +3635,16 @@ def _strict_robustness_reject(strategy_id: str, row, metrics: dict, config: dict
     lean paper gate demoted to advisory: WFA IS->OOS degradation, absolute OOS
     Sharpe, OOS trade count, Monte-Carlo percentile, cost-stress survival, and
     regime consistency. Returns a rejection reason, or None if all clear.
-    Read-only / best-effort (may run inside the gate's write txn).
+    Read-only and fail-closed (may run inside the gate's write txn).
     """
     gate = config.get("gauntlet", {})
     rob = config.get("robustness_thresholds", {})
     try:
         verdict_payloads, _ = _extract_gauntlet_verdict_payloads(strategy_id, row, metrics)
-    except Exception:
-        return None
-    if not isinstance(verdict_payloads, dict):
-        return None
+    except Exception as exc:
+        return f"Live gate: robustness evidence unavailable: {exc}"
+    if not isinstance(verdict_payloads, dict) or not verdict_payloads:
+        return "Live gate: robustness evidence unavailable (no usable gauntlet artifacts)"
 
     wfa = verdict_payloads.get("walk_forward")
     if isinstance(wfa, dict):
@@ -3712,12 +3746,16 @@ def _evaluate_gauntlet_gate(strategy_id: str, config: dict) -> tuple[bool, str]:
     # relaxed preset / custom config can soften this ->paper gate.
     floors = dict(_PAPER_GATE_FLOORS)
     floors.update({k: v for k, v in (config.get("safety_floors") or {}).items() if k in floors})
-    required = gate.get("required_tests", []) or []
-    required_tests = {_canonicalize_gauntlet_verdict_test(t) for t in required if str(t).strip()}
-    enforce_all_verdict_tests = not required_tests
-
-    def _verdict_test_required(test_name: str) -> bool:
-        return enforce_all_verdict_tests or _canonicalize_gauntlet_verdict_test(test_name) in required_tests
+    configured_required = gate.get("required_tests", []) or []
+    configured_required_tests = {
+        _canonicalize_gauntlet_verdict_test(test_name)
+        for test_name in configured_required
+        if str(test_name).strip()
+    }
+    # Empty is the documented "enforce all" setting used by the workflow engine.
+    # Keep the direct promotion gate on the same contract; treating it as an empty
+    # requirement set lets a caller bypass the entire robustness battery.
+    required_tests = configured_required_tests or set(_GAUNTLET_VALIDATION_TYPES)
 
     row = _load_strategy_row_for_gate(strategy_id)
     if not row:
@@ -3962,15 +4000,15 @@ def _evaluate_gauntlet_gate(strategy_id: str, config: dict) -> tuple[bool, str]:
     # Deflated Sharpe Ratio — optimizer selection-bias guard. OPT-IN: the DSR is
     # computed and surfaced for observation regardless, but only REJECTS here when
     # robustness_thresholds.deflated_sharpe_gate_enabled is on, so it can be
-    # calibrated before it blocks strategies. Read-only + best-effort (the gate may
-    # run inside a write txn — never let an advisory metric stall promotion).
+        # calibrated before it blocks strategies. Once enabled it is authoritative,
+        # so an unavailable computation blocks rather than silently disabling the gate.
     if bool(rob_thresholds.get("deflated_sharpe_gate_enabled", False)):
         try:
             from forven.gauntlet.deflated_sharpe import compute_strategy_dsr
 
             dsr_info = compute_strategy_dsr(strategy_id)
-        except Exception:
-            dsr_info = None
+        except Exception as exc:
+            return False, f"DSR gate unavailable: {exc}"
         dsr_val = dsr_info.get("dsr") if isinstance(dsr_info, dict) else None
         if dsr_val is not None:
             min_dsr = float(rob_thresholds.get("min_deflated_sharpe", 0.90))
@@ -4000,25 +4038,22 @@ def _evaluate_gauntlet_gate(strategy_id: str, config: dict) -> tuple[bool, str]:
     if oos_pf < min_oos_pf:
         return False, f"S00552 REJECT: Gauntlet OOS Profit Factor {oos_pf:.2f} below {min_oos_pf:.2f} minimum"
 
-    if required_tests:
-        if not verdict_payloads:
-            verdict_payloads, overall_status = _extract_gauntlet_verdict_payloads(strategy_id, row, metrics)
-        available_tests = set(verdict_payloads)
-        if not available_tests:
-            missing = ", ".join(sorted(required_tests))
-            return False, f"Gauntlet missing verdict evidence for required tests: {missing}"
-        missing = sorted(required_tests.difference(available_tests))
-        if missing:
-            return False, f"Gauntlet missing required verdict tests: {', '.join(missing)}"
-        failing = sorted(
-            test_name
-            for test_name in required_tests
-            if _verdict_payload_failed(verdict_payloads.get(test_name))
-        )
-        if failing:
-            return False, f"Gauntlet required verdict tests failed: {', '.join(failing)}"
-    elif overall_status == "fail":
-        return False, "Gauntlet overall verdict failed"
+    if not verdict_payloads:
+        verdict_payloads, overall_status = _extract_gauntlet_verdict_payloads(strategy_id, row, metrics)
+    available_tests = set(verdict_payloads)
+    if not available_tests:
+        missing = ", ".join(sorted(required_tests))
+        return False, f"Gauntlet missing verdict evidence for required tests: {missing}"
+    missing = sorted(required_tests.difference(available_tests))
+    if missing:
+        return False, f"Gauntlet missing required verdict tests: {', '.join(missing)}"
+    failing = sorted(
+        test_name
+        for test_name in required_tests
+        if _verdict_payload_failed(verdict_payloads.get(test_name))
+    )
+    if failing:
+        return False, f"Gauntlet required verdict tests failed: {', '.join(failing)}"
 
     # === Promotion Readiness Gates (configurable via pipeline settings) ===
     ps = _load_pipeline_settings()
@@ -4044,7 +4079,7 @@ def _evaluate_gauntlet_gate(strategy_id: str, config: dict) -> tuple[bool, str]:
 
     # Real artifact rows for all required tests
     result = _gate_check("gate_require_artifact_rows_enabled", "gate_require_artifact_rows_required",
-                         _check_artifact_rows_exist, strategy_id, required)
+                         _check_artifact_rows_exist, strategy_id, sorted(required_tests))
     if result:
         return result
 
@@ -4110,10 +4145,9 @@ def _evaluate_paper_gate(strategy_id: str, config: dict) -> tuple[bool, str]:
     # capital — operationalizing "achievable paper, strict live". Wired on/off.
     if bool(gate.get("live_strict_robustness_enabled", True)):
         _strict_metrics = _load_metrics_blob(row)
-        if _strict_metrics:
-            _strict_reason = _strict_robustness_reject(strategy_id, row, _strict_metrics, config)
-            if _strict_reason:
-                return False, _strict_reason
+        _strict_reason = _strict_robustness_reject(strategy_id, row, _strict_metrics, config)
+        if _strict_reason:
+            return False, _strict_reason
 
     # L-19 (2026-06-09 audit): this is the live-money gate — FAIL CLOSED when the
     # paper stage entry time is unknown. Previously a missing/unparseable

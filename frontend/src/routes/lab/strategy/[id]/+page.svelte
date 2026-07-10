@@ -4517,7 +4517,7 @@
 										<div class="text-[9px] uppercase tracking-wide text-[#555]">PF</div>
 										<div class="mt-1 font-mono text-sm text-[#aaa]">{formatProfitFactor(activeRunItem)}</div>
 									</div>
-									<div class="border border-[#1f1f1f] bg-black px-2.5 py-2" title={`Gauntlet robustness score; below ${gauntletMinScore ?? 60} fails the promotion gate`}>
+									<div class="border border-[#1f1f1f] bg-black px-2.5 py-2" title="Gauntlet ranking score. Promotion readiness comes from the backend gate and persisted verdicts.">
 										<div class="text-[9px] uppercase tracking-wide text-[#555]">Rob%</div>
 										<div class="mt-1 font-mono text-sm text-[#aaa]">{formatRobustness(activeRunItem)}</div>
 									</div>
@@ -4900,7 +4900,7 @@
 											<th class="px-3 py-2 text-right cursor-pointer select-none hover:text-[#aaa]" on:click={() => toggleHistorySort('win_rate')} title="Full-window win rate = combined wins / combined closed trades.">Win%{historySortIndicator('win_rate')}</th>
 											<th class="px-3 py-2 text-right cursor-pointer select-none hover:text-[#aaa]" on:click={() => toggleHistorySort('trades')} title="Total completed trades across IS + OOS.">Trades{historySortIndicator('trades')}</th>
 											<th class="px-3 py-2 text-right cursor-pointer select-none hover:text-[#aaa]" on:click={() => toggleHistorySort('profit_factor')} title="Full-window profit factor = combined gross profit / combined gross loss. ∞ if no losing trades.">PF{historySortIndicator('profit_factor')}</th>
-											<th class="px-3 py-2 text-right cursor-pointer select-none hover:text-[#aaa]" on:click={() => toggleHistorySort('robustness')} title={`Gauntlet robustness score; below ${gauntletMinScore ?? 60} fails the promotion gate`}>Rob%{historySortIndicator('robustness')}</th>
+											<th class="px-3 py-2 text-right cursor-pointer select-none hover:text-[#aaa]" on:click={() => toggleHistorySort('robustness')} title="Gauntlet ranking score. Promotion readiness comes from the backend gate and persisted verdicts.">Rob%{historySortIndicator('robustness')}</th>
 											<th class="px-3 py-2 text-right cursor-pointer select-none hover:text-[#aaa] border-l border-[#222] pl-3" on:click={() => toggleHistorySort('oos_cagr')} title="Out-of-sample CAGR (annualized). Short windows are shown with muted styling.">OOS CAGR{historySortIndicator('oos_cagr')}</th>
 											<th class="px-3 py-2 text-right cursor-pointer select-none hover:text-[#aaa]" on:click={() => toggleHistorySort('oos_sharpe')} title="Out-of-sample annualized Sharpe. Low-trade samples are shown with muted styling.">OOS Sharpe{historySortIndicator('oos_sharpe')}</th>
 											<th class="px-3 py-2 text-right">Actions</th>
@@ -5693,7 +5693,7 @@
 									<div class="border border-[#222] bg-[#070707] px-3 py-2">
 										<div class="text-[9px] font-semibold uppercase tracking-widest text-[#555]">Gauntlet</div>
 										<div class="mt-1.5 flex flex-wrap gap-x-4 gap-y-1 font-mono text-xs">
-											<div title={`Gauntlet robustness score; below ${gauntletMinScore ?? 60} fails the promotion gate`}><span class="text-[10px] uppercase text-[#555] mr-1">Rob%</span> <span data-testid="selected-result-robustness" class="text-[#aaa]">{formatResultRobustness(selectedResult)}</span></div>
+													<div title="Gauntlet ranking score. Promotion readiness comes from the backend gate and persisted verdicts."><span class="text-[10px] uppercase text-[#555] mr-1">Rob%</span> <span data-testid="selected-result-robustness" class="text-[#aaa]">{formatResultRobustness(selectedResult)}</span></div>
 										</div>
 									</div>
 									{#if readResultCoverage(selectedResult, 'funding_coverage_pct') !== null || readResultCoverage(selectedResult, 'open_interest_coverage_pct') !== null}

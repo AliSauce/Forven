@@ -93,12 +93,27 @@ def test_fetchable_feed_fetch_fails_blocks(monkeypatch):
     assert "could not be downloaded" in res.error
 
 
-def test_fail_open_when_class_unresolved(monkeypatch):
+def test_fail_closed_when_class_unresolved(monkeypatch):
     import forven.strategies.backtest as backtest_mod
 
     monkeypatch.setattr(backtest_mod, "_resolve_strategy_class", lambda _t: None)
     res = da.evaluate_data_availability("unknown_type", "BTC/USDT", "1h")
-    assert res.ok and not res.blocked
+    assert res.blocked and not res.ok
+    assert "class could not be resolved" in str(res.error)
+
+
+def test_fail_closed_when_availability_probe_errors(monkeypatch):
+    _patch(monkeypatch, required={"funding_rate"}, present=set())
+    monkeypatch.setattr(
+        da,
+        "_present_columns",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("catalog unavailable")),
+    )
+
+    res = da.evaluate_data_availability("fund_strat", "BTC/USDT", "1h")
+
+    assert res.blocked and not res.ok
+    assert "catalog unavailable" in str(res.error)
 
 
 # --- detection ------------------------------------------------------------

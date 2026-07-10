@@ -110,6 +110,29 @@ def test_update_params_live_evolution_is_blocked(forven_db):
     assert _params("lk-live-evo") == {"rsi_period": 14}  # UNCHANGED
 
 
+def test_update_params_rechecks_stage_at_write_time(forven_db, monkeypatch):
+    import forven.brain as brain
+
+    strategy_id = "lk-param-race"
+    _insert_strategy(strategy_id, stage="gauntlet", params={"adx_min": 20})
+    original_certify = brain.certify_execution_strategy
+
+    def promote_then_certify(*args, **kwargs):
+        with get_db() as conn:
+            conn.execute(
+                "UPDATE strategies SET stage = 'paper', status = 'paper' WHERE id = ?",
+                (strategy_id,),
+            )
+        return original_certify(*args, **kwargs)
+
+    monkeypatch.setattr(brain, "certify_execution_strategy", promote_then_certify)
+
+    result = update_strategy_params(strategy_id, {"adx_min": 45}, actor="system")
+
+    assert result == {"locked": True, "strategy_id": strategy_id, "stage": "paper"}
+    assert _params(strategy_id) == {"adx_min": 20}
+
+
 # --- metric-sync lock (the degradation that fed spurious dethrones) ----------
 
 def test_metric_sync_skips_paper_strategy(forven_db):
@@ -133,12 +156,65 @@ def test_metric_sync_updates_gauntlet_strategy(forven_db):
     from forven.strategies import backtest as bt
 
     _insert_strategy("lk-gauntlet-metrics", stage="quick_screen", metrics={})
-    new = {"sharpe": 1.2, "total_trades": 25, "backtest_months": 4.0}
+    new = {
+        "sharpe": 1.2,
+        "total_trades": 25,
+        "backtest_months": 4.0,
+        "in_sample": {"sharpe": 1.1, "total_trades": 15},
+        "out_of_sample": {"sharpe": 1.2, "total_trades": 10},
+    }
     bt._sync_strategy_metrics_and_promote_if_eligible(
         "lk-gauntlet-metrics", new, promotion_reason="first run"
     )
     stored = _metrics("lk-gauntlet-metrics")
     assert stored.get("sharpe") == 1.2 and stored.get("total_trades") == 25
+
+
+def test_metric_sync_rechecks_stage_at_write_time(forven_db, monkeypatch):
+    import forven.brain as brain
+    from forven.strategies import backtest as bt
+
+    strategy_id = "lk-metric-race"
+    original = {"sharpe": 1.8, "total_trades": 32}
+    _insert_strategy(strategy_id, stage="gauntlet", metrics=original)
+
+    def promote_during_lock_check(_stage):
+        with get_db() as conn:
+            conn.execute(
+                "UPDATE strategies SET stage = 'paper', status = 'paper' WHERE id = ?",
+                (strategy_id,),
+            )
+        return False
+
+    monkeypatch.setattr(brain, "stage_is_param_locked", promote_during_lock_check)
+
+    bt._sync_strategy_metrics_and_promote_if_eligible(
+        strategy_id,
+        {
+            "sharpe": 2.0,
+            "total_trades": 40,
+            "backtest_months": 4.0,
+            "in_sample": {"sharpe": 1.8, "total_trades": 24},
+            "out_of_sample": {"sharpe": 2.0, "total_trades": 16},
+        },
+        promotion_reason="race test",
+    )
+
+    assert _metrics(strategy_id) == original
+
+
+def test_legacy_bulk_backtest_save_respects_operator_metric_freeze(forven_db):
+    from forven.strategies.backtest import save_backtest_results
+
+    strategy_id = "S09991"
+    original = {"sharpe": 1.8, "total_trades": 32}
+    _insert_strategy(strategy_id, stage="paper", metrics=original)
+
+    save_backtest_results(
+        {strategy_id: {"metrics": {"sharpe": 0.2, "total_trades": 3}}}
+    )
+
+    assert _metrics(strategy_id) == original
 
 
 # --- gauntlet engine stops re-processing paper strategies -------------------

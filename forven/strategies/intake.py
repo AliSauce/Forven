@@ -207,7 +207,7 @@ def scan_custom_strategies(*, register: bool = False) -> dict:
     include_archived = include_archived_custom_strategies()
 
     # Ensure registry has been discovered at least once
-    registry.discover()
+    registry.discover(include_custom=False)
 
     known_types = set(registry._TYPE_MAP.keys())
 
@@ -254,6 +254,79 @@ def scan_custom_strategies(*, register: bool = False) -> dict:
                 file_name=file_name,
             ))
             continue
+
+        # Custom/generated modules are untrusted. Import, construction and probes
+        # run only in the locked-down worker; the API process consumes metadata.
+        try:
+            from forven.sandbox.strategy_worker import validate_custom_module_isolated
+
+            meta = validate_custom_module_isolated(modname, package="custom")
+        except Exception as exc:
+            report.errors.append(IntakeError(
+                module_name=modname,
+                error=f"Isolated validation failed: {exc}",
+                file_name=file_name,
+            ))
+            continue
+        if not meta.get("ok"):
+            report.errors.append(IntakeError(
+                module_name=modname,
+                error=f"Isolated validation failed: {meta.get('error') or 'unknown error'}",
+                file_name=file_name,
+            ))
+            continue
+
+        type_name = str(meta.get("type_name") or "").strip()
+        asset = str(meta.get("asset") or "BTC").strip() or "BTC"
+        certified = bool(meta.get("certified"))
+        cert_error = meta.get("cert_error")
+        lookahead_reason = meta.get("lookahead_reason")
+        crash_reason = meta.get("execution_crash_reason")
+        if lookahead_reason or crash_reason:
+            certified = False
+            cert_error = cert_error or lookahead_reason or crash_reason
+        existing_strategy = _find_existing_strategy_container(
+            type_name=type_name,
+            source_ref=source_ref,
+        )
+        if existing_strategy:
+            report.already_known += 1
+            continue
+
+        strategy_id = None
+        if register:
+            try:
+                registration = _register_custom_strategy_sandboxed(
+                    modname=modname,
+                    source_ref=source_ref,
+                    file_name=file_name,
+                    source="intake_scan",
+                    hypothesis_id=None,
+                    session_id=None,
+                    origin_task_id=None,
+                    validated_meta=meta,
+                )
+                strategy_id = str(registration.get("strategy_id") or "") or None
+                certified = bool(registration.get("certified"))
+                cert_error = registration.get("certification_error")
+            except Exception as exc:
+                report.errors.append(IntakeError(
+                    module_name=modname,
+                    error=f"Sandbox registration failed: {exc}",
+                    file_name=file_name,
+                ))
+                continue
+
+        report.new_strategies.append(IntakeEntry(
+            module_name=modname,
+            type_name=type_name,
+            strategy_id=strategy_id,
+            asset=asset.upper(),
+            certified=certified,
+            certification_error=cert_error,
+            file_name=file_name,
+        ))
+        continue
 
         # Try importing
         try:
@@ -362,9 +435,10 @@ def scan_custom_strategies(*, register: bool = False) -> dict:
                 data_block_reason = _avail.error or "required data feed unavailable"
         except Exception as exc:
             log.warning(
-                "Intake: data-availability probe errored for %s (failing open): %s",
+                "Intake: data-availability probe errored for %s (parking): %s",
                 modname, exc,
             )
+            data_block_reason = f"data-availability check unavailable: {exc}"
         if data_block_reason:
             if not cert_error:
                 cert_error = data_block_reason
@@ -469,6 +543,112 @@ def scan_custom_strategies(*, register: bool = False) -> dict:
     return report.to_dict()
 
 
+def _register_custom_strategy_sandboxed(
+    *,
+    modname: str,
+    source_ref: str,
+    file_name: str,
+    source: str,
+    hypothesis_id: str | None,
+    session_id: str | None,
+    origin_task_id: str | None,
+    validated_meta: dict | None = None,
+) -> dict:
+    """Register generated custom code without importing it in the API process."""
+    import hashlib
+
+    from forven.sandbox.strategy_worker import validate_custom_module_isolated
+    from forven.strategies import imported as imported_pkg
+    from forven.strategies import registry
+
+    source_path = Path(source_ref).resolve()
+    banned = _file_uses_banned_imports(source_path)
+    if banned:
+        raise ValueError(
+            f"{file_name} uses banned imports: {', '.join(banned)}. "
+            "Use native pandas/numpy."
+        )
+    registry.assert_custom_module_safe(modname)
+
+    meta = dict(validated_meta) if isinstance(validated_meta, dict) else validate_custom_module_isolated(
+        modname,
+        package="custom",
+    )
+    if not meta.get("ok"):
+        raise ValueError(
+            f"isolated strategy validation failed: {meta.get('error') or 'unknown error'}"
+        )
+    type_name = str(meta.get("type_name") or "").strip()
+    if not type_name:
+        raise ValueError(f"{file_name} is missing a valid TYPE_NAME")
+    existing = _find_existing_strategy_container(
+        type_name=type_name,
+        source_ref=str(source_path),
+        ignore_terminal=True,
+    )
+    if existing:
+        existing_id = str(existing.get("id") or "").strip() or "<unknown>"
+        existing_stage = str(existing.get("stage") or "").strip() or "unknown"
+        raise ValueError(
+            f"Strategy '{type_name}' is already registered as {existing_id} "
+            f"(stage={existing_stage}, still active)"
+        )
+
+    content = source_path.read_text(encoding="utf-8")
+    digest = hashlib.sha256(content.encode("utf-8")).hexdigest()[:12]
+    sandbox_module = f"dropzone_{modname}_{digest}"
+    imported_dir = Path(imported_pkg.__file__).resolve().parent
+    target = imported_dir / f"{sandbox_module}.py"
+    moved_file = False
+    if target.exists():
+        if target.read_text(encoding="utf-8") != content:
+            raise ValueError(f"sandbox module collision at {target}")
+    else:
+        source_path.replace(target)
+        moved_file = True
+
+    try:
+        registered = register_imported_strategy_file(
+            module_name=sandbox_module,
+            source=source,
+            source_id=str(source_path),
+            _validated_meta=meta,
+            _container_type=type_name,
+            _source_ref=str(target),
+            _hypothesis_id=hypothesis_id,
+            _origin_task_id=origin_task_id,
+            _session_id=session_id,
+        )
+    except Exception:
+        if moved_file and target.exists():
+            target.replace(source_path)
+        raise
+
+    if not moved_file and source_path != target:
+        source_path.unlink(missing_ok=True)
+
+    payload = IntakeRegistration(
+        strategy_id=str(registered["strategy_id"]),
+        module_name=modname,
+        type_name=type_name,
+        asset=str(registered.get("asset") or "BTC"),
+        certified=bool(registered.get("certified")),
+        certification_error=registered.get("certification_error"),
+        file_name=file_name,
+        source=source,
+        source_ref=str(target),
+        stage=str(registered.get("stage") or "research_only"),
+        session_id=session_id,
+        lookahead_blocked=bool(registered.get("lookahead_blocked")),
+        lookahead_reason=registered.get("certification_error")
+        if registered.get("lookahead_blocked")
+        else None,
+    ).to_dict()
+    payload["runtime_type"] = registered.get("runtime_type")
+    payload["sandbox_only"] = True
+    return payload
+
+
 def register_custom_strategy_file(
     *,
     file_path: str | None = None,
@@ -509,6 +689,16 @@ def register_custom_strategy_file(
                 f"{file_name} is missing embedded hypothesis_id for auto_intake registration"
             )
         hypothesis_id = inferred_hypothesis_id
+    return _register_custom_strategy_sandboxed(
+        modname=modname,
+        source_ref=source_ref,
+        file_name=file_name,
+        source=source,
+        hypothesis_id=hypothesis_id,
+        session_id=clean_session_id,
+        origin_task_id=origin_task_id,
+    )
+
     known_types = set(registry._TYPE_MAP.keys())
 
     # Banned-import gate — reject before we even try to import so that
@@ -641,7 +831,7 @@ def register_custom_strategy_file(
     # then burns planner/repair cycles as a phantom (S05577, S05838). Park it
     # at birth as research_only with the real reason; fetchable feeds are
     # auto-downloaded by the probe itself, so this only fires on genuinely
-    # unavailable data. Fails open on internal errors.
+    # unavailable data. Internal errors park the candidate in research_only.
     data_block_reason: str | None = None
     try:
         from forven.strategies.data_availability import evaluate_data_availability
@@ -656,9 +846,10 @@ def register_custom_strategy_file(
             data_block_reason = _avail.error or "required data feed unavailable"
     except Exception as exc:
         log.warning(
-            "Targeted intake: data-availability probe errored for %s (failing open): %s",
+            "Targeted intake: data-availability probe errored for %s (parking): %s",
             modname, exc,
         )
+        data_block_reason = f"data-availability check unavailable: {exc}"
     if data_block_reason:
         log.warning(
             "Targeted intake: required data feed unavailable for %s (type=%s) — registering as research_only: %s",
@@ -769,6 +960,12 @@ def register_imported_strategy_file(
     module_name: str,
     source: str = "import",
     source_id: str | None = None,
+    _validated_meta: dict | None = None,
+    _container_type: str | None = None,
+    _source_ref: str | None = None,
+    _hypothesis_id: str | None = None,
+    _origin_task_id: str | None = None,
+    _session_id: str | None = None,
 ) -> dict:
     """Register an UNTRUSTED-ORIGIN (imported / shared) strategy as a SANDBOX-ONLY
     container — WITHOUT importing the author's code into the trusted parent.
@@ -816,7 +1013,10 @@ def register_imported_strategy_file(
         raise ValueError(f"{modname}.py rejected by the security scan: {findings}")
 
     # Validate OUT-OF-PROCESS — the worker imports + probes; the parent never does.
-    meta = validate_custom_module_isolated(modname, package="imported")
+    meta = dict(_validated_meta) if isinstance(_validated_meta, dict) else validate_custom_module_isolated(
+        modname,
+        package="imported",
+    )
     if not meta.get("ok"):
         raise ValueError(
             f"imported strategy validation failed: {meta.get('error') or 'unknown error'}"
@@ -845,6 +1045,17 @@ def register_imported_strategy_file(
             )
 
     runtime_type = imported_runtime_type(modname)
+    declared_type = str(meta.get("type_name") or "").strip()
+    container_type = str(_container_type or "").strip() or runtime_type
+    stored_source_ref = str(_source_ref or "").strip() or str(target)
+    existing_strategy = _find_existing_strategy_container(
+        type_name=declared_type or container_type,
+        source_ref=stored_source_ref,
+        ignore_terminal=True,
+    )
+    if existing_strategy:
+        existing_id = str(existing_strategy.get("id") or "").strip() or "<unknown>"
+        raise ValueError(f"strategy is already registered as {existing_id}")
     asset = str(meta.get("asset") or "BTC").strip() or "BTC"
     certified = bool(meta.get("certified"))
     cert_error = meta.get("cert_error")
@@ -888,9 +1099,29 @@ def register_imported_strategy_file(
             params=stored_params,
             stage=initial_stage,
             source=source,
-            source_ref=str(target),
+            source_ref=stored_source_ref,
+            hypothesis_id=_hypothesis_id,
+            origin_task_id=_origin_task_id,
             sandbox_only=True,
         )
+        if container_type != runtime_type:
+            conn.execute(
+                "UPDATE strategies SET type = ?, runtime_type = ? WHERE id = ?",
+                (container_type, runtime_type, strategy_id),
+            )
+        if _session_id:
+            from forven.ai_dropzone_sessions import record_strategy_in_session
+
+            record_strategy_in_session(
+                conn,
+                session_id=_session_id,
+                strategy_id=strategy_id,
+            )
+        if cert_error:
+            conn.execute(
+                "UPDATE strategies SET status_reason = ? WHERE id = ?",
+                (f"sandbox_validation: {str(cert_error)[:400]}", strategy_id),
+            )
 
     # A running persistent worker discovered imported/ at its startup; force a
     # respawn so the next isolated execution call sees the newly-written module.
@@ -921,6 +1152,7 @@ def register_imported_strategy_file(
         "strategy_id": strategy_id,
         "module_name": modname,
         "runtime_type": runtime_type,
+        "type_name": declared_type or container_type,
         "asset": asset.upper(),
         "certified": certified,
         "certification_error": cert_error,

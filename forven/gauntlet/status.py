@@ -113,7 +113,7 @@ def _latest_robustness_results(strategy_id: str) -> dict[str, dict[str, Any]]:
               AND LOWER(TRIM(COALESCE(result_type, ''))) IN (
                   'walk_forward','monte_carlo','param_jitter','parameter_jitter','cost_stress','regime_split'
               )
-            ORDER BY datetime(created_at) DESC
+            ORDER BY datetime(created_at) DESC, result_id DESC
             """,
             (strategy_id,),
         ).fetchall()
@@ -196,6 +196,8 @@ def get_strategy_gauntlet_status(strategy_id: str) -> dict[str, Any]:
         settings_snapshot = build_settings_snapshot()
     gauntlet_cfg = settings_snapshot.get("gauntlet") if isinstance(settings_snapshot.get("gauntlet"), dict) else {}
     required_tests = normalize_required_tests(gauntlet_cfg.get("required_tests"))
+    if not required_tests:
+        required_tests = list(ROBUSTNESS_STEP_KEYS)
 
     # Stale-validation detection: a result validated one set of params; once the
     # strategy's params change, its PASS/FAIL no longer describes the strategy.
@@ -223,7 +225,12 @@ def get_strategy_gauntlet_status(strategy_id: str) -> dict[str, Any]:
         # walk_forward step as "passed" (verdict="PASS") even when the raw WFA
         # verdict is FAIL; an older DB artifact with verdict=FAIL must NOT
         # clobber that authoritative workflow-step outcome.
-        step_already_passed = str(step.get("status") or "").lower() == "passed"
+        step_result_id = str(step.get("result_id") or "").strip()
+        latest_result_id = str(result.get("result_id") or "").strip() if result else ""
+        step_already_passed = (
+            str(step.get("status") or "").lower() == "passed"
+            and (not result or (step_result_id and step_result_id == latest_result_id))
+        )
         if result and not step_already_passed:
             payload.update(result)
         # Fold-rescue transparency (issue #18): a rescued walk_forward step passed the
@@ -330,6 +337,21 @@ def get_strategy_gauntlet_status(strategy_id: str) -> dict[str, Any]:
     except Exception:
         deflated_sharpe = None
 
+    ready_for_paper = False
+    promotion_reason: str | None = None
+    if normalize_stage(strategy.get("stage")) == "gauntlet":
+        try:
+            from forven.policy import evaluate_promotion
+
+            ready_for_paper, promotion_reason = evaluate_promotion(
+                clean_strategy_id,
+                "gauntlet",
+                "paper",
+                record_rejection=False,
+            )
+        except Exception as exc:
+            promotion_reason = f"Promotion gate unavailable: {exc}"
+
     return sanitize_non_finite({
         "ok": True,
         "strategy_id": clean_strategy_id,
@@ -349,5 +371,6 @@ def get_strategy_gauntlet_status(strategy_id: str) -> dict[str, Any]:
         "tests_total": len(ROBUSTNESS_STEP_KEYS),
         "required_tests": required_tests,
         "missing_required": missing_required,
-        "ready_for_paper": bool(required_tests) and not missing_required and normalize_stage(strategy.get("stage")) == "gauntlet",
+        "ready_for_paper": ready_for_paper,
+        "promotion_reason": promotion_reason,
     })

@@ -89,6 +89,89 @@ def test_strategy_gauntlet_status_unifies_workflow_steps_and_robustness_results(
     assert status["missing_required"] == ["walk_forward"]
 
 
+def test_empty_required_tests_status_enforces_every_robustness_step(forven_db):
+    strategy_id = _create_strategy()
+    create_or_get_workflow(
+        strategy_id=strategy_id,
+        created_by="pytest",
+        settings_snapshot={"gauntlet": {"required_tests": []}},
+    )
+
+    status = get_strategy_gauntlet_status(strategy_id)
+
+    assert status["required_tests"] == [
+        "walk_forward",
+        "monte_carlo",
+        "parameter_jitter",
+        "cost_stress",
+        "regime_split",
+    ]
+    assert status["missing_required"] == status["required_tests"]
+    assert status["ready_for_paper"] is False
+
+
+def test_newer_failed_artifact_overrides_older_passed_workflow_step(forven_db):
+    strategy_id = _create_strategy()
+    workflow = create_or_get_workflow(
+        strategy_id=strategy_id,
+        created_by="pytest",
+        settings_snapshot={"gauntlet": {"required_tests": ["walk_forward"]}},
+    )
+    detail = get_workflow_detail(workflow["id"])
+    wf_step = next(step for step in detail["steps"] if step["step_key"] == "walk_forward")
+    update_step_status(
+        wf_step["id"],
+        "passed",
+        output={"result_id": "WF-OLD", "verdict": "PASS"},
+        result_id="WF-OLD",
+    )
+    with get_db() as conn:
+        conn.executemany(
+            """
+            INSERT INTO backtest_results (
+                result_id, strategy_id, result_type, symbol, timeframe,
+                metrics_json, config_json, created_at
+            ) VALUES (?, ?, 'walk_forward', 'BTC/USDT', '1h', ?, ?, ?)
+            """,
+            [
+                (
+                    "WF-OLD",
+                    strategy_id,
+                    json.dumps({"verdict": "PASS"}),
+                    json.dumps({"status": "succeeded"}),
+                    "2026-07-04T00:00:00+00:00",
+                ),
+                (
+                    "WF-NEW",
+                    strategy_id,
+                    json.dumps({"verdict": "FAIL"}),
+                    json.dumps({"status": "succeeded"}),
+                    "2026-07-05T00:00:00+00:00",
+                ),
+            ],
+        )
+
+    status = get_strategy_gauntlet_status(strategy_id)
+
+    assert status["tests"]["walk_forward"]["result_id"] == "WF-NEW"
+    assert status["tests"]["walk_forward"]["status"] == "failed_gate"
+    assert status["tests"]["walk_forward"]["verdict"] == "FAIL"
+    assert status["missing_required"] == ["walk_forward"]
+
+
+def test_ready_for_paper_is_authoritative_backend_gate_result(forven_db, monkeypatch):
+    strategy_id = _create_strategy()
+    monkeypatch.setattr(
+        "forven.policy.evaluate_promotion",
+        lambda *_args, **_kwargs: (False, "persisted cost-stress verdict failed"),
+    )
+
+    status = get_strategy_gauntlet_status(strategy_id)
+
+    assert status["ready_for_paper"] is False
+    assert status["promotion_reason"] == "persisted cost-stress verdict failed"
+
+
 def test_strategy_gauntlet_status_is_strict_json_serializable_with_nonfinite_metrics(forven_db):
     strategy_id = _create_strategy()
 

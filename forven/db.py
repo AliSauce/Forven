@@ -4864,7 +4864,7 @@ def create_strategy_container(
     # point every creation path funnels through, so inject the class's own
     # preferred direction here. Best-effort: registry unavailable -> no-op.
     params = dict(params or {})
-    if "trade_mode" not in params:
+    if not sandbox_only and "trade_mode" not in params:
         try:
             from forven.strategies.registry import _TYPE_MAP, discover
 
@@ -4876,7 +4876,7 @@ def create_strategy_container(
                 params["trade_mode"] = "both" if "both" in modes else sorted(modes)[0]
         except Exception:
             pass
-    elif str(params.get("trade_mode") or "").strip().lower() == "both":
+    elif not sandbox_only and str(params.get("trade_mode") or "").strip().lower() == "both":
         # TRADE-MODE-4 (2026-07-08): the inverse of TRADE-MODE-1. When params
         # carry trade_mode='both' that the archetype CANNOT run — a long-only
         # built-in (macd, williams_r, ...) stamped with 'both' by a CRUX-1
