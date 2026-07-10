@@ -140,6 +140,10 @@ def sim_get_account_value() -> dict:
         "totalMarginUsed": 0,
         "totalNtlPos": 0,
         "totalRawUsd": equity,
+        # PAPER-HALT-2: without a label the daemon defaulted this to "exchange",
+        # so SIMULATED losses read as a real-capital basis and could arm the
+        # real kill-switch. "sim" is a non-real basis: metrics only, no halts.
+        "source": "sim",
     }
 
 def sim_get_all_mids() -> dict[str, float]:

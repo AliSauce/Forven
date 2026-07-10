@@ -3566,6 +3566,19 @@ def _get_risk_state() -> dict:
 # be silently dropped.
 _RISK_WRITE_TIMEOUT_SECONDS = 2.0
 
+# PAPER-HALT-2: the kill-switch and daily-loss halt are REAL-CAPITAL protections.
+# Only equity samples read from a real exchange basis may arm them. Paper/sim
+# bases (the credential-less paper fallback, the simulation harness's mock
+# exchange) track drawdown metrics for display but NEVER halt the system —
+# paper strategies run in isolated $10k containers precisely so they can fail,
+# and an aggregate paper drawdown says nothing about real capital at risk.
+# (PAPER-HALT-1 decoupled the other direction: halts don't block paper opens.)
+_REAL_CAPITAL_EQUITY_SOURCES = {"exchange", "books_aggregate", "books_only"}
+
+
+def _is_real_capital_equity_source(source: str | None) -> bool:
+    return str(source or "").strip().lower() in _REAL_CAPITAL_EQUITY_SOURCES
+
 
 def _save_risk_state(state: dict, *, best_effort: bool = False):
     with _RISK_STATE_LOCK:
@@ -3833,7 +3846,11 @@ def _update_equity_locked(account_equity: float, source: str) -> dict:
         _exec_mode = str(_get_execution_mode() or "paper").strip().lower()
     except Exception:
         _exec_mode = "paper"
-    if source == "paper" and prev_source != "paper" and _exec_mode != "paper":
+    if (
+        not _is_real_capital_equity_source(source)
+        and _is_real_capital_equity_source(prev_source)
+        and _exec_mode != "paper"
+    ):
         log.warning(
             "Ignoring transient paper-source equity sample during a live session "
             "(would flap the source basis and re-baseline/clear the kill-switch); risk state unchanged."
@@ -3860,8 +3877,15 @@ def _update_equity_locked(account_equity: float, source: str) -> dict:
     #     live positions. Re-baseline the denominator.
     # The daily-loss HALT is cleared ONLY on the initial paper->live connect; a
     # live<->live basis flip must NOT lift an already-fired halt (RISK-STATE-1).
-    _initial_live_connect = (prev_source == "paper" and source != "paper")
-    _live_basis_changed = (source != prev_source and source != "paper" and prev_source != "paper")
+    _initial_live_connect = (
+        not _is_real_capital_equity_source(prev_source)
+        and _is_real_capital_equity_source(source)
+    )
+    _live_basis_changed = (
+        source != prev_source
+        and _is_real_capital_equity_source(source)
+        and _is_real_capital_equity_source(prev_source)
+    )
     if (_initial_live_connect or _live_basis_changed) and hwm > 0:
         log.info(
             "Equity source basis changed: %s -> %s. Re-baselining HWM ($%.2f -> $%.2f) and daily tracking%s.",
@@ -3960,6 +3984,34 @@ def _update_equity_locked(account_equity: float, source: str) -> dict:
         result["kill_switch"] = True
         # Already-active kill-switch was persisted when it first fired; this is a
         # routine re-save of unchanged state, so best-effort is safe.
+        _save_risk_state(state, best_effort=True)
+        return result
+
+    # PAPER-HALT-2: a non-real-capital basis (paper fallback, sim harness) never
+    # arms the kill-switch or daily-loss halt — those are real-capital
+    # protections, and a paper container failing is the experiment working. Log
+    # the would-have-fired transition once so the operator can still see it.
+    real_capital_basis = _is_real_capital_equity_source(source)
+    if not real_capital_basis:
+        breach = (
+            (drawdown_pct >= max_drawdown)
+            or (daily_pnl_pct <= -daily_loss_limit)
+        )
+        if breach and not state.get("paper_basis_breach_logged"):
+            state["paper_basis_breach_logged"] = True
+            log.info(
+                "paper-basis equity breached a halt threshold (drawdown %.1f%%, "
+                "daily %.1f%%, source=%s) — halts NOT armed (real-capital only)",
+                drawdown_pct * 100, daily_pnl_pct * 100, source,
+            )
+            log_activity("info", "risk", (
+                f"Paper-basis equity crossed a halt threshold (drawdown "
+                f"{drawdown_pct:.1%}, daily {daily_pnl_pct:.1%}, source={source}). "
+                "Kill-switch and daily-loss halts arm on real-capital equity only; "
+                "paper strategies fail in their own containers."
+            ))
+        elif not breach and state.get("paper_basis_breach_logged"):
+            state["paper_basis_breach_logged"] = False
         _save_risk_state(state, best_effort=True)
         return result
 
