@@ -100,6 +100,7 @@ class DataHub:
                 "DuckDB enrichment failed for %s/%s; falling back to legacy joins: %s",
                 symbol, timeframe, exc,
             )
+            from forven.data_manager import StreamUnreadableError as _LegacyUnreadable
             from forven.data_manager import get_data_manager
             dm = get_data_manager()
             result = df.copy()
@@ -115,6 +116,12 @@ class DataHub:
                     continue
                 try:
                     result = join(result)
+                except _LegacyUnreadable:
+                    # A present-but-corrupt expected stream must fail the enrich
+                    # loudly (FIX 4 parity), not be silently dropped like an
+                    # absent one — otherwise the backtest runs judged on an
+                    # absent aux column that DataHub would have surfaced.
+                    raise
                 except Exception as join_exc:
                     logging.getLogger("forven.dataeng.hub").warning(
                         "Legacy %s enrichment skipped for %s: %s", stream_name, symbol, join_exc
@@ -321,6 +328,13 @@ class _EnrichmentSpec:
     # announced (funding, OI, macro) -> no shift. Mirrors data_manager's
     # _merge_asof_parquet(shift_to_bucket_close=...).
     bucket_close_shift_seconds: int = 0
+    # PARITY with legacy _merge_asof_parquet(fill_coverage_only=True): restrict
+    # ``fill`` to bars AT/AFTER the stream's first covered timestamp. Bars before
+    # coverage stay NaN (unknown), not a fabricated 0 — otherwise the hub hands a
+    # backtest fake zeros where the legacy engine leaves NaN, and the two engines
+    # silently diverge on pre-coverage bars (the liquidations divergence FIX 4's
+    # parity test surfaced).
+    fill_coverage_only: bool = False
 
 
 def _available_enrichment_specs(
@@ -411,6 +425,10 @@ def _available_enrichment_specs(
             ("long_liq_usd", "short_liq_usd", "liq_imbalance"),
             {"long_liq_usd": 0.0, "short_liq_usd": 0.0, "liq_imbalance": 0.0},
             bucket_close_shift_seconds=3600,
+            # PARITY: legacy _enrich_liquidations uses fill_coverage_only=True — a
+            # blanket 0 fill before capture started would hand backtests years of
+            # fake zeros (the phantom-family 0-trade failure mode).
+            fill_coverage_only=True,
         ),
         # Run 3 crypto-native streams (strategy-path, bucket-close shifted; no
         # fill — NaN before coverage, matching the legacy joins).
@@ -481,15 +499,55 @@ def _first_existing_macro_path(macro_dir: Path, macro_name: str) -> Path | None:
     return None
 
 
+class StreamUnreadableError(RuntimeError):
+    """A stream parquet EXISTS but DuckDB could not read it.
+
+    Absent files are dropped from the plan (both engines skip the column);
+    a present-but-corrupt file that the plan needs must fail the enrich so the
+    DataHub and legacy paths fail IDENTICALLY on the same condition rather than
+    one silently running a backtest with a whole aux column absent (FIX 4)."""
+
+
 def _parquet_has_columns(path: Path, columns: list[str]) -> bool:
-    if not path.exists():
+    if not path.exists() or _empty_file(path):
         return False
     try:
         with duckdb.connect(":memory:") as con:
             names = {row[0] for row in con.execute("DESCRIBE SELECT * FROM read_parquet(?)", [str(path)]).fetchall()}
-        return all(column in names for column in columns)
+    except Exception as exc:
+        # Present but unreadable: fail loudly (parity with the legacy path's
+        # StreamUnreadableError) instead of silently dropping the stream.
+        raise StreamUnreadableError(f"stream parquet unreadable: {path}") from exc
+    return all(column in names for column in columns)
+
+
+def _empty_file(path: Path) -> bool:
+    try:
+        return path.stat().st_size == 0
+    except OSError:
+        return True
+
+
+def _stream_coverage_start(path: Path, shift_seconds: int) -> pd.Timestamp | None:
+    """First covered (bucket-close-shifted) timestamp of a stream parquet, ns UTC.
+
+    Used to gate coverage-only fills so pre-coverage bars stay NaN (parity with
+    the legacy engine). None when the file has no readable timestamps."""
+    try:
+        with duckdb.connect(":memory:") as con:
+            row = con.execute("SELECT min(timestamp) FROM read_parquet(?)", [str(path)]).fetchone()
     except Exception:
-        return False
+        return None
+    if not row or row[0] is None:
+        return None
+    ts = pd.Timestamp(row[0])
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
+    else:
+        ts = ts.tz_convert("UTC")
+    if shift_seconds > 0:
+        ts = ts + pd.Timedelta(seconds=shift_seconds)
+    return ts
 
 
 def _enrich_with_duckdb(df: pd.DataFrame, specs: list[_EnrichmentSpec]) -> pd.DataFrame:
@@ -527,11 +585,26 @@ def _enrich_with_duckdb(df: pd.DataFrame, specs: list[_EnrichmentSpec]) -> pd.Da
             f"ON b.timestamp >= {alias}.timestamp"
         )
         join_params.append(str(spec.path))
+        # For coverage-only fill, compute the stream's first covered (shifted)
+        # timestamp once and gate the default on it, so pre-coverage bars stay
+        # NaN instead of a fabricated 0 — parity with legacy fill_coverage_only.
+        cov_start = None
+        if spec.fill_coverage_only and spec.fill:
+            cov_start = _stream_coverage_start(spec.path, _shift)
         for output_col in spec.output_columns:
             joined = f"{alias}.{_quote_identifier(_joined_col(alias, output_col))}"
             if output_col in spec.fill:
-                select_parts.append(f"COALESCE({joined}, ?) AS {_quote_identifier(output_col)}")
-                select_params.append(spec.fill[output_col])
+                if cov_start is not None:
+                    # Fill only at/after coverage start; before it, leave NULL.
+                    select_parts.append(
+                        f"CASE WHEN b.timestamp >= ? THEN COALESCE({joined}, ?) "
+                        f"ELSE {joined} END AS {_quote_identifier(output_col)}"
+                    )
+                    select_params.append(cov_start)
+                    select_params.append(spec.fill[output_col])
+                else:
+                    select_parts.append(f"COALESCE({joined}, ?) AS {_quote_identifier(output_col)}")
+                    select_params.append(spec.fill[output_col])
             else:
                 select_parts.append(f"{joined} AS {_quote_identifier(output_col)}")
 

@@ -106,6 +106,7 @@ jobs:
             tests/test_dataeng_foundation.py \
             tests/test_enrichment_causality.py \
             tests/test_enrich_backtest_frame.py \
+            tests/test_data_engine_p2_hardening.py \
             tests/test_orderflow_lookahead.py \
             tests/test_binance_vision.py \
             tests/test_keepalive_staleness.py \

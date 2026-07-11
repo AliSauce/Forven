@@ -403,6 +403,30 @@ def _load_stream_parquet(path: Path) -> pd.DataFrame | None:
         return None
 
 
+class StreamUnreadableError(RuntimeError):
+    """A stream parquet file EXISTS but could not be read.
+
+    Distinct from an ABSENT file: absent means "not collected yet" (both
+    enrichment engines agree to skip the column), whereas unreadable means the
+    data is present but corrupt. Silently skipping an unreadable expected stream
+    lets a backtest run with a whole aux column NaN/absent, judged as if that
+    were the data — so the enrichment fails loudly instead, and the DataHub and
+    legacy paths fail IDENTICALLY on the same file (FIX 4 parity)."""
+
+
+def _stream_load_status(path: Path) -> str:
+    """Classify a stream parquet path: ``"absent"`` (missing/empty file — skip
+    gracefully), ``"unreadable"`` (present but corrupt — must fail), or ``"ok"``."""
+    try:
+        if not path.exists() or path.stat().st_size == 0:
+            return "absent"
+    except OSError:
+        return "absent"
+    if _load_stream_parquet(path) is None:
+        return "unreadable"
+    return "ok"
+
+
 _parquet_cache_lock = threading.Lock()
 _parquet_cache: dict[str, tuple[tuple[float, int], pd.DataFrame]] = {}
 _PARQUET_CACHE_MAX = 256
@@ -499,6 +523,13 @@ def _merge_asof_parquet(
     """
     src = _parquet_read_cache(path)
     if src is None or src.empty:
+        # Distinguish an ABSENT file (not collected yet — skip gracefully, both
+        # engines agree) from a PRESENT-BUT-UNREADABLE one (corrupt data). A
+        # corrupt expected stream must fail loudly so the legacy path does not
+        # silently no-op a column that would otherwise be judged as real data
+        # (FIX 4 parity — the DataHub path raises on the same file).
+        if _stream_load_status(path) == "unreadable":
+            raise StreamUnreadableError(f"stream parquet unreadable: {path}")
         _log_missing_stream_once(path)
         return df
     if not all(c in src.columns for c in cols):
@@ -1158,10 +1189,30 @@ class LiquidationCollector:
 
                 raw_df = pd.DataFrame(records)
                 raw_df = raw_df.set_index("timestamp")
-                # Bucket into 1h periods
-                long_liq = raw_df[raw_df["side"] == "SELL"].resample("1h")["qty_usd"].sum()
-                short_liq = raw_df[raw_df["side"] == "BUY"].resample("1h")["qty_usd"].sum()
-                liq_count = raw_df.resample("1h")["qty_usd"].count()
+                # Bucket into 1h periods on a CONTINUOUS hourly index spanning the
+                # fetched window, so interior hours with no liquidations become
+                # explicit ZERO rows rather than being absent. Absent rows let the
+                # backward-matching enrichment ASOF carry the previous bucket's
+                # stale aggregates across the gap (phantom values). Zero rows are
+                # values at their own bucket close — causal, not look-ahead.
+                bucket_index = pd.date_range(
+                    raw_df.index.min().floor("1h"),
+                    raw_df.index.max().floor("1h"),
+                    freq="1h",
+                    tz="UTC",
+                )
+                long_liq = (
+                    raw_df[raw_df["side"] == "SELL"].resample("1h")["qty_usd"].sum()
+                    .reindex(bucket_index, fill_value=0.0)
+                )
+                short_liq = (
+                    raw_df[raw_df["side"] == "BUY"].resample("1h")["qty_usd"].sum()
+                    .reindex(bucket_index, fill_value=0.0)
+                )
+                liq_count = (
+                    raw_df.resample("1h")["qty_usd"].count()
+                    .reindex(bucket_index, fill_value=0)
+                )
 
                 agg_df = pd.DataFrame({
                     "long_liq_usd": long_liq,
@@ -2200,51 +2251,44 @@ class DataManager:
 
         result = df.copy()
 
+        # FIX 4 parity: a per-stream error is swallowed (log + skip) EXCEPT
+        # StreamUnreadableError — a present-but-corrupt expected stream must fail
+        # the enrichment loudly, identically to the DataHub path, instead of
+        # silently no-op'ing a whole aux column that a backtest would then be
+        # judged on as if it were real data. An ABSENT file is still graceful.
+        def _run(stream_name: str, join):
+            nonlocal result
+            try:
+                result = join(result)
+            except StreamUnreadableError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                log.warning("%s enrichment skipped for %s: %s", stream_name, symbol, exc)
+
         # Existing enrichment
         if "funding" not in excluded:
-            try:
-                result = self._enrich_funding(result, symbol)
-            except Exception as exc:
-                log.warning("Funding enrichment skipped for %s: %s", symbol, exc)
+            _run("Funding", lambda r: self._enrich_funding(r, symbol))
 
         if "oi" not in excluded:
-            try:
-                result = self._enrich_oi(result, symbol, timeframe)
-            except Exception as exc:
-                log.warning("OI enrichment skipped for %s/%s: %s", symbol, timeframe, exc)
+            _run("OI", lambda r: self._enrich_oi(r, symbol, timeframe))
 
         # Phase 1: Derivatives intelligence
         if "long_short_ratio" not in excluded:
-            try:
-                result = self._enrich_long_short_ratio(result, symbol)
-            except Exception as exc:
-                log.warning("LSR enrichment skipped for %s: %s", symbol, exc)
+            _run("LSR", lambda r: self._enrich_long_short_ratio(r, symbol))
 
         if "taker_volume" not in excluded:
-            try:
-                result = self._enrich_taker_volume(result, symbol)
-            except Exception as exc:
-                log.warning("Taker volume enrichment skipped for %s: %s", symbol, exc)
+            _run("Taker volume", lambda r: self._enrich_taker_volume(r, symbol))
 
         if "liquidations" not in excluded:
-            try:
-                result = self._enrich_liquidations(result, symbol)
-            except Exception as exc:
-                log.warning("Liquidation enrichment skipped for %s: %s", symbol, exc)
+            _run("Liquidation", lambda r: self._enrich_liquidations(r, symbol))
 
         # Run 3 crypto-native streams: per-symbol basis + market-wide implied
         # vol. Both are bar-aggregate series → bucket-close shifted.
         if "basis" not in excluded:
-            try:
-                result = self._enrich_basis(result, symbol)
-            except Exception as exc:
-                log.warning("Basis enrichment skipped for %s: %s", symbol, exc)
+            _run("Basis", lambda r: self._enrich_basis(r, symbol))
 
         if "iv" not in excluded:
-            try:
-                result = self._enrich_iv(result)
-            except Exception as exc:
-                log.warning("IV enrichment skipped: %s", exc)
+            _run("IV", lambda r: self._enrich_iv(r))
 
         # RESEARCH-ONLY daily macro / sentiment. These carry same-day-close
         # lookahead and weekend gaps, so they are NEVER joined on the strategy/
