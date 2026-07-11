@@ -53,6 +53,59 @@ def _insert_legacy_margin_trades(conn, sid, pnls, *, flag=None):
     conn.commit()
 
 
+def _insert_robustness_result(sid, result_type, metrics):
+    """Persist a passing gauntlet robustness artifact for ``sid`` (mirrors
+    tests/test_two_tier_gate.py::_insert_result)."""
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO backtest_results (result_id, strategy_id, result_type, symbol, timeframe, "
+            "metrics_json, config_json, created_at) "
+            "VALUES (?, ?, ?, 'BTC/USDT', '1h', ?, '{\"status\":\"succeeded\"}', datetime('now'))",
+            (f"{result_type}-{sid}", sid, result_type, json.dumps(metrics)),
+        )
+        conn.commit()
+
+
+def _wf_pass():
+    """A clean, passing walk-forward payload (low degradation, ample OOS Sharpe/trades)."""
+    return {
+        "verdict": "PASS",
+        "degradation": 0.10,
+        "avg_oos_sharpe": 1.0,
+        "total_oos_trades": 40,
+        "splits": [
+            {"out_of_sample": {"sharpe": 1.2, "total_trades": 20}},
+            {"out_of_sample": {"sharpe": 0.9, "total_trades": 18}},
+            {"out_of_sample": {"sharpe": 0.7, "total_trades": 15}},
+        ],
+    }
+
+
+def _seed_clean_robustness_evidence(sid):
+    """Seed the minimal set of PASSING gauntlet artifacts the paper->live gate's
+    strict-live robustness battery requires (PR#60 'Harden Forge lifecycle
+    correctness', commit 1c40bcc3 — made unconditional by a97942ac).
+
+    Without these, ``_strict_robustness_reject`` at the TOP of ``_evaluate_paper_gate``
+    short-circuits with "Live gate: robustness evidence unavailable (no usable gauntlet
+    artifacts)" BEFORE any S00152 reason is reached. Seeding clean walk_forward +
+    cost_stress + regime_split + monte_carlo evidence (param_jitter is not checked by
+    the battery) lets these tests exercise their ORIGINAL S00152 assertions again
+    without weakening the gate. Values match tests/test_two_tier_gate.py's proven
+    clean-pass set."""
+    _insert_robustness_result(sid, "walk_forward", _wf_pass())
+    _insert_robustness_result(
+        sid, "cost_stress", {"verdict": "PASS", "degradation_pct": 20.0, "stressed_sharpe": 0.6}
+    )
+    _insert_robustness_result(
+        sid, "regime_split", {"verdict": "PASS", "n_regimes": 3, "profitable_regime_share": 0.75}
+    )
+    _insert_robustness_result(
+        sid, "monte_carlo",
+        {"verdict": "PASS", "n_trades": 40, "percentile_score": 0.8, "max_dd_p95_ratio": 0.15},
+    )
+
+
 def test_gate_excludes_non_equity_fraction_rows(forven_db):
     """PROMOTION-GATE-PARITY-2/3: only kernel equity-fraction paper rows (flagged
     pnl_is_equity_fraction) count toward the promotion gate. Legacy/margin-scale rows
@@ -63,12 +116,15 @@ def test_gate_excludes_non_equity_fraction_rows(forven_db):
         # 5 legacy margin-scale rows + a converge artifact — none flagged.
         _insert_legacy_margin_trades(conn, "s-mixed", [0.30] * 5, flag={"non_vectorizable_legacy": True})
 
-    # Sample counts ONLY the 12 flagged rows (not 17).
-    _, msg = _check_paper_trades("s-mixed")
+    # Sample counts ONLY the 12 flagged rows (not 17). _check_paper_trades returns a
+    # 3-tuple (passed, msg, extra) — the trailing `extra` dict predates PR#60; the old
+    # 2-value unpack raised "too many values to unpack".
+    _, msg, _ = _check_paper_trades("s-mixed")
     assert "12/" in msg, msg
 
     # And the excluded +30% margin rows can't inflate the compounded paper return.
-    passed, ret_msg = _check_paper_return("s-mixed")
+    # _check_paper_return also returns a 3-tuple (passed, msg, extra) on this path.
+    passed, ret_msg, _ = _check_paper_return("s-mixed")
     assert passed  # the 12 small positive equity-fraction trades are net positive
     # 12 * +1% compounded ≈ +12.7%, NOT the ~3700% five +30% margin rows would add.
     pct = float(ret_msg.split(":")[1].strip().rstrip("%"))
@@ -88,6 +144,7 @@ def test_oos_sharpe_much_higher_than_is_sharpe_rejects(forven_db):
             "oos_sharpe": 2.0,  # 2.0x IS → exceeds 1.5x limit
         })
         _insert_paper_trades(conn, "s-overfit", [1.0] * 60)
+    _seed_clean_robustness_evidence("s-overfit")
 
     passed, msg = _evaluate_paper_gate("s-overfit", DEFAULT_PIPELINE_CONFIG)
     assert not passed
@@ -104,6 +161,7 @@ def test_oos_sharpe_within_ratio_passes(forven_db):
             "profit_factor": 3.0,
         })
         _insert_paper_trades(conn, "s-ok-sharpe", [1.0] * 60)
+    _seed_clean_robustness_evidence("s-ok-sharpe")
 
     passed, msg = _evaluate_paper_gate("s-ok-sharpe", DEFAULT_PIPELINE_CONFIG)
     assert passed
@@ -118,6 +176,7 @@ def test_oos_sharpe_check_skipped_when_is_zero(forven_db):
             "profit_factor": 3.0,
         })
         _insert_paper_trades(conn, "s-zero-is", [1.0] * 60)
+    _seed_clean_robustness_evidence("s-zero-is")
 
     passed, msg = _evaluate_paper_gate("s-zero-is", DEFAULT_PIPELINE_CONFIG)
     assert passed
@@ -135,6 +194,7 @@ def test_profit_factor_below_1_5_rejects(forven_db):
             "profit_factor": 1.2,
         })
         _insert_paper_trades(conn, "s-low-pf", [1.0] * 60)
+    _seed_clean_robustness_evidence("s-low-pf")
 
     passed, msg = _evaluate_paper_gate("s-low-pf", DEFAULT_PIPELINE_CONFIG)
     assert not passed
@@ -149,6 +209,7 @@ def test_profit_factor_between_1_5_and_2_0_passes_with_size_reduction(forven_db)
             "profit_factor": 1.7,
         })
         _insert_paper_trades(conn, "s-mid-pf", [1.0] * 60)
+    _seed_clean_robustness_evidence("s-mid-pf")
 
     passed, msg = _evaluate_paper_gate("s-mid-pf", DEFAULT_PIPELINE_CONFIG)
     assert passed
@@ -163,6 +224,7 @@ def test_profit_factor_above_2_0_passes_normally(forven_db):
             "profit_factor": 2.5,
         })
         _insert_paper_trades(conn, "s-good-pf", [1.0] * 60)
+    _seed_clean_robustness_evidence("s-good-pf")
 
     passed, msg = _evaluate_paper_gate("s-good-pf", DEFAULT_PIPELINE_CONFIG)
     assert passed
@@ -179,6 +241,7 @@ def test_insufficient_paper_trades_rejects(forven_db):
     with get_db() as conn:
         _insert_strategy(conn, "s-few-trades", metrics={"profit_factor": 3.0})
         _insert_paper_trades(conn, "s-few-trades", [1.0] * 5)
+    _seed_clean_robustness_evidence("s-few-trades")
 
     passed, msg = _evaluate_paper_gate("s-few-trades", DEFAULT_PIPELINE_CONFIG)
     assert not passed
@@ -190,6 +253,7 @@ def test_insufficient_paper_sample_precedes_static_pf_reject(forven_db):
     with get_db() as conn:
         _insert_strategy(conn, "s-few-trades-low-pf", metrics={"profit_factor": 1.2})
         _insert_paper_trades(conn, "s-few-trades-low-pf", [1.0] * 5)
+    _seed_clean_robustness_evidence("s-few-trades-low-pf")
 
     passed, msg = _evaluate_paper_gate("s-few-trades-low-pf", DEFAULT_PIPELINE_CONFIG)
     assert not passed
@@ -201,6 +265,7 @@ def test_exactly_50_trades_passes(forven_db):
     with get_db() as conn:
         _insert_strategy(conn, "s-fifty", metrics={"profit_factor": 3.0})
         _insert_paper_trades(conn, "s-fifty", [1.0] * 50)
+    _seed_clean_robustness_evidence("s-fifty")
 
     passed, msg = _evaluate_paper_gate("s-fifty", DEFAULT_PIPELINE_CONFIG)
     assert passed
@@ -218,6 +283,7 @@ def test_negative_paper_return_rejects(forven_db):
         # 30 wins + 30 losses that net to negative
         pnls = [2.0] * 25 + [-2.5] * 25 + [-1.0] * 10
         _insert_paper_trades(conn, "s-neg-return", pnls)
+    _seed_clean_robustness_evidence("s-neg-return")
 
     passed, msg = _evaluate_paper_gate("s-neg-return", DEFAULT_PIPELINE_CONFIG)
     assert not passed
@@ -232,6 +298,7 @@ def test_zero_paper_return_rejects(forven_db):
         # 50 trades that net to exactly zero
         pnls = [1.0] * 25 + [-1.0] * 25
         _insert_paper_trades(conn, "s-zero-return", pnls)
+    _seed_clean_robustness_evidence("s-zero-return")
 
     passed, msg = _evaluate_paper_gate("s-zero-return", DEFAULT_PIPELINE_CONFIG)
     assert not passed
@@ -250,6 +317,7 @@ def test_paper_drawdown_exceeding_limit_rejects(forven_db):
         # PnL values are fractional (e.g., 0.02 = +2%, -0.20 = -20%)
         pnls = [0.02] * 20 + [-0.20] + [0.02] * 39
         _insert_paper_trades(conn, "s-high-dd", pnls)
+    _seed_clean_robustness_evidence("s-high-dd")
 
     passed, msg = _evaluate_paper_gate("s-high-dd", DEFAULT_PIPELINE_CONFIG)
     assert not passed
@@ -281,6 +349,7 @@ def test_oos_profit_factor_used_when_available(forven_db):
             "oos_profit_factor": 1.2,  # but OOS PF is below 1.5
         })
         _insert_paper_trades(conn, "s-oos-pf", [1.0] * 60)
+    _seed_clean_robustness_evidence("s-oos-pf")
 
     passed, msg = _evaluate_paper_gate("s-oos-pf", DEFAULT_PIPELINE_CONFIG)
     assert not passed
@@ -294,6 +363,7 @@ def test_general_pf_fallback_when_no_oos(forven_db):
             "profit_factor": 1.7,  # between 1.5-2.0 → 50% reduction
         })
         _insert_paper_trades(conn, "s-gen-pf", [1.0] * 60)
+    _seed_clean_robustness_evidence("s-gen-pf")
 
     passed, msg = _evaluate_paper_gate("s-gen-pf", DEFAULT_PIPELINE_CONFIG)
     assert passed

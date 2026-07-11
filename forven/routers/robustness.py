@@ -977,6 +977,204 @@ def _run_walk_forward_analysis(body: WalkForwardBody) -> dict:
     return result
 
 
+def _monte_carlo_bootstrap_worker(
+    returns: list[float],
+    *,
+    original_sharpe: float,
+    original_return: float,
+    n_simulations: int,
+    initial_capital: float,
+    mc_profitable_min: float,
+    max_dd_p95_limit_pct: float,
+) -> dict:
+    """Pure numpy bootstrap of realized trade returns — the Monte Carlo compute core.
+
+    This is the GIL-bound hotspot of the MC step: ``n_simulations`` (default 1000)
+    seeded resamples over the realized trade returns, each doing cumprod / drawdown /
+    percentile numpy work. It touches NO database, lake, or global state, and all of
+    its inputs are plain floats/lists, so it is offloaded to an isolated subprocess by
+    ``_run_monte_carlo_analysis`` (mirroring the isolated backtest workers). It is a
+    MODULE-LEVEL function precisely so spawn-based ProcessPoolExecutor can pickle it on
+    Windows. The RNG is seeded (42) inside the function, so the result is bit-identical
+    whether it runs in-thread or in a child process.
+    """
+    rng = np.random.default_rng(42)
+    returns_arr = _finite_array(returns)
+    n_trades = len(returns)
+    # Preserve the original loop/output semantics exactly: the loop is clamped to >=1
+    # iteration, while the path-sampling stride and the reported n_simulations use the
+    # RAW requested count (so a degenerate 0 request reports 0, as before).
+    n_simulations = int(n_simulations)
+    n_iterations = max(n_simulations, 1)
+    initial_capital = float(initial_capital)
+    final_returns: list[float] = []
+    max_drawdowns: list[float] = []
+    sharpes: list[float] = []
+    equity_paths: list[list[float]] = []
+    max_paths = 50
+
+    for sim_idx in range(n_iterations):
+        sampled = rng.choice(returns_arr, size=n_trades, replace=True)
+        equity_factors = np.cumprod(1.0 + sampled)
+        equity = equity_factors * initial_capital
+        final_return_pct = ((equity[-1] - initial_capital) / initial_capital) * 100.0
+        final_returns.append(float(final_return_pct))
+
+        # Include the pre-trade starting balance in the peak path. Otherwise a loss
+        # on the first sampled trade becomes the initial peak and its drawdown vanishes.
+        equity_with_initial = np.concatenate(([initial_capital], equity))
+        peak = np.maximum.accumulate(equity_with_initial)
+        drawdown_pct = np.where(
+            peak > 0,
+            (peak - equity_with_initial) / peak * 100.0,
+            0.0,
+        )
+        max_drawdowns.append(float(np.nanmax(drawdown_pct)) if drawdown_pct.size else 0.0)
+
+        if len(sampled) > 1 and np.std(sampled) > 0:
+            # Per-TRADE Sharpe of the bootstrapped path. (Was * sqrt(252), which
+            # annualizes as if these were daily returns — they are per-trade returns at
+            # an arbitrary frequency, so the 252 factor was a meaningless scale. This is
+            # a diagnostic only; the MC verdict uses prob_profitable + the drawdown cap.)
+            sharpes.append(float(np.mean(sampled) / np.std(sampled)))
+        else:
+            sharpes.append(0.0)
+
+        if n_simulations <= max_paths or sim_idx % max(1, n_simulations // max_paths) == 0:
+            if len(equity_paths) < max_paths:
+                equity_paths.append([initial_capital] + equity.tolist())
+
+    final_returns_arr = _finite_array(final_returns)
+    max_drawdowns_arr = _finite_array(max_drawdowns)
+    sharpes_arr = _finite_array(sharpes)
+    percentile_rank = (
+        float(np.mean(final_returns_arr <= original_return) * 100.0)
+        if final_returns_arr.size
+        else 0.0
+    )
+    max_dd_percentiles = _percentile_distribution(max_drawdowns_arr)
+    prob_profitable = round(float(np.mean(final_returns_arr > 0) * 100.0), 1) if final_returns_arr.size else 0.0
+    max_dd_p95 = float(max_dd_percentiles.get("p95", 0.0) or 0.0)
+    verdict_reasons: list[str] = []
+    if prob_profitable < mc_profitable_min:
+        verdict_reasons.append(
+            f"probability profitable {prob_profitable:.1f}% below {mc_profitable_min:.1f}% threshold"
+        )
+    if max_dd_p95 > max_dd_p95_limit_pct:
+        verdict_reasons.append(
+            f"95th percentile drawdown {max_dd_p95:.1f}% exceeds {max_dd_p95_limit_pct:.1f}% limit"
+        )
+
+    return {
+        "method": "trade_bootstrap",
+        # Interpretation guard (issue #19): this test bootstraps the trades the
+        # baseline ALREADY produced, so a PASS certifies sequencing/tail-risk
+        # stability of that trade set — it is not evidence the edge is real.
+        "scope_note": (
+            "Bootstrap of realized trade returns: tests stability of the trade "
+            "sequence and bounds tail risk. It does not test whether the "
+            "underlying edge is real — walk-forward and regime-split do that."
+        ),
+        "original_sharpe": round(original_sharpe, 3),
+        "original_return": round(original_return, 2),
+        "n_simulations": int(n_simulations),
+        "n_trades": n_trades,
+        "percentile_rank": round(percentile_rank, 1),
+        "percentile_score": round(prob_profitable / 100.0, 5),
+        "return_distribution": _percentile_distribution(final_returns_arr),
+        "drawdown_distribution": max_dd_percentiles,
+        "sharpe_distribution": _percentile_distribution(sharpes_arr),
+        "prob_profitable": prob_profitable,
+        "prob_loss_gt_10": round(float(np.mean(final_returns_arr < -10) * 100.0), 1) if final_returns_arr.size else 0.0,
+        "verdict": "FAIL" if verdict_reasons else "PASS",
+        "verdict_reasons": verdict_reasons,
+        "verdict_threshold": round(mc_profitable_min, 1),
+        "verdict_thresholds": {
+            "min_prob_profitable": round(mc_profitable_min, 1),
+            "max_dd_p95": round(max_dd_p95_limit_pct, 1),
+        },
+        "equity_paths": equity_paths,
+        "return_histogram": _make_histogram(final_returns_arr),
+        "drawdown_histogram": _make_histogram(max_drawdowns_arr),
+        "sharpe_histogram": _make_histogram(sharpes_arr),
+        "max_dd_p95_ratio": round(float(max_dd_p95 / 100.0), 5),
+    }
+
+
+# Wall-clock ceiling for the offloaded Monte Carlo bootstrap subprocess. The compute
+# is bounded by n_simulations (default 1000) x n_trades numpy ops — seconds in
+# practice — so this is a leak/hang backstop, not a normal-path limit.
+_MONTE_CARLO_ISOLATION_TIMEOUT = 300
+
+
+def _run_monte_carlo_bootstrap(
+    returns: list[float],
+    *,
+    original_sharpe: float,
+    original_return: float,
+    n_simulations: int,
+    initial_capital: float,
+    mc_profitable_min: float,
+    max_dd_p95_limit_pct: float,
+) -> dict:
+    """Run the Monte Carlo bootstrap, offloaded to an isolated subprocess.
+
+    The bootstrap is a self-contained, DB-free numpy hotspot (see
+    ``_monte_carlo_bootstrap_worker``) that otherwise burns the GIL on an API worker
+    thread for the duration of ``n_simulations`` resamples — one of the multi-second
+    event-loop stalls attributed to gauntlet/validation compute. It queues on the
+    process-wide subprocess budget (``strategies/concurrency.py``) exactly like every
+    isolated backtest, so peak child-process memory stays bounded no matter how the
+    parallel levers stack. Falls back to running inline (identical result — the RNG is
+    seeded inside the worker) under pytest, when isolation is disabled, or if the child
+    process cannot be spawned; a subprocess timeout/crash is a real failure and raised.
+    """
+    kwargs = {
+        "original_sharpe": original_sharpe,
+        "original_return": original_return,
+        "n_simulations": n_simulations,
+        "initial_capital": initial_capital,
+        "mc_profitable_min": mc_profitable_min,
+        "max_dd_p95_limit_pct": max_dd_p95_limit_pct,
+    }
+
+    from forven.strategies.backtest import _should_use_process_isolation
+
+    if not _should_use_process_isolation():
+        return _monte_carlo_bootstrap_worker(returns, **kwargs)
+
+    import concurrent.futures
+    import multiprocessing
+
+    from forven.strategies.backtest import _kill_executor_processes
+    from forven.strategies.concurrency import backtest_subprocess_slot
+
+    try:
+        with backtest_subprocess_slot("monte_carlo"), concurrent.futures.ProcessPoolExecutor(
+            max_workers=1,
+            mp_context=multiprocessing.get_context("spawn"),
+        ) as executor:
+            future = executor.submit(_monte_carlo_bootstrap_worker, returns, **kwargs)
+            try:
+                return future.result(timeout=_MONTE_CARLO_ISOLATION_TIMEOUT)
+            except concurrent.futures.TimeoutError:
+                log.error(
+                    "ISOLATION: Monte Carlo bootstrap timed out after %ds (%d simulations, %d returns)",
+                    _MONTE_CARLO_ISOLATION_TIMEOUT, int(n_simulations), len(returns),
+                )
+                _kill_executor_processes(executor)
+                raise HTTPException(
+                    500,
+                    f"Monte Carlo bootstrap timed out after {_MONTE_CARLO_ISOLATION_TIMEOUT}s.",
+                )
+    except (OSError, concurrent.futures.BrokenExecutor) as exc:
+        # The child process could not be spawned (fork/exec failure, broken pool):
+        # degrade to inline compute rather than fail the required test. The result is
+        # identical — the RNG is seeded inside the worker.
+        log.warning("Monte Carlo isolation unavailable (%s) — running inline", exc)
+        return _monte_carlo_bootstrap_worker(returns, **kwargs)
+
+
 def _run_monte_carlo_analysis(body: MonteCarloBody) -> dict:
     context = _result_context_from_detail(body.result_id)
     trades = context["trades"]
@@ -1013,101 +1211,18 @@ def _run_monte_carlo_analysis(body: MonteCarloBody) -> dict:
     max_dd_p95_limit_raw = float(gauntlet_cfg.get("mc_max_dd_p95", 0.40))
     max_dd_p95_limit_pct = max_dd_p95_limit_raw * 100.0 if abs(max_dd_p95_limit_raw) <= 1.0 else max_dd_p95_limit_raw
 
-    rng = np.random.default_rng(42)
-    returns_arr = _finite_array(returns)
-    n_trades = len(returns)
-    final_returns: list[float] = []
-    max_drawdowns: list[float] = []
-    sharpes: list[float] = []
-    equity_paths: list[list[float]] = []
-    max_paths = 50
-
-    for sim_idx in range(max(int(body.n_simulations), 1)):
-        sampled = rng.choice(returns_arr, size=n_trades, replace=True)
-        equity_factors = np.cumprod(1.0 + sampled)
-        equity = equity_factors * body.initial_capital
-        final_return_pct = ((equity[-1] - body.initial_capital) / body.initial_capital) * 100.0
-        final_returns.append(float(final_return_pct))
-
-        # Include the pre-trade starting balance in the peak path. Otherwise a loss
-        # on the first sampled trade becomes the initial peak and its drawdown vanishes.
-        equity_with_initial = np.concatenate(([float(body.initial_capital)], equity))
-        peak = np.maximum.accumulate(equity_with_initial)
-        drawdown_pct = np.where(
-            peak > 0,
-            (peak - equity_with_initial) / peak * 100.0,
-            0.0,
-        )
-        max_drawdowns.append(float(np.nanmax(drawdown_pct)) if drawdown_pct.size else 0.0)
-
-        if len(sampled) > 1 and np.std(sampled) > 0:
-            # Per-TRADE Sharpe of the bootstrapped path. (Was * sqrt(252), which
-            # annualizes as if these were daily returns — they are per-trade returns at
-            # an arbitrary frequency, so the 252 factor was a meaningless scale. This is
-            # a diagnostic only; the MC verdict uses prob_profitable + the drawdown cap.)
-            sharpes.append(float(np.mean(sampled) / np.std(sampled)))
-        else:
-            sharpes.append(0.0)
-
-        if body.n_simulations <= max_paths or sim_idx % max(1, body.n_simulations // max_paths) == 0:
-            if len(equity_paths) < max_paths:
-                equity_paths.append([float(body.initial_capital)] + equity.tolist())
-
-    final_returns_arr = _finite_array(final_returns)
-    max_drawdowns_arr = _finite_array(max_drawdowns)
-    sharpes_arr = _finite_array(sharpes)
-    percentile_rank = (
-        float(np.mean(final_returns_arr <= original_return) * 100.0)
-        if final_returns_arr.size
-        else 0.0
+    # The bootstrap itself is a DB-free numpy hotspot: offload it to an isolated
+    # subprocess (queued on the process-wide budget) so it no longer holds the GIL on
+    # an API worker thread. All the DB/config reads above stay in-thread.
+    return _run_monte_carlo_bootstrap(
+        returns,
+        original_sharpe=original_sharpe,
+        original_return=original_return,
+        n_simulations=int(body.n_simulations),
+        initial_capital=float(body.initial_capital),
+        mc_profitable_min=mc_profitable_min,
+        max_dd_p95_limit_pct=max_dd_p95_limit_pct,
     )
-    max_dd_percentiles = _percentile_distribution(max_drawdowns_arr)
-    prob_profitable = round(float(np.mean(final_returns_arr > 0) * 100.0), 1) if final_returns_arr.size else 0.0
-    max_dd_p95 = float(max_dd_percentiles.get("p95", 0.0) or 0.0)
-    verdict_reasons: list[str] = []
-    if prob_profitable < mc_profitable_min:
-        verdict_reasons.append(
-            f"probability profitable {prob_profitable:.1f}% below {mc_profitable_min:.1f}% threshold"
-        )
-    if max_dd_p95 > max_dd_p95_limit_pct:
-        verdict_reasons.append(
-            f"95th percentile drawdown {max_dd_p95:.1f}% exceeds {max_dd_p95_limit_pct:.1f}% limit"
-        )
-
-    return {
-        "method": "trade_bootstrap",
-        # Interpretation guard (issue #19): this test bootstraps the trades the
-        # baseline ALREADY produced, so a PASS certifies sequencing/tail-risk
-        # stability of that trade set — it is not evidence the edge is real.
-        "scope_note": (
-            "Bootstrap of realized trade returns: tests stability of the trade "
-            "sequence and bounds tail risk. It does not test whether the "
-            "underlying edge is real — walk-forward and regime-split do that."
-        ),
-        "original_sharpe": round(original_sharpe, 3),
-        "original_return": round(original_return, 2),
-        "n_simulations": int(body.n_simulations),
-        "n_trades": n_trades,
-        "percentile_rank": round(percentile_rank, 1),
-        "percentile_score": round(prob_profitable / 100.0, 5),
-        "return_distribution": _percentile_distribution(final_returns_arr),
-        "drawdown_distribution": max_dd_percentiles,
-        "sharpe_distribution": _percentile_distribution(sharpes_arr),
-        "prob_profitable": prob_profitable,
-        "prob_loss_gt_10": round(float(np.mean(final_returns_arr < -10) * 100.0), 1) if final_returns_arr.size else 0.0,
-        "verdict": "FAIL" if verdict_reasons else "PASS",
-        "verdict_reasons": verdict_reasons,
-        "verdict_threshold": round(mc_profitable_min, 1),
-        "verdict_thresholds": {
-            "min_prob_profitable": round(mc_profitable_min, 1),
-            "max_dd_p95": round(max_dd_p95_limit_pct, 1),
-        },
-        "equity_paths": equity_paths,
-        "return_histogram": _make_histogram(final_returns_arr),
-        "drawdown_histogram": _make_histogram(max_drawdowns_arr),
-        "sharpe_histogram": _make_histogram(sharpes_arr),
-        "max_dd_p95_ratio": round(float(max_dd_p95 / 100.0), 5),
-    }
 
 
 def _run_param_jitter_analysis(body: ParamJitterBody, *, outer_budget_s: float | None = None) -> dict:
@@ -1514,35 +1629,22 @@ def _run_cost_stress_analysis(body: CostStressBody) -> dict:
     }
 
 
-def _run_regime_split_analysis(body: RegimeSplitBody) -> dict:
-    from forven.strategies.backtest import _detect_entry_regime, load_backtest_candles
+def _regime_classify_trades_worker(candles: "pd.DataFrame", trades: list[dict]) -> dict:
+    """Classify each trade by its entry-bar regime — the regime-split compute core.
 
-    context = _result_context_from_detail(body.result_id)
-    trades = context["trades"]
-    if int(context.get("trade_count") or 0) <= 0:
-        _raise_zero_trade_prerequisite("Baseline backtest")
-    if not trades:
-        _raise_missing_trade_artifacts("Regime split")
-    if not context["symbol"] or not context["timeframe"]:
-        raise HTTPException(400, "Baseline backtest is missing symbol/timeframe metadata.")
+    This is the GIL-bound hotspot of the regime-split step: for every trade it slices
+    the candle frame up to the entry bar and runs ``_detect_entry_regime`` (RSI/ADX/EMA
+    over the prefix). It touches no database and its inputs (a candles frame + plain
+    trade dicts) are picklable, so ``_run_regime_split_analysis`` offloads it to an
+    isolated subprocess (mirroring the isolated backtest workers). MODULE-LEVEL so
+    spawn-based ProcessPoolExecutor can pickle it on Windows. Deterministic — same
+    inputs yield the same buckets in either process.
 
-    entry_times = [ts for ts in (_coerce_trade_timestamp(trade) for trade in trades) if ts is not None]
-    if not entry_times:
-        raise HTTPException(400, "Regime split requires trade entry timestamps.")
+    Returns the by-regime return/PnL buckets and the unresolved tally; the (light)
+    per-regime aggregation + verdict stay in the caller so its logic is unchanged.
+    """
+    from forven.strategies.backtest import _detect_entry_regime
 
-    candles = load_backtest_candles(
-        asset=context["symbol"],
-        timeframe=context["timeframe"],
-        bars=720,
-        start_date=(min(entry_times) - pd.Timedelta(days=60)).isoformat(),
-        end_date=context["end_date"] or max(entry_times).isoformat(),
-    )
-    if candles.empty:
-        raise HTTPException(400, "No candle data available for regime classification.")
-
-    # Bucket trades by regime using *return* (dimensionless, position-size-invariant)
-    # rather than absolute PnL dollars. Absolute PnL double-counts position sizing
-    # decisions and is misleading when comparing regime profitability.
     by_regime_returns: dict[str, list[float]] = defaultdict(list)
     by_regime_pnl: dict[str, list[float]] = defaultdict(list)
     unresolved_trades = 0
@@ -1571,6 +1673,101 @@ def _run_regime_split_analysis(body: RegimeSplitBody) -> dict:
             ret_ratio = pnl_val / 10_000.0 if pnl_val else 0.0
         by_regime_returns[regime].append(float(ret_ratio))
         by_regime_pnl[regime].append(_coerce_trade_pnl(trade))
+
+    return {
+        "by_regime_returns": {k: list(v) for k, v in by_regime_returns.items()},
+        "by_regime_pnl": {k: list(v) for k, v in by_regime_pnl.items()},
+        "unresolved_trades": unresolved_trades,
+        "unresolved_reasons": dict(unresolved_reasons),
+    }
+
+
+# Wall-clock ceiling for the offloaded regime classification subprocess. Bounded by
+# n_trades x per-trade RSI/ADX/EMA over the (≤720-bar) window — a leak/hang backstop.
+_REGIME_SPLIT_ISOLATION_TIMEOUT = 300
+
+
+def _run_regime_classification(candles: "pd.DataFrame", trades: list[dict]) -> dict:
+    """Run the per-trade regime classification, offloaded to an isolated subprocess.
+
+    The classification loop is a self-contained, DB-free pandas/numpy hotspot (see
+    ``_regime_classify_trades_worker``) that otherwise burns the GIL on an API worker
+    thread for the duration of the per-trade RSI/ADX/EMA passes. It queues on the
+    process-wide subprocess budget (``strategies/concurrency.py``) exactly like every
+    isolated backtest. Falls back to running inline (identical result — the compute is
+    deterministic) under pytest, when isolation is disabled, or if the child process
+    cannot be spawned; a subprocess timeout/crash is a real failure and raised.
+    """
+    from forven.strategies.backtest import _should_use_process_isolation
+
+    if not _should_use_process_isolation():
+        return _regime_classify_trades_worker(candles, trades)
+
+    import concurrent.futures
+    import multiprocessing
+
+    from forven.strategies.backtest import _kill_executor_processes
+    from forven.strategies.concurrency import backtest_subprocess_slot
+
+    try:
+        with backtest_subprocess_slot("regime_split"), concurrent.futures.ProcessPoolExecutor(
+            max_workers=1,
+            mp_context=multiprocessing.get_context("spawn"),
+        ) as executor:
+            future = executor.submit(_regime_classify_trades_worker, candles, trades)
+            try:
+                return future.result(timeout=_REGIME_SPLIT_ISOLATION_TIMEOUT)
+            except concurrent.futures.TimeoutError:
+                log.error(
+                    "ISOLATION: Regime classification timed out after %ds (%d trades, %d bars)",
+                    _REGIME_SPLIT_ISOLATION_TIMEOUT, len(trades), len(candles),
+                )
+                _kill_executor_processes(executor)
+                raise HTTPException(
+                    500,
+                    f"Regime classification timed out after {_REGIME_SPLIT_ISOLATION_TIMEOUT}s.",
+                )
+    except (OSError, concurrent.futures.BrokenExecutor) as exc:
+        log.warning("Regime-split isolation unavailable (%s) — running inline", exc)
+        return _regime_classify_trades_worker(candles, trades)
+
+
+def _run_regime_split_analysis(body: RegimeSplitBody) -> dict:
+    from forven.strategies.backtest import load_backtest_candles
+
+    context = _result_context_from_detail(body.result_id)
+    trades = context["trades"]
+    if int(context.get("trade_count") or 0) <= 0:
+        _raise_zero_trade_prerequisite("Baseline backtest")
+    if not trades:
+        _raise_missing_trade_artifacts("Regime split")
+    if not context["symbol"] or not context["timeframe"]:
+        raise HTTPException(400, "Baseline backtest is missing symbol/timeframe metadata.")
+
+    entry_times = [ts for ts in (_coerce_trade_timestamp(trade) for trade in trades) if ts is not None]
+    if not entry_times:
+        raise HTTPException(400, "Regime split requires trade entry timestamps.")
+
+    candles = load_backtest_candles(
+        asset=context["symbol"],
+        timeframe=context["timeframe"],
+        bars=720,
+        start_date=(min(entry_times) - pd.Timedelta(days=60)).isoformat(),
+        end_date=context["end_date"] or max(entry_times).isoformat(),
+    )
+    if candles.empty:
+        raise HTTPException(400, "No candle data available for regime classification.")
+
+    # Bucket trades by regime using *return* (dimensionless, position-size-invariant)
+    # rather than absolute PnL dollars. Absolute PnL double-counts position sizing
+    # decisions and is misleading when comparing regime profitability. The per-trade
+    # classification (the RSI/ADX/EMA hotspot) is offloaded to an isolated subprocess;
+    # the light aggregation + verdict below stay in-thread.
+    classified = _run_regime_classification(candles, trades)
+    by_regime_returns: dict[str, list[float]] = defaultdict(list, classified["by_regime_returns"])
+    by_regime_pnl: dict[str, list[float]] = defaultdict(list, classified["by_regime_pnl"])
+    unresolved_trades = int(classified["unresolved_trades"])
+    unresolved_reasons: dict[str, int] = defaultdict(int, classified["unresolved_reasons"])
 
     if not by_regime_returns:
         raise HTTPException(
