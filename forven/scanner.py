@@ -6789,6 +6789,13 @@ def manage_positions_via_kernel(strat_id: str, strat: dict, *, account_equity=No
     # must use that as window_start — using df.index[0] would treat a still-valid open
     # whose entry fell in the warmup band as an orphan and converge-close it.
     KERNEL_WARMUP = 200
+    # Fund the kernel walk IN-LINE (same opt-in the backtest uses) so paper's kelly
+    # sizing evidence (res.closed_gross) is funding-aware — matching the backtest's
+    # funding-aware Kelly instead of learning price-only returns. Each kernel-funded
+    # trade is stamped ``_funding_from_kernel``; the post-walk pass below skips those
+    # (single-application invariant). Gated on the SAME setting the post-hoc pass reads
+    # so paper never funds one way in-walk and the other post-hoc — one funding switch.
+    _include_funding = _paper_include_funding_enabled()
     try:
         res = _bt.run_strategy_execution(
             df, strategy_instance, params=p, warmup=KERNEL_WARMUP, leverage=leverage,
@@ -6798,6 +6805,7 @@ def manage_positions_via_kernel(strat_id: str, strat: dict, *, account_equity=No
             # PAIR form (BTC/USDT), not the bare coin: the intrabar resolver
             # loads the lake 1m series, which lives under the pair directory.
             symbol=str(strat.get("symbol") or "").strip() or None, timeframe=timeframe,
+            include_funding=_include_funding,
         )
     except Exception as exc:
         log.warning("[%s] kernel paper: run_strategy_execution failed (%s); SKIP scan (no legacy)", strat_id, exc)
@@ -6829,10 +6837,14 @@ def manage_positions_via_kernel(strat_id: str, strat: dict, *, account_equity=No
         return None  # genuinely non-vectorizable → caller decides (flag vs legacy)
 
     # Net-costs parity: charge perp funding into the kernel trades' pnl_pct exactly
-    # like the backtest (which funds by default via _apply_funding_to_trades).
-    # run_strategy_execution nets only fees+slippage; funding is applied here so a
+    # like the backtest. With ``include_funding`` on (above), a FAITHFUL trade the kernel
+    # already funded in-walk carries ``_funding_from_kernel`` and _apply_funding_to_trades
+    # SKIPS it (single-application invariant) — this pass then only funds any trade the
+    # kernel could not (e.g. legacy/adapter producers that don't stamp the flag), so a
     # held perp position's closed PnL matches the backtest rather than overstating it.
-    if res.closed_trades and _paper_include_funding_enabled():
+    # Runs on the SAME ``df`` the walk ran on, so the post-hoc rates equal the in-walk
+    # rates bar-for-bar. Guard on ``_include_funding`` so both paths share one switch.
+    if res.closed_trades and _include_funding:
         try:
             _bt._apply_funding_to_trades(res.closed_trades, df, leverage, timeframe)
         except Exception as exc:
