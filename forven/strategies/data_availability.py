@@ -406,6 +406,27 @@ def evaluate_data_availability(
 
             cls = _resolve_strategy_class(strategy_type)
         if cls is None:
+            from forven.strategies.sandbox_proxy import is_sandbox_only_type
+
+            if is_sandbox_only_type(strategy_type):
+                # A sandbox-only (imported/dropzone) class is NEVER resolvable in
+                # the trusted parent — by design its code loads only in the
+                # worker. Its availability was already certified WITH the real
+                # class at registration (intake passes strategy_cls; a blocked
+                # verdict parks the strategy research_only at birth), so a
+                # sandbox strategy that reached the active funnel has passed
+                # this probe. Hard-blocking here re-blocked every certified
+                # dropzone strategy at quick_screen ("Cannot verify data
+                # availability ... could not be resolved", the S06890/S06895
+                # chain, 2026-07-11). The backtest itself still fails loudly on
+                # genuinely missing data.
+                who = strategy_id or strategy_type or "strategy"
+                result.ok = True
+                result.warnings.append(
+                    f"{who}: sandbox-only runtime — data availability certified at "
+                    "registration; parent-side class introspection skipped."
+                )
+                return result
             who = strategy_id or strategy_type or "strategy"
             return DataAvailabilityResult(
                 ok=False,
