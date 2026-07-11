@@ -100,3 +100,27 @@ def test_killed_only_optimization_reads_as_no_optimization(forven_db):
     ok, msg = _check_confirmation_backtest(sid)
     assert not ok
     assert "No optimization found" in str(msg)
+
+
+def test_errored_newer_wfa_does_not_make_stale_verdict_look_fresh(forven_db):
+    """Symmetry: the VALIDATION side of the freshness/ordering comparison must
+    also be genuine-only. An errored re-run newer than the optimization must not
+    make the surviving (pre-optimization) verdict look fresh - the gate reads
+    the OLD pass, so freshness must flag it stale."""
+    sid = "S-ORD4"
+    _insert_strategy(sid)
+    m, c = _GENUINE_WF
+    _insert_result(sid, "wf-old-pass", "walk_forward", "2026-07-11T08:00:00+00:00", metrics=m, config=c)
+    m, c = _GENUINE_OPT
+    _insert_result(sid, "opt-good", "optimization", "2026-07-11T10:00:00+00:00", metrics=m, config=c)
+    _insert_result(
+        sid, "wf-errored", "walk_forward", "2026-07-11T11:00:00+00:00",
+        metrics={"status": "failed", "error": "Timed out after 600s"},
+        config={"status": "failed", "error": "Timed out after 600s"},
+    )
+
+    ok, rejection = _check_validation_freshness(sid, ["walk_forward"])
+    assert not ok, "the surviving verdict predates the optimization - must read stale"
+    assert "Stale validation tests" in str(rejection)
+    ok, rejection = _check_artifact_ordering(sid, ["walk_forward"])
+    assert not ok

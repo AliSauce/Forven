@@ -9469,9 +9469,19 @@ def _resolve_backtest_context_from_results(
 
 
 def _normalize_strategy_type(value: object) -> str | None:
-    normalized = str(value or "").strip().lower()
-    if not normalized:
+    raw = str(value or "").strip()
+    if not raw:
         return None
+    from forven.strategies.sandbox_proxy import is_sandbox_only_type
+
+    # Namespaced sandbox types are exact worker-registry keys: case-sensitive and
+    # never family-aliased. Lowercasing one breaks the worker lookup for a
+    # mixed-case imported module (silent 0-signal runs), and the family alias /
+    # *_orb collapse below would execute the WRONG builtin class for an imported
+    # strategy whose module name ends in a family token.
+    if is_sandbox_only_type(raw):
+        return raw
+    normalized = raw.lower()
     aliases = {
         "bb": "bollinger",
         "bollinger_band": "bollinger",
@@ -10328,7 +10338,7 @@ def post_backtest_preview(body: BacktestPreviewBody):
         row = _require_existing_strategy_row(requested)
         if isinstance(row, dict):
             base_params = _parse_strategy_params_blob(row.get("params")) or {}
-            explicit_type = row.get("type")
+            explicit_type = resolve_execution_strategy_type(row)
             if not (asset and asset.strip()):
                 asset = _extract_base_asset_symbol(str(row.get("symbol") or body.symbol))
     except Exception:
@@ -11327,7 +11337,7 @@ def post_optimization_submit(body: OptimizationSubmitBody):
                 base_params = dict(audit_params)
                 inferred_params_for_backfill = dict(audit_params)
     strategy_type = _resolve_backtesting_strategy_type(
-        explicit_type=strategy_row.get("type"),
+        explicit_type=resolve_execution_strategy_type(strategy_row),
         strategy_name=strategy_name or strategy_id,
         params=base_params,
         payload=body.definition_json,

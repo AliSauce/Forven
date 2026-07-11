@@ -170,3 +170,108 @@ def test_recalc_missing_test_still_pulls_score_down(forven_db):
     score, passed = _score_fields(strategy_id)
     assert passed == 2
     assert score < 100.0
+
+
+def test_recalc_skips_zero_fold_wfa_and_surfaces_older_pass(forven_db):
+    """The S06885 shape via the SCORE path: a completed (no error) walk_forward
+    with an empty splits list and 0 OOS trades must not displace the older
+    genuine pass in _recalculate_robustness_score - same rule as the paper-gate
+    extractor, or the two readers drift again."""
+    strategy_id = _create_strategy()
+    _set_required_tests(["walk_forward", "param_jitter", "cost_stress"])
+
+    base = datetime(2026, 7, 11, 12, 0, 0, tzinfo=timezone.utc)
+    for i, (rt, (metrics, config)) in enumerate(_PASS_ROWS.items()):
+        _insert_result(
+            strategy_id,
+            result_id=f"{rt}-pass",
+            result_type=rt,
+            metrics=metrics,
+            config=config,
+            created_at=(base + timedelta(minutes=i)).isoformat(),
+        )
+    _insert_result(
+        strategy_id,
+        result_id="walk_forward-zerofold",
+        result_type="walk_forward",
+        metrics={
+            "status": "succeeded",
+            "verdict": "FAIL",
+            "splits": [],
+            "aggregate_oos": {"sharpe": 0.0, "total_trades": 0},
+        },
+        config={"status": "succeeded"},
+        created_at=(base + timedelta(hours=1)).isoformat(),
+    )
+
+    robustness_router._recalculate_robustness_score(strategy_id)
+    score, passed = _score_fields(strategy_id)
+    assert passed == 3, "0-fold completed WFA must not displace the genuine PASS"
+    assert score == 100.0
+
+
+def test_recalc_all_nonresult_rows_writes_zero_not_stale(forven_db):
+    """When EVERY persisted row is a non-result (all timed out), the recalc must
+    overwrite any previously-written score with 0 - leaving a stale 100 standing
+    would let the brain keep reading robustness no surviving evidence supports."""
+    strategy_id = _create_strategy()
+    _set_required_tests(["walk_forward", "param_jitter", "cost_stress"])
+
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE strategies SET metrics = ? WHERE id = ?",
+            (
+                json.dumps(
+                    {
+                        "sharpe": 1.0,
+                        "composite_robustness_score": 100.0,
+                        "robustness_tests_passed": 3,
+                    }
+                ),
+                strategy_id,
+            ),
+        )
+        conn.commit()
+
+    base = datetime(2026, 7, 11, 12, 0, 0, tzinfo=timezone.utc)
+    for i, rt in enumerate(("walk_forward", "param_jitter", "cost_stress")):
+        _insert_result(
+            strategy_id,
+            result_id=f"{rt}-timeout",
+            result_type=rt,
+            metrics={"status": "failed", "error": "Timed out after 600s"},
+            config={"status": "failed", "error": "Timed out after 600s"},
+            created_at=(base + timedelta(minutes=i)).isoformat(),
+        )
+
+    robustness_router._recalculate_robustness_score(strategy_id)
+    score, passed = _score_fields(strategy_id)
+    assert passed == 0
+    assert score == 0.0
+
+
+def test_collect_succeeded_types_ignores_newer_errored_row(forven_db):
+    """_collect_succeeded_validation_types feeds the auto-promotion reconcile: a
+    newer errored row must not CLAIM the type and hide the older genuine PASS."""
+    strategy_id = _create_strategy()
+    base = datetime(2026, 7, 11, 12, 0, 0, tzinfo=timezone.utc)
+    metrics, config = _PASS_ROWS["walk_forward"]
+    _insert_result(
+        strategy_id,
+        result_id="wfa-pass",
+        result_type="walk_forward",
+        metrics=metrics,
+        config=config,
+        created_at=base.isoformat(),
+    )
+    _insert_result(
+        strategy_id,
+        result_id="wfa-errored",
+        result_type="walk_forward",
+        metrics={"status": "failed", "error": "Timed out after 600s"},
+        config={"status": "failed", "error": "Timed out after 600s"},
+        created_at=(base + timedelta(hours=1)).isoformat(),
+    )
+
+    succeeded = robustness_router._collect_succeeded_validation_types(strategy_id)
+    assert "walk_forward" in succeeded

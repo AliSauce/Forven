@@ -740,15 +740,21 @@ def _best_sweep_result(
         ).fetchall()
 
     best_tf = str(fallback_tf or "1h").strip() or "1h"
-    declared_tf = best_tf.lower()
+    # The author's declaration comes from the IMMUTABLE params (_timeframe) when
+    # available: strategies.timeframe (fallback_tf) is overwritten by
+    # _persist_quick_screen_winner, so after one legitimate crowning a re-sweep
+    # reading only the column would defend the previously-crowned timeframe
+    # instead of the author's.
+    declared_display = (
+        str((params or {}).get("_timeframe") or "").strip() or best_tf
+    )
+    declared_tf = declared_display.lower()
     best_result_id: str | None = None
     best_metrics: dict[str, Any] = {}
     best_score = float("-inf")
     best_sharpe = float("-inf")
     declared_score = float("-inf")
     declared_pick: tuple[str, str | None, dict[str, Any]] | None = None
-    declared_degen_pick: tuple[str, str | None, dict[str, Any]] | None = None
-    declared_degen_trades = -1.0
     # Least-degenerate fallback, used ONLY if no context clears the validity floor —
     # so a strategy that genuinely can't trade anywhere is judged (and failed) on its
     # most-traded context, never crowned by a lucky 4-trade slice.
@@ -777,9 +783,6 @@ def _best_sweep_result(
         # strategy's stored metrics (the gate then reads IS Sharpe 0.00 and rejects).
         # Such a slice can never be the sweep winner.
         if is_degenerate_backtest_metrics(metrics):
-            if tf.lower() == declared_tf and float(trades) > declared_degen_trades:
-                declared_degen_pick = (tf, rid, metrics)
-                declared_degen_trades = float(trades)
             continue
         score = sharpe * 10.0 + min(trades, 100.0) * 0.01 + total_return * 0.01
         if tf.lower() == declared_tf and score > declared_score:
@@ -789,20 +792,24 @@ def _best_sweep_result(
             best_score = score
             best_sharpe = float(sharpe)
             best_tf, best_result_id, best_metrics = tf, rid, metrics
-    # Prefer-declared bias (see docstring): an off-declared winner must BEAT the
-    # declared context and carry positive Sharpe, else the declared context stands.
+    # No context cleared the validity floor: judge on the most-traded context
+    # (never crowned by a lucky slice — see fb comment above).
+    if best_score == float("-inf"):
+        return fb_tf, fb_result_id, fb_metrics
+    # Prefer-declared bias (see docstring). Declared rows join the same global
+    # max, so when the winner is off-declared the load-bearing quality bar is
+    # POSITIVE Sharpe (the score comparison only breaks exact ties).
     if declared_pick is not None and best_tf.lower() != declared_tf:
         if not (best_score > declared_score and best_sharpe > 0.0):
             return declared_pick
-    if (
-        declared_pick is None
-        and declared_degen_pick is not None
-        and best_score != float("-inf")
-        and best_sharpe <= 0.0
-    ):
-        return declared_degen_pick
-    if best_score == float("-inf"):
-        return fb_tf, fb_result_id, fb_metrics
+    if declared_pick is None and best_sharpe <= 0.0:
+        # Every survivor is negative and the declared context is unmeasured
+        # (absent or degeneracy-skipped): return the declared timeframe
+        # UNMEASURED — no result id, no metrics — so the caller's gate takes the
+        # retryable missing-evidence path instead of judging/persisting a
+        # context the author never declared, or contaminating strategies.metrics
+        # with a degenerate lucky slice.
+        return declared_display, None, {}
     return best_tf, best_result_id, best_metrics
 
 

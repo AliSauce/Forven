@@ -96,3 +96,23 @@ def test_active_registration_sweep_skips_imported_rows(forven_db, monkeypatch):
         "dropzone_zz_dropzone_sweep_s63999_deadbeef0000"
         not in reg._FAILED_CUSTOM_MODULES
     )
+
+
+def test_normalize_passes_imported_types_through_unchanged():
+    """_normalize_strategy_type must never lowercase or family-alias a namespaced
+    sandbox type: the worker registry lookup is case-sensitive, and the *_orb
+    suffix collapse would execute the WRONG builtin class for an imported module
+    whose name ends in a family token."""
+    from forven.api_core import _normalize_strategy_type
+
+    assert (
+        _normalize_strategy_type("imported__dropzone_MyStrat_AB12cd34")
+        == "imported__dropzone_MyStrat_AB12cd34"
+    )
+    assert (
+        _normalize_strategy_type("imported__breakout_orb")
+        == "imported__breakout_orb"
+    )
+    # Non-imported behavior unchanged.
+    assert _normalize_strategy_type("Breakout_ORB") == "orb"
+    assert _normalize_strategy_type("bb") == "bollinger"

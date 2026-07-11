@@ -210,3 +210,34 @@ def test_walk_forward_explicit_small_window_still_floored(monkeypatch, forven_db
     )
 
     assert "bars requested (need 420+)" in str(result.get("error") or "")
+
+
+def test_walk_forward_dated_1d_window_sized_by_span(monkeypatch, forven_db):
+    """The gauntlet's post-optimization WFA passes the optimizer's validation
+    window as start/end dates. The bar count must derive from the SPAN - the
+    stage-days fallback read a multi-year dated 1d span as '365 requested bars'
+    and errored before loading anything."""
+
+    def _candles(*_args, **_kwargs):
+        return _fake_daily_ohlcv(1100)
+
+    monkeypatch.setattr("forven.strategies.backtest.load_backtest_candles", _candles)
+    monkeypatch.setattr(
+        "forven.api_core.stage_backtest_duration_days", lambda *_a, **_k: 365
+    )
+
+    result = walk_forward(
+        strategy_id="wf-1d-dated",
+        asset="BTC",
+        strategy_type="rsi_momentum",
+        params={},
+        timeframe="1d",
+        start_date="2023-07-01T00:00:00+00:00",
+        end_date="2026-07-01T00:00:00+00:00",
+        n_splits=2,
+    )
+
+    err = str(result.get("error") or "")
+    assert "bars requested (need 420+)" not in err, (
+        f"dated 1d span must size by the dates, got: {err}"
+    )

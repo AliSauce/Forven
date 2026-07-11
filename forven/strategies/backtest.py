@@ -10868,7 +10868,37 @@ def walk_forward(
         # here so every WFA caller (gauntlet run_walk_forward passes no window) honors it.
         duration_days = stage_backtest_duration_days("walk_forward", settings)
         minutes_per_bar = max(_timeframe_to_minutes(resolved_timeframe), 1)
-        total_bars = (duration_days * 24 * 60) // minutes_per_bar
+        if start_date or end_date:
+            # A DATED window (the gauntlet passes the optimizer's validation
+            # window) sizes by the SPAN: the loader slices by the dates, so a
+            # stage-days bar count is unrelated to the data actually loaded —
+            # it made the pre-load floor read a 3-year 1d span as "365 requested
+            # bars" and error before loading. The post-load len(df) check stays
+            # authoritative for what the lake really returned.
+            try:
+                from datetime import datetime as _dt
+                from datetime import timezone as _tz
+
+                def _parse_wfa_date(value: object) -> _dt | None:
+                    text = str(value or "").strip()
+                    if not text:
+                        return None
+                    parsed = _dt.fromisoformat(text.replace("Z", "+00:00"))
+                    if parsed.tzinfo is None:
+                        parsed = parsed.replace(tzinfo=_tz.utc)
+                    return parsed
+
+                span_start = _parse_wfa_date(start_date)
+                span_end = _parse_wfa_date(end_date) or _dt.now(_tz.utc)
+                if span_start is not None and span_end > span_start:
+                    span_days = (span_end - span_start).total_seconds() / 86400.0
+                    total_bars = max(int(span_days * 24 * 60) // minutes_per_bar, 1)
+                else:
+                    total_bars = (duration_days * 24 * 60) // minutes_per_bar
+            except Exception:  # noqa: BLE001 — unparseable dates fall back to stage days
+                total_bars = (duration_days * 24 * 60) // minutes_per_bar
+        else:
+            total_bars = (duration_days * 24 * 60) // minutes_per_bar
 
 
     

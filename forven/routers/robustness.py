@@ -442,27 +442,20 @@ def _load_strategy_row(strategy_id: str):
 
 
 def _extract_strategy_info(row) -> tuple[str, dict]:
-    from forven.strategies.sandbox_proxy import is_sandbox_only_type
-
     strategy_type: str = ""
-    # Imported/dropzone rows execute under their namespaced runtime_type; the
-    # bare `type` has no source in custom/ (moved to imported/ at registration)
-    # and resolves to the orphan guard.
     try:
-        runtime_type = str(row["runtime_type"] or "").strip()
+        explicit = row["strategy_type"]
     except (IndexError, KeyError):
-        runtime_type = ""
-    if runtime_type and is_sandbox_only_type(runtime_type):
-        strategy_type = runtime_type
-    if not strategy_type:
-        for col in ("strategy_type", "type"):
-            try:
-                value = row[col]
-                if value:
-                    strategy_type = str(value)
-                    break
-            except (IndexError, KeyError):
-                continue
+        explicit = None
+    if explicit:
+        strategy_type = str(explicit)
+    else:
+        # Single source of truth for the executable type: imported/dropzone rows
+        # run under their namespaced runtime_type (the bare `type` has no source
+        # in custom/ and resolves to the orphan guard).
+        from forven.api_core import resolve_execution_strategy_type
+
+        strategy_type = resolve_execution_strategy_type(row) or ""
 
     raw_params: str | dict = "{}"
     for col in ("params", "params_json", "definition_json"):
@@ -2172,7 +2165,11 @@ def _recalculate_robustness_score(strategy_id: str) -> None:
         if not rows:
             return
 
-        from forven.policy import is_nonresult_validation_row, load_pipeline_config
+        from forven.policy import (
+            is_nonresult_validation_row,
+            is_nonresult_wfa_row,
+            load_pipeline_config,
+        )
 
         gauntlet_cfg = load_pipeline_config().get("gauntlet", {})
         min_trades = int(gauntlet_cfg.get("min_trades", 10) or 10)
@@ -2183,15 +2180,36 @@ def _recalculate_robustness_score(strategy_id: str) -> None:
         # extractor. Counting an infra failure as `passed=False` here dragged
         # composite_robustness_score/robustness_tests_passed and the brain then
         # archived on a phantom merit fail (2026-07-11).
+        parsed = [
+            (
+                str(r["result_type"] or "").strip().lower(),
+                _parse_json_object(r["metrics_json"]),
+                _parse_json_object(r["config_json"]),
+            )
+            for r in rows
+        ]
+        # Mirror the paper-gate extractor's current-params preference: a re-run
+        # scored on since-changed params must not displace a current-params
+        # verdict here either (the two readers feed the same brain decisions).
+        current_hash = _current_params_hash(strategy_id)
+        if current_hash:
+            matching = [
+                p for p in parsed
+                if str((p[2] or {}).get("params_hash") or "").strip() == current_hash
+            ]
+            if matching:
+                parsed = matching + [p for p in parsed if p not in matching]
+
         seen = set()
         tests: list[dict] = []
-        for r in rows:
-            rt = str(r["result_type"] or "").strip().lower()
+        for rt, metrics, config in parsed:
             if rt in seen:
                 continue
-            metrics = _parse_json_object(r["metrics_json"])
-            config = _parse_json_object(r["config_json"])
             if is_nonresult_validation_row(metrics, config):
+                continue
+            # A completed 0-fold/0-trade walk_forward measured nothing — same
+            # rule as the paper-gate extractor (policy.is_nonresult_wfa_row).
+            if rt == "walk_forward" and is_nonresult_wfa_row(metrics):
                 continue
             seen.add(rt)
             passed_result, reason = _validation_row_passed(
@@ -2203,8 +2221,11 @@ def _recalculate_robustness_score(strategy_id: str) -> None:
             margin = _test_pass_margin(rt, metrics, config) if passed_result else 0.0
             tests.append({"type": rt, "passed": passed_result, "reason": reason, "margin": margin})
 
-        if not tests:
-            return
+        # NOTE: no early return when tests is empty — if every persisted row is a
+        # non-result the score below computes to 0 and OVERWRITES whatever stale
+        # composite was last written (matching the pre-fix net effect for the
+        # all-errored case; leaving a stale 100 standing would let the brain keep
+        # reading robustness no surviving evidence supports).
 
         # Denominator = the canonical REQUIRED test set, NOT just the tests that happen
         # to have a row. Counting only measured tests means a single passing test of N
@@ -2316,6 +2337,8 @@ def _collect_succeeded_validation_types(strategy_id: str) -> set[str]:
             """,
             (strategy_id,),
         ).fetchall()
+    from forven.policy import is_nonresult_validation_row, is_nonresult_wfa_row
+
     gauntlet_cfg = load_pipeline_config().get("gauntlet", {})
     min_trades = int(gauntlet_cfg.get("min_trades", 10) or 10)
     seen: set[str] = set()
@@ -2324,9 +2347,16 @@ def _collect_succeeded_validation_types(strategy_id: str) -> set[str]:
         rt = _canonicalize_required_validation_type(row["result_type"])
         if not rt or rt in seen:
             continue
-        seen.add(rt)
         metrics = _parse_json_object(row["metrics_json"])
         config = _parse_json_object(row["config_json"])
+        # Non-result rows must not CLAIM the type: a newer errored/0-fold re-run
+        # would otherwise hide an older genuine PASS from the auto-promotion
+        # reconcile (same skip semantics as the paper-gate extractor).
+        if is_nonresult_validation_row(metrics, config):
+            continue
+        if rt == "walk_forward" and is_nonresult_wfa_row(metrics):
+            continue
+        seen.add(rt)
         passed_result, _reason = _validation_row_passed(
             rt,
             metrics,
@@ -2357,6 +2387,8 @@ def _has_paper_readiness_artifacts(strategy_id: str) -> bool:
     if not rows:
         return False
 
+    from forven.policy import is_nonresult_validation_row, is_nonresult_wfa_row
+
     gauntlet_cfg = load_pipeline_config().get("gauntlet", {})
     min_trades = int(gauntlet_cfg.get("min_trades", 10) or 10)
     seen: set[str] = set()
@@ -2364,9 +2396,15 @@ def _has_paper_readiness_artifacts(strategy_id: str) -> bool:
         rt = _canonicalize_required_validation_type(row["result_type"])
         if rt in seen:
             continue
-        seen.add(rt)
         metrics = _parse_json_object(row["metrics_json"])
         config = _parse_json_object(row["config_json"])
+        # Same skip-don't-claim rule as the paper-gate extractor: an errored or
+        # 0-fold re-run must not hide an older genuine artifact.
+        if is_nonresult_validation_row(metrics, config):
+            continue
+        if rt == "walk_forward" and is_nonresult_wfa_row(metrics):
+            continue
+        seen.add(rt)
         if rt == "walk_forward":
             passed_result, _reason = _validation_row_passed(
                 rt,

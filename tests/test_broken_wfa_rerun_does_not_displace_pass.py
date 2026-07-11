@@ -133,3 +133,27 @@ def test_stale_params_rerun_does_not_shadow_current_params_pass(forven_db):
         "a re-run scored on since-changed params must not shadow the "
         "current-params verdict"
     )
+
+
+def test_gauntlet_status_reader_skips_broken_rerun(forven_db):
+    """The gauntlet status reader feeds run_paper_promotion_gate's merit
+    bucketing: the 0-fold completed re-run must not surface as the latest
+    walk_forward verdict there either (it merit-failed strategies the policy
+    gate itself would pass)."""
+    from forven.gauntlet.status import _latest_robustness_results
+
+    sid = "S-WFDSP4"
+    _insert_strategy(sid)
+    _insert_wf(sid, "wf-pass", "2026-07-11T10:00:00+00:00",
+               metrics=_genuine_pass_metrics(),
+               config={"status": "succeeded", "params_hash": _hash()})
+    _insert_wf(sid, "wf-broken", "2026-07-11T17:20:00+00:00",
+               metrics=_broken_zero_fold_metrics(),
+               config={"status": "succeeded", "params_hash": _hash()})
+
+    latest = _latest_robustness_results(sid)
+    wf = latest.get("walk_forward")
+    assert wf is not None
+    assert wf["result_id"] == "wf-pass", (
+        "status reader must surface the genuine pass, not the 0-fold re-run"
+    )

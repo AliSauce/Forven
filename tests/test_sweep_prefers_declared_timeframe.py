@@ -54,15 +54,65 @@ def _insert_bt(
 
 def test_declared_tf_wins_over_negative_offtf_when_declared_row_degenerate(forven_db):
     """S06895 reconstruction: declared-4h row degenerate by one trade; every
-    surviving off-declared context is negative -> declared 4h must be returned."""
+    surviving off-declared context is negative -> the declared 4h comes back
+    UNMEASURED (no result id, no metrics) so the gate retries on the declared
+    context instead of judging a hijacked negative one — and the degenerate
+    lucky slice never reaches strategies.metrics."""
     sid = "S-SWPD1"
     _insert_strategy(sid, "4h")
     _insert_bt(sid, "bt-4h", "4h", trades=9, sharpe=2.996, total_return=6.0, is_trades=33)
     _insert_bt(sid, "bt-1h", "1h", trades=31, sharpe=-2.40, total_return=-9.2, is_trades=94)
     _insert_bt(sid, "bt-15m", "15m", trades=156, sharpe=-8.485, total_return=-33.9, is_trades=268)
 
-    tf, rid, _metrics = _best_sweep_result(sid, "4h")
+    tf, rid, metrics = _best_sweep_result(sid, "4h")
     assert tf == "4h", f"negative off-declared context must not be crowned (got {tf})"
+    assert rid is None, "a degeneracy-skipped declared slice must not be crowned either"
+    assert metrics == {}
+
+
+def test_declared_row_absent_negative_survivors_returns_declared_unmeasured(forven_db):
+    """When the declared timeframe has NO row at all and every survivor is
+    negative, the declared timeframe comes back unmeasured — a negative
+    off-declared context is never crowned just because the declared run is
+    missing (the last unclosed corner of the S06895 class)."""
+    sid = "S-SWPD6"
+    _insert_strategy(sid, "4h")
+    _insert_bt(sid, "bt-1h", "1h", trades=31, sharpe=-2.40, total_return=-9.2, is_trades=94)
+    _insert_bt(sid, "bt-15m", "15m", trades=156, sharpe=-8.485, total_return=-33.9, is_trades=268)
+
+    tf, rid, metrics = _best_sweep_result(sid, "4h")
+    assert tf == "4h"
+    assert rid is None
+    assert metrics == {}
+
+
+def test_declared_tf_read_from_immutable_params_over_hijacked_column(forven_db):
+    """After a prior crowning persisted timeframe='1h' onto the strategy row,
+    the author's declaration must still come from params._timeframe — otherwise
+    the bias defends the previously-crowned context instead of the author's."""
+    from forven.engine_provenance import BACKTEST_ENGINE_VERSION
+
+    sid = "S-SWPD7"
+    strategy_params = {"_timeframe": "4h", "kc_period": 10}
+    _insert_strategy(sid, "1h")  # column already hijacked to 1h
+    _insert_bt(sid, "bt-4h", "4h", trades=30, sharpe=1.5, total_return=6.0)
+    _insert_bt(sid, "bt-1h", "1h", trades=100, sharpe=0.8, total_return=3.0)
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE backtest_results SET config_json = ? WHERE strategy_id = ?",
+            (
+                json.dumps(
+                    {"engine_version": BACKTEST_ENGINE_VERSION, "params": strategy_params}
+                ),
+                sid,
+            ),
+        )
+        conn.commit()
+
+    tf, rid, _metrics = _best_sweep_result(
+        sid, "1h", params=strategy_params, since=None, as_of=None
+    )
+    assert tf == "4h", "params._timeframe must define the declared context"
     assert rid == "bt-4h"
 
 

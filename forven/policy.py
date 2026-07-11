@@ -1006,34 +1006,51 @@ def _check_params_applied(strategy_id: str) -> tuple[bool, str]:
     return True, "Strategy params match optimization best params"
 
 
-def _latest_genuine_optimization_time(conn, strategy_id: str) -> str:
-    """Raw created_at of the newest optimization that actually COMPLETED.
+def _latest_genuine_result_time(conn, strategy_id: str, result_type: str) -> str:
+    """Raw created_at of the newest row of ``result_type`` that actually
+    COMPLETED (not pending/errored/timed-out/restart-killed).
 
-    A failed / restart-killed / still-running optimization row (e.g. "Server
-    restarted while job was running") measured nothing: letting it set the
-    ordering/freshness baseline spuriously invalidates every genuine
-    walk_forward run before it (the S06885 promotion deadlock, 2026-07-11).
-    Returns "" when no genuine optimization exists.
+    A non-result row measured nothing: letting it set an ordering/freshness
+    timestamp either spuriously invalidates every genuine run before it (a
+    restart-killed optimization vs a real walk_forward — the S06885 promotion
+    deadlock, 2026-07-11) or makes a stale surviving verdict look fresh (an
+    errored newer walk_forward masking that the verdict the gate actually reads
+    predates the optimization). Status/error are extracted in SQL — no
+    metric-blob fetch, no row cap; rows with unparseable JSON count as genuine,
+    matching the pre-fix readers. Returns "" when no genuine row exists.
     """
     rows = conn.execute(
-        """SELECT created_at, metrics_json, config_json FROM backtest_results
+        """SELECT created_at,
+                  CASE WHEN json_valid(COALESCE(metrics_json, ''))
+                       THEN LOWER(TRIM(COALESCE(json_extract(metrics_json, '$.status'), '')))
+                       ELSE '' END AS m_status,
+                  CASE WHEN json_valid(COALESCE(metrics_json, ''))
+                       THEN TRIM(COALESCE(json_extract(metrics_json, '$.error'), ''))
+                       ELSE '' END AS m_error,
+                  CASE WHEN json_valid(COALESCE(config_json, ''))
+                       THEN LOWER(TRIM(COALESCE(json_extract(config_json, '$.status'), '')))
+                       ELSE '' END AS c_status,
+                  CASE WHEN json_valid(COALESCE(config_json, ''))
+                       THEN TRIM(COALESCE(json_extract(config_json, '$.error'), ''))
+                       ELSE '' END AS c_error
+           FROM backtest_results
            WHERE strategy_id = ?
-             AND LOWER(TRIM(COALESCE(result_type, 'backtest'))) = 'optimization'
+             AND LOWER(TRIM(COALESCE(result_type, 'backtest'))) = ?
              AND (deleted_at IS NULL OR TRIM(COALESCE(deleted_at, '')) = '')
-           ORDER BY datetime(created_at) DESC LIMIT 50""",
-        (strategy_id,),
+           ORDER BY datetime(created_at) DESC""",
+        (strategy_id, str(result_type or "").strip().lower()),
     ).fetchall()
     for row in rows:
-        metrics_blob = _parse_json_blob(row["metrics_json"], {})
-        config_blob = _parse_json_blob(row["config_json"], {})
-        if not isinstance(metrics_blob, dict):
-            metrics_blob = {}
-        if not isinstance(config_blob, dict):
-            config_blob = {}
+        metrics_blob = {"status": row["m_status"], "error": row["m_error"]}
+        config_blob = {"status": row["c_status"], "error": row["c_error"]}
         if is_nonresult_validation_row(metrics_blob, config_blob):
             continue
         return str(row["created_at"] or "")
     return ""
+
+
+def _latest_genuine_optimization_time(conn, strategy_id: str) -> str:
+    return _latest_genuine_result_time(conn, strategy_id, "optimization")
 
 
 def _check_confirmation_backtest(strategy_id: str) -> tuple[bool, str]:
@@ -1069,48 +1086,27 @@ def _check_artifact_ordering(strategy_id: str, required_types: list[str] | None 
     """Verify artifacts were created in the correct order:
     multi-TF backtests → optimization → confirmation backtest → validation tests.
     """
-    with get_db() as conn:
-        rows = conn.execute(
-            """SELECT LOWER(TRIM(COALESCE(result_type, 'backtest'))) AS rt,
-                      MAX(datetime(created_at)) AS latest
-               FROM backtest_results
-               WHERE strategy_id = ?
-                 AND (deleted_at IS NULL OR TRIM(COALESCE(deleted_at, '')) = '')
-               GROUP BY LOWER(TRIM(COALESCE(result_type, 'backtest')))""",
-            (strategy_id,),
-        ).fetchall()
-
-        # The optimization baseline must be a GENUINE completed run — a failed/
-        # restart-killed row would spuriously flag every earlier walk_forward as
-        # stale. Normalize through SQLite datetime() so it compares against the
-        # MAX(datetime(...)) validation timestamps in the same format.
-        opt_time = ""
-        raw_opt_time = _latest_genuine_optimization_time(conn, strategy_id)
-        if raw_opt_time:
-            normalized = conn.execute(
-                "SELECT datetime(?) AS t", (raw_opt_time,)
-            ).fetchone()
-            opt_time = str((normalized["t"] if normalized else "") or "")
-
-    timestamps: dict[str, str] = {}
-    for row in rows:
-        rt = str(row["rt"] or "")
-        timestamps[rt] = str(row["latest"] or "")
-
-    # Check ordering: optimization before validation tests
+    # Check ordering: optimization before validation tests. BOTH sides of the
+    # comparison must be GENUINE completed runs: a failed/restart-killed
+    # optimization would spuriously flag every earlier walk_forward as stale,
+    # and an errored newer validation row would make a stale surviving verdict
+    # look correctly ordered. Raw created_at strings compare consistently
+    # (same column, same writer).
     required = {
         _canonicalize_gauntlet_verdict_test(rt)
         for rt in (required_types or [])
         if str(rt or "").strip()
     }
     validation_types = sorted(required) if required else list(_GAUNTLET_VALIDATION_TYPES)
-    for vt in validation_types:
-        vt_time = timestamps.get(vt, "")
-        if vt_time and opt_time and vt_time < opt_time:
-            return False, GateRejection(
-                f"Ordering violation: {vt} was run before optimization — re-run after optimization",
-                reason_code="stale_validation",
-            )
+    with get_db() as conn:
+        opt_time = _latest_genuine_optimization_time(conn, strategy_id)
+        for vt in validation_types:
+            vt_time = _latest_genuine_result_time(conn, strategy_id, vt)
+            if vt_time and opt_time and vt_time < opt_time:
+                return False, GateRejection(
+                    f"Ordering violation: {vt} was run before optimization — re-run after optimization",
+                    reason_code="stale_validation",
+                )
 
     return True, "Artifact ordering is correct"
 
@@ -1138,15 +1134,11 @@ def _check_validation_freshness(strategy_id: str, required_types: list[str] | No
     stale = []
     with get_db() as conn:
         for vt in validation_types:
-            row = conn.execute(
-                """SELECT created_at FROM backtest_results
-                   WHERE strategy_id = ?
-                     AND LOWER(TRIM(COALESCE(result_type, 'backtest'))) = ?
-                     AND (deleted_at IS NULL OR TRIM(COALESCE(deleted_at, '')) = '')
-                   ORDER BY datetime(created_at) DESC LIMIT 1""",
-                (strategy_id, vt),
-            ).fetchone()
-            if row and str(row["created_at"] or "") < baseline:
+            # Genuine rows only: an errored/timed-out newer re-run must not make
+            # the verdict the gate actually reads (an older genuine run) look
+            # fresh against the optimization baseline.
+            vt_time = _latest_genuine_result_time(conn, strategy_id, vt)
+            if vt_time and vt_time < baseline:
                 stale.append(vt)
 
     if stale:
@@ -2042,6 +2034,18 @@ _VALIDATION_NONRESULT_STATUSES = {
 }
 
 
+def is_errored_validation_row(metrics_blob: object, config_blob: object) -> bool:
+    """True when a persisted validation row ERRORED (failed/timed-out/crashed or
+    carries an error string) — it measured nothing and must never be read as a
+    merit verdict. Excludes pending/running rows: use is_nonresult_validation_row
+    where in-flight rows must also be skipped."""
+    metrics = metrics_blob if isinstance(metrics_blob, dict) else {}
+    config = config_blob if isinstance(config_blob, dict) else {}
+    status = str(metrics.get("status") or config.get("status") or "").strip().lower()
+    error_text = str(metrics.get("error") or config.get("error") or "").strip()
+    return bool(error_text) or status in _VALIDATION_NONRESULT_STATUSES
+
+
 def is_nonresult_validation_row(metrics_blob: object, config_blob: object) -> bool:
     """True when a persisted validation row is a NON-RESULT — pending, errored,
     timed out, or crashed — i.e. it measured nothing and must never be read as a
@@ -2054,11 +2058,10 @@ def is_nonresult_validation_row(metrics_blob: object, config_blob: object) -> bo
     status = str(metrics.get("status") or config.get("status") or "").strip().lower()
     if status in _VALIDATION_PENDING_STATUSES:
         return True
-    error_text = str(metrics.get("error") or config.get("error") or "").strip()
-    return bool(error_text) or status in _VALIDATION_NONRESULT_STATUSES
+    return is_errored_validation_row(metrics, config)
 
 
-def _is_nonresult_wfa_row(metrics_blob: object) -> bool:
+def is_nonresult_wfa_row(metrics_blob: object) -> bool:
     """True when a COMPLETED walk_forward row EXPLICITLY measured nothing: an
     empty splits list and zero OOS trades. Such a run carries no evidence in
     either direction.
@@ -2133,6 +2136,15 @@ def _extract_gauntlet_verdict_payloads(strategy_id: str, row, metrics: dict) -> 
             "SELECT params FROM strategies WHERE id = ?", (strategy_id,)
         ).fetchone()
 
+    # Parse configs ONCE (reused by both the preference partition and the main
+    # loop — this extractor runs per strategy per gate evaluation).
+    parsed_rows: list[tuple[object, dict]] = []
+    for result_row in rows:
+        config_blob = _parse_json_blob(result_row["config_json"], {})
+        if not isinstance(config_blob, dict):
+            config_blob = {}
+        parsed_rows.append((result_row, config_blob))
+
     # Prefer rows validated against the strategy's CURRENT params (the fingerprint
     # is stamped into each row's config at submission; see gauntlet/status.py's
     # staleness display). First-per-type-wins below then means "newest genuine
@@ -2150,28 +2162,20 @@ def _extract_gauntlet_verdict_payloads(strategy_id: str, row, metrics: dict) -> 
     if current_params_hash:
         matching = []
         others = []
-        for result_row in rows:
-            config_blob = _parse_json_blob(result_row["config_json"], {})
-            stamped = (
-                str(config_blob.get("params_hash") or "").strip()
-                if isinstance(config_blob, dict)
-                else ""
-            )
-            (matching if stamped == current_params_hash else others).append(result_row)
+        for pair in parsed_rows:
+            stamped = str(pair[1].get("params_hash") or "").strip()
+            (matching if stamped == current_params_hash else others).append(pair)
         if matching:
-            rows = matching + others
+            parsed_rows = matching + others
 
     stale_engine_types: set[str] = set()
-    for result_row in rows:
+    for result_row, config_blob in parsed_rows:
         normalized_type = _canonicalize_gauntlet_verdict_test(result_row["result_type"])
         if normalized_type in payloads or normalized_type in stale_engine_types:
             continue
         metrics_blob = _parse_json_blob(result_row["metrics_json"], {})
-        config_blob = _parse_json_blob(result_row["config_json"], {})
         if not isinstance(metrics_blob, dict):
             metrics_blob = {}
-        if not isinstance(config_blob, dict):
-            config_blob = {}
         # A verdict produced by a DIFFERENT engine version must never be compared
         # against fresh numbers. It CLAIMS its test type (so an even-older row or
         # the cached fallback blob cannot sneak in as the verdict) but contributes
@@ -2230,7 +2234,7 @@ def _extract_gauntlet_verdict_payloads(strategy_id: str, row, metrics: dict) -> 
         # signals). Skip it like an errored row so the newest GENUINE verdict
         # surfaces; a re-run with real folds that fails still displaces an older
         # pass, and legacy verdict-only rows (no splits key) stay honored.
-        if normalized_type == "walk_forward" and _is_nonresult_wfa_row(metrics_blob):
+        if normalized_type == "walk_forward" and is_nonresult_wfa_row(metrics_blob):
             continue
         payload = _validation_row_to_verdict_payload(normalized_type, metrics_blob, config_blob)
         legitimacy_payload = dict(config_blob)
