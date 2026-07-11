@@ -2172,21 +2172,28 @@ def _recalculate_robustness_score(strategy_id: str) -> None:
         if not rows:
             return
 
-        from forven.policy import load_pipeline_config
+        from forven.policy import is_nonresult_validation_row, load_pipeline_config
 
         gauntlet_cfg = load_pipeline_config().get("gauntlet", {})
         min_trades = int(gauntlet_cfg.get("min_trades", 10) or 10)
 
-        # Deduplicate by result_type (keep latest)
+        # Deduplicate by result_type (keep the latest GENUINE verdict). A pending or
+        # errored/timed-out row is a NON-RESULT: skip it without claiming the type so
+        # an older genuine verdict can still surface — mirroring the paper gate's
+        # extractor. Counting an infra failure as `passed=False` here dragged
+        # composite_robustness_score/robustness_tests_passed and the brain then
+        # archived on a phantom merit fail (2026-07-11).
         seen = set()
         tests: list[dict] = []
         for r in rows:
             rt = str(r["result_type"] or "").strip().lower()
             if rt in seen:
                 continue
-            seen.add(rt)
             metrics = _parse_json_object(r["metrics_json"])
             config = _parse_json_object(r["config_json"])
+            if is_nonresult_validation_row(metrics, config):
+                continue
+            seen.add(rt)
             passed_result, reason = _validation_row_passed(
                 rt,
                 metrics,

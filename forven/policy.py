@@ -2014,6 +2014,28 @@ def _validation_row_to_verdict_payload(result_type: str, metrics: dict, config: 
     return {"status": status, "passed": status == "pass", "verdict": verdict}
 
 
+_VALIDATION_PENDING_STATUSES = {"pending", "queued", "running", "started", "submitted"}
+_VALIDATION_NONRESULT_STATUSES = {
+    "failed", "error", "errored", "cancelled", "canceled", "timeout", "timed_out", "crashed",
+}
+
+
+def is_nonresult_validation_row(metrics_blob: object, config_blob: object) -> bool:
+    """True when a persisted validation row is a NON-RESULT — pending, errored,
+    timed out, or crashed — i.e. it measured nothing and must never be read as a
+    merit verdict. Single source of truth shared by the paper-gate verdict
+    extractor and the robustness score recalculator so the two readers cannot
+    drift (the 2026-07-11 leak: the gate skipped errored rows but the score
+    recalc counted them as failed tests)."""
+    metrics = metrics_blob if isinstance(metrics_blob, dict) else {}
+    config = config_blob if isinstance(config_blob, dict) else {}
+    status = str(metrics.get("status") or config.get("status") or "").strip().lower()
+    if status in _VALIDATION_PENDING_STATUSES:
+        return True
+    error_text = str(metrics.get("error") or config.get("error") or "").strip()
+    return bool(error_text) or status in _VALIDATION_NONRESULT_STATUSES
+
+
 def _extract_gauntlet_verdict_payloads(strategy_id: str, row, metrics: dict) -> tuple[dict[str, object], str | None]:
     from forven.engine_provenance import is_stale_engine_artifact
 
@@ -2105,25 +2127,19 @@ def _extract_gauntlet_verdict_payloads(strategy_id: str, row, metrics: dict) -> 
             )
             stale_engine_types.add(normalized_type)
             continue
-        status = str(metrics_blob.get("status") or config_blob.get("status") or "").strip().lower()
-        if status in {"pending", "queued", "running", "started", "submitted"}:
-            continue
-        # An ERRORED validation job is a NON-RESULT, not a quality verdict — skip it
-        # exactly like a pending one. Example: a walk_forward that could not run because
-        # "lookback (210) exceeds available bars per split (84)" on an incompatible
-        # (e.g. stale-container 1d) timeframe, a worker crash, or a data gap. Such a row
-        # carries status='failed'/'error' + an `error` string and NO splits/verdict.
-        # Reading it as a verdict turns a missing run into a PHANTOM merit FAIL — folds
-        # default to 0 ("Walk-forward has 0 folds" S00552 reject), trades to 0
-        # (degenerate reject) — which then ARCHIVES a strategy whose genuine (succeeded)
-        # validation on the correct timeframe actually passed (the S03523 case: a valid
-        # 5-fold BTC-1h walk_forward existed, but the errored BTC-1d row drove the gate).
-        # Genuine PASS/FAIL verdicts use status='succeeded' with splits + a verdict and
-        # carry NO error field, so they are unaffected.
-        error_text = str(metrics_blob.get("error") or config_blob.get("error") or "").strip()
-        if error_text or status in {
-            "failed", "error", "errored", "cancelled", "canceled", "timeout", "timed_out", "crashed",
-        }:
+        # A PENDING or ERRORED validation job is a NON-RESULT, not a quality verdict —
+        # skip it. Example: a walk_forward that could not run because "lookback (210)
+        # exceeds available bars per split (84)" on an incompatible (e.g.
+        # stale-container 1d) timeframe, a worker crash, a timeout, or a data gap. Such
+        # a row carries status='failed'/'error' + an `error` string and NO
+        # splits/verdict. Reading it as a verdict turns a missing run into a PHANTOM
+        # merit FAIL — folds default to 0 ("Walk-forward has 0 folds" S00552 reject),
+        # trades to 0 (degenerate reject) — which then ARCHIVES a strategy whose
+        # genuine (succeeded) validation on the correct timeframe actually passed (the
+        # S03523 case: a valid 5-fold BTC-1h walk_forward existed, but the errored
+        # BTC-1d row drove the gate). Genuine PASS/FAIL verdicts use status='succeeded'
+        # with splits + a verdict and carry NO error field, so they are unaffected.
+        if is_nonresult_validation_row(metrics_blob, config_blob):
             continue
         payload = _validation_row_to_verdict_payload(normalized_type, metrics_blob, config_blob)
         legitimacy_payload = dict(config_blob)

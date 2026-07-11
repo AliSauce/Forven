@@ -7475,7 +7475,48 @@ def verify_fitness_before_archive(strategy_id: str) -> tuple[bool, str]:
         has_return = metrics.get("total_return_pct") is not None or metrics.get("total_return") is not None
         if not has_sharpe and not has_return:
             return False, f"Strategy {strategy_id} has no valid performance metrics - archive REJECTED"
-        
+
+        return True, ""
+
+
+def verify_evidence_before_reject(strategy_id: str) -> tuple[bool, str]:
+    """Ghost protection for the `rejected` terminal, mirroring
+    verify_fitness_before_archive WITHOUT the fitness-key requirement: `rejected`
+    is reached by gate failures where metrics exist but no fitness was ever
+    scored, so demanding the fitness key would block legitimate merit rejects.
+    Blocks only rejects with NO metrics / NO performance evidence — a strategy
+    that never got a fair run (orphaned runtime, infra failure) must not be
+    terminally rejected on the absence of evidence.
+    Returns (can_reject, error_message)."""
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT metrics FROM strategies WHERE id = ?",
+            (strategy_id,),
+        ).fetchone()
+
+        if not row:
+            return False, f"Strategy {strategy_id} not found"
+
+        metrics_json = row[0]
+        if not metrics_json:
+            return False, f"Strategy {strategy_id} has no metrics - terminal reject blocked (ghost protection)"
+
+        try:
+            metrics = json.loads(metrics_json) if isinstance(metrics_json, str) else metrics_json
+        except Exception:
+            return False, f"Strategy {strategy_id} has invalid metrics JSON - terminal reject blocked"
+
+        if not isinstance(metrics, dict) or not metrics:
+            return False, f"Strategy {strategy_id} has no metrics - terminal reject blocked (ghost protection)"
+
+        has_sharpe = metrics.get("sharpe") is not None or metrics.get("sharpe_ratio") is not None
+        has_return = metrics.get("total_return_pct") is not None or metrics.get("total_return") is not None
+        if not has_sharpe and not has_return:
+            return False, (
+                f"Strategy {strategy_id} has no valid performance metrics - "
+                "terminal reject blocked (ghost protection)"
+            )
+
         return True, ""
 
 
