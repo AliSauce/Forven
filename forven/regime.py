@@ -88,6 +88,69 @@ def get_adx_bounds_for_family(strategy_type: str) -> tuple[float | None, float |
     return policy.get("adx_min"), policy.get("adx_max")
 
 
+# --- Shared regime ATR-ratio baseline --------------------------------------------
+# The volatility input to _classify is the ATR RATIO: recent ATR vs a lagged baseline
+# ATR. Historically THREE call sites computed it inline with drifting conventions —
+# the backtest signal-walk used a 44-bar baseline while the robustness validator and
+# THIS live detector used a 30-bar baseline (tr[-44:-14]). A bar could therefore
+# classify to a different regime in the backtest vs. live/robustness. These helpers are
+# the ONE definition all three now share (the 30-bar baseline the module docstring
+# always advertised); unifying the signal-walk to it is stats-affecting → engine v5.
+
+# Recent-ATR and baseline-ATR windows, and the lag between them (in bars).
+REGIME_ATR_PERIOD = 14
+REGIME_ATR_BASELINE_PERIOD = 30  # baseline window = tr[-44:-14] → 30 bars, lagged by 14
+
+
+def regime_true_range(high, low, close) -> "pd.Series":
+    """Wilder true range as a pandas Series (max of H-L, |H-prevClose|, |L-prevClose|).
+
+    Accepts pandas Series (aligned by index). No lookahead: TR at bar i uses close[i-1].
+    """
+    high = pd.Series(high)
+    low = pd.Series(low)
+    close = pd.Series(close)
+    prev_close = close.shift()
+    return pd.concat(
+        [(high - low), (high - prev_close).abs(), (low - prev_close).abs()],
+        axis=1,
+    ).max(axis=1)
+
+
+def regime_atr_ratio_series(high, low, close) -> "pd.Series":
+    """Per-bar ATR ratio = mean(TR over last 14) / mean(TR over the 30 bars ending 14
+    bars ago), for regime classification. Vectorized over the whole frame.
+
+    Taking ``.iloc[-1]`` of this on a trailing window reproduces the scalar computation
+    ``mean(tr[-14:]) / mean(tr[-44:-14])`` exactly (when the window spans > 44 bars), so
+    the signal-walk (which reads every bar) and the window-based sites (robustness, live)
+    share ONE baseline. NaN (warmup) is left as NaN — callers substitute 1.0 as before.
+    """
+    tr = regime_true_range(high, low, close)
+    atr_current = tr.rolling(REGIME_ATR_PERIOD).mean()
+    atr_baseline = tr.rolling(REGIME_ATR_BASELINE_PERIOD).mean().shift(REGIME_ATR_PERIOD)
+    return atr_current / atr_baseline.clip(lower=1e-9)
+
+
+def regime_atr_ratio_at(high, low, close, *, default: float = 1.0) -> float:
+    """Scalar ATR ratio at the LAST bar of the given series (the window-based sites).
+
+    Returns ``default`` when the ratio is NaN (warmup) or non-finite, matching the
+    ``else 1.0`` fallbacks the inline sites used.
+    """
+    series = regime_atr_ratio_series(high, low, close)
+    if len(series) == 0:
+        return float(default)
+    value = series.iloc[-1]
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    if value != value or value in (float("inf"), float("-inf")):  # NaN / inf guard
+        return float(default)
+    return value
+
+
 REGIME_PARAM_OVERLAYS = {
     TREND_UP: {
         "rsi_momentum": {"rsi_entry": 40, "rsi_exit": 60, "adx_min": 0},
@@ -330,15 +393,9 @@ def detect_regime(asset: str, bars: int = 300) -> RegimeState:
         else:
             ema_alignment = "mixed"
 
-        # ATR ratio (current 14-bar ATR vs 30-bar average ATR)
-        tr = pd.concat([
-            high - low,
-            (high - close.shift()).abs(),
-            (low - close.shift()).abs(),
-        ], axis=1).max(axis=1)
-        atr_current = float(tr.iloc[-14:].mean())
-        atr_avg = float(tr.iloc[-44:-14].mean()) if len(tr) > 44 else atr_current
-        atr_ratio = atr_current / atr_avg if atr_avg > 0 else 1.0
+        # ATR ratio (current 14-bar ATR vs 30-bar average ATR) — shared baseline so a
+        # bar classifies identically here, in the backtest signal-walk, and in robustness.
+        atr_ratio = regime_atr_ratio_at(high, low, close, default=1.0)
 
         # Classification logic
         regime, confidence = _classify(adx_val, ema_alignment, atr_ratio, rsi_val)

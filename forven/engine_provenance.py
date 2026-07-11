@@ -46,7 +46,7 @@ import json
 # data-substrate rebuild that invalidates comparisons against prior verdicts
 # (verdicts are only evidence relative to the data they were scored on) — and
 # add a matching ENGINE_VERSION_LOG entry (test-enforced).
-BACKTEST_ENGINE_VERSION = 4
+BACKTEST_ENGINE_VERSION = 5
 
 # Append-only changelog: one entry per version, newest last. The unit test
 # asserts the newest entry matches BACKTEST_ENGINE_VERSION so a bump can never
@@ -91,6 +91,21 @@ ENGINE_VERSION_LOG: tuple[dict, ...] = (
             "liquidation, shared hedged exposure, exit-notional fee/slippage, "
             "mark-to-market portfolio return/drawdown, chronological purged WFA, "
             "disjoint optimizer holdout, and point-in-time appended-bar filtering."
+        ),
+    },
+    {
+        "version": 5,
+        "date": "2026-07-11",
+        "summary": (
+            "Metric-semantics re-baseline: bar-level CALENDAR Sharpe/Sortino from the "
+            "mark-to-market equity curve are now the primary sharpe/sortino (trade-based "
+            "EVENT values preserved as trade_sharpe/trade_sortino) — sparse-trading "
+            "strategies read a LOWER, cadence-comparable Sharpe; funding-aware Kelly "
+            "evidence (perp funding accrued inside the kernel walk so kelly sizing learns "
+            "funding-adjusted returns, applied exactly once); unified regime ATR-ratio "
+            "baseline (signal-walk aligned to the 30-bar baseline robustness + live use, "
+            "was 44-bar); and true fixed-DOLLAR notional (fixed-mode sizes off equity at "
+            "entry, so deployed notional stays ~fixed_size instead of scaling with equity)."
         ),
     },
 )

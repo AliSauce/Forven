@@ -58,6 +58,30 @@ def test_size_fraction_fixed_is_ratio_of_initial_capital():
     assert sizing.size_fraction(_ec(sizing_mode="fixed", fixed_size=None), None, leverage=1.0, initial_capital=10000) == 1.0
 
 
+def test_fixed_mode_is_true_fixed_dollar_off_current_equity():
+    """v5: `fixed` mode targets a fixed DOLLAR notional — the fraction = fixed_size /
+    equity AT ENTRY, so a grown account deploys a SHRINKING fraction (constant dollars),
+    not a constant fraction whose notional balloons with equity."""
+    ec = _ec(sizing_mode="fixed", fixed_size=5000)
+    # At initial capital the fraction is 0.5 (5000/10000) — unchanged from before.
+    assert sizing.size_fraction(ec, None, leverage=1.0, initial_capital=10000, current_equity=10000) == pytest.approx(0.5)
+    # After the account doubles to 20000, the SAME $5000 target is a 0.25 fraction …
+    assert sizing.size_fraction(ec, None, leverage=1.0, initial_capital=10000, current_equity=20000) == pytest.approx(0.25)
+    # … so the deployed notional stays ~$5000 (0.25 * 20000), not $10000 (0.5 * 20000).
+    grown_fraction = sizing.size_fraction(ec, None, leverage=1.0, initial_capital=10000, current_equity=20000)
+    assert grown_fraction * 20000 == pytest.approx(5000)
+    # A shrunk account deploys a LARGER fraction, clamped to 1.0 when the target exceeds equity.
+    assert sizing.size_fraction(ec, None, leverage=1.0, initial_capital=10000, current_equity=4000) == pytest.approx(1.0)
+
+
+def test_fixed_mode_defaults_to_initial_capital_without_current_equity():
+    """Back-compat: a caller that cannot supply current_equity (current_equity=None)
+    reproduces the pre-v5 fixed-FRACTION behaviour for that one call."""
+    ec = _ec(sizing_mode="fixed", fixed_size=5000)
+    assert sizing.size_fraction(ec, None, leverage=1.0, initial_capital=10000) == pytest.approx(0.5)
+    assert sizing.size_fraction(ec, None, leverage=1.0, initial_capital=10000, current_equity=None) == pytest.approx(0.5)
+
+
 def test_size_fraction_fraction_risk_over_stop():
     sf = sizing.size_fraction(_ec(sizing_mode="fraction", risk_per_trade=0.02), 0.03, leverage=1.0, initial_capital=10000)
     assert sf == pytest.approx(0.02 / 0.03)

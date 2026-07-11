@@ -31,11 +31,27 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+import numpy as np
 import pandas as pd
 
 from forven.regime import RANGE_BOUND
 from forven.strategies import sizing as _sizing
 from forven.strategies.base import DirectionalSignals  # noqa: F401  (re-exported for callers)
+
+
+@dataclass(frozen=True)
+class FundingContext:
+    """Per-bar perp funding series threaded into :func:`simulate` (opt-in).
+
+    ``rates`` is a numpy array aligned 1:1 with the simulated frame's bars (the merged
+    ``funding_rate`` column; NaN where a bar had no rate). ``hours_per_bar`` scales the
+    per-bar rate to the bar's holding interval (funding accrues hourly). Supplied only by
+    the backtest funding path; the scanner and every parity test leave it None so the
+    kernel stays byte-identically price-only and funding is owned by the post-walk pass.
+    """
+
+    rates: "np.ndarray"
+    hours_per_bar: float
 
 
 def _trade_direction_sign(direction: str) -> float:
@@ -164,6 +180,47 @@ class KernelResult:
     pending_entries: dict[str, dict] = field(default_factory=dict)
     pending_exits: dict[str, dict] = field(default_factory=dict)
     ec: dict | None = None
+    # The funding context :func:`simulate` ran with (None = price-only). Exposed so the
+    # backtest's force-close applies funding to the end-of-data trade with the same
+    # series/alignment the walk used, keeping the single-application invariant intact.
+    funding: "FundingContext | None" = None
+
+
+def _accrue_funding_gross(
+    funding: "FundingContext | None",
+    direction: str,
+    entry_bar: int,
+    exit_idx: int,
+    leverage: float,
+) -> tuple[float | None, bool]:
+    """Pre-size, leveraged funding return for a position held over [entry_bar, exit_idx).
+
+    Returns ``(funding_gross, complete)`` where ``funding_gross`` is the equity-fraction
+    funding term at UNIT size (positive = credit received, negative = paid) and
+    ``complete`` is False if any held bar lacked a funding rate. Returns ``(None, ...)``
+    when no funding context is supplied (the default — kernel stays price-only, and the
+    post-walk :func:`backtest._apply_funding_to_trades` owns funding as before).
+
+    Sign/scale mirror ``_apply_funding_to_trades`` EXACTLY except it stops before the
+    ``* size_fraction`` step (that is applied by the caller), so the two never diverge:
+    ``funding_pnl = -sign * Σfunding_rate * hours * leverage`` (pre-size).
+    """
+    if funding is None:
+        return None, True
+    rates = funding.rates
+    n = len(rates)
+    lo = max(int(entry_bar), 0)
+    hi = min(int(exit_idx), n)
+    if hi <= lo:
+        # Zero-bar hold accrues no funding — trivially complete (mirrors the
+        # bars_held<=0 branch in _apply_funding_to_trades).
+        return 0.0, True
+    window = rates[lo:hi]
+    complete = not bool(np.isnan(window).any())
+    funding_sum = float(np.nansum(window))
+    sign = _trade_direction_sign(direction)
+    funding_gross = -sign * funding_sum * funding.hours_per_bar * max(float(leverage), 0.0)
+    return funding_gross, complete
 
 
 def finalize(
@@ -180,11 +237,19 @@ def finalize(
     leverage: float,
     trade_mode: str,
     open_at_end: bool = False,
+    funding: "FundingContext | None" = None,
 ) -> None:
     """Append one realized trade (and its pre-size gross to the kelly evidence list).
 
     Shared by :func:`simulate`'s in-loop exits and the backtest's end-of-data
     force-close so the math is defined exactly once.
+
+    When ``funding`` is supplied (opt-in; default None), the position's perp funding is
+    accrued INSIDE the walk: the pre-size funding return is folded into ``gross`` (so the
+    kelly evidence series ``closed_gross`` is funding-aware — the whole point) and the
+    size-scaled funding into ``pnl_pct`` (so the kernel's own trade PnL is funding-aware
+    too). The trade is stamped ``_funding_from_kernel`` so the post-walk
+    ``_apply_funding_to_trades`` SKIPS it — funding is applied exactly once.
     """
     entry_price = float(at["entry_price"])
     if entry_price <= 0:
@@ -192,8 +257,17 @@ def finalize(
     sign = _trade_direction_sign(direction)
     drag = _trade_drag(round_trip_drag, entry_price, float(exit_price))
     gross = ((exit_price - entry_price) / entry_price) * sign * leverage - drag
-    closed_gross.append(gross)  # pre-size, for kelly evidence
     size_fraction = float(at.get("size_fraction", 1.0))
+
+    funding_gross, funding_complete = _accrue_funding_gross(
+        funding, direction, int(at["entry_bar"]), int(exit_idx), leverage
+    )
+    if funding_gross is not None:
+        # Fold funding into the pre-size gross BEFORE the kelly-evidence append so
+        # Kelly learns from the funding-adjusted return (fixes the high-funding
+        # size-up bias); the trade's net pnl then carries the size-scaled leg.
+        gross = gross + funding_gross
+    closed_gross.append(gross)  # pre-size, for kelly evidence (funding-aware when supplied)
     pnl_pct = gross * size_fraction
     trade = {
         "entry_bar": int(at["entry_bar"]),
@@ -214,6 +288,13 @@ def finalize(
         "cost_drag_pct": round(float(drag * size_fraction), 8),
         "exit_reason": exit_reason,
     }
+    if funding_gross is not None:
+        # Kernel-applied funding: stamp the same fields _apply_funding_to_trades would,
+        # and mark it so that post-walk pass skips this trade (single-application invariant).
+        trade["funding_cost_pct"] = round(float(funding_gross * size_fraction), 6)
+        trade["funding_applied"] = True
+        trade["funding_complete"] = bool(funding_complete)
+        trade["_funding_from_kernel"] = True
     if open_at_end:
         trade["open_at_end"] = True
     if at.get("regime") is not None:
@@ -234,6 +315,7 @@ def simulate(
     ec: dict,
     initial_capital: float,
     intrabar_resolver=None,
+    funding: "FundingContext | None" = None,
 ) -> KernelResult:
     """Walk the bars and produce closed trades + still-open positions (no force-close).
 
@@ -249,6 +331,11 @@ def simulate(
     returns ``"stop"`` / ``"tp"`` / ``None`` (None = stay pessimistic). It is
     consulted ONLY in the both-touched case, so single-touch bars are
     byte-identical with the resolver on or off.
+
+    ``funding`` (optional): a :class:`FundingContext` of the per-bar funding series.
+    When supplied, each trade's funding is accrued at finalize (folded into the kelly
+    evidence AND the trade's net PnL) and the post-walk pass skips it — see
+    :func:`finalize`. Default None ⇒ price-only kernel (byte-identical to pre-v5).
     """
     opens = df["open"].astype(float).values
     highs = df["high"].astype(float).values
@@ -262,6 +349,12 @@ def simulate(
     lev = max(float(leverage), 1e-9)
     maintenance_margin_ratio = 0.005
 
+    # Running realized equity, compounded from each closed trade's net pnl_pct. Only
+    # ``fixed``-mode sizing reads it (true fixed-DOLLAR notional: the target dollar amount
+    # divided by the account value AT ENTRY, so a growing account deploys a shrinking
+    # fraction). Other modes ignore current_equity, so this is inert for them.
+    realized_equity = [max(float(initial_capital), 0.0)]
+
     def _entry_stop_dist_pct(entry_idx: int, entry_price: float) -> float | None:
         atr_value = (
             float(atr_vals[entry_idx])
@@ -274,7 +367,20 @@ def simulate(
         return _sizing.size_fraction(
             ec, stop_dist_pct, leverage=lev,
             initial_capital=initial_capital, closed_gross=closed_gross,
+            current_equity=realized_equity[0],
         )
+
+    def _finalize(at, direction, exit_price, exit_idx, exit_time, exit_reason, *, open_at_end=False):
+        """Finalize a trade AND advance the running equity by its net return, so a
+        later fixed-mode entry sizes off the up-to-date account value."""
+        before = len(trades)
+        finalize(
+            trades, closed_gross, at, direction, exit_price, exit_idx, exit_time, exit_reason,
+            round_trip_drag=round_trip_drag, leverage=leverage, trade_mode=trade_mode,
+            open_at_end=open_at_end, funding=funding,
+        )
+        if len(trades) > before:
+            realized_equity[0] = max(0.0, realized_equity[0] * (1.0 + float(trades[-1]["pnl_pct"])))
 
     for idx in range(max(int(warmup), 0) + 1, len(df)):
         signal_idx = idx - 1
@@ -371,8 +477,7 @@ def simulate(
                     exit_price, exit_reason = (tp, "take_profit")
 
             if exit_price is not None:
-                finalize(trades, closed_gross, at, direction, exit_price, idx, current_time, exit_reason,
-                         round_trip_drag=round_trip_drag, leverage=leverage, trade_mode=trade_mode)
+                _finalize(at, direction, exit_price, idx, current_time, exit_reason)
                 active_trades[direction] = None
             elif at.get("trail_pct"):
                 # Still open — ratchet the trailing peak with THIS bar for the next bar.
@@ -476,10 +581,7 @@ def simulate(
                 exit_price, exit_reason = float(target_price), "take_profit"
 
             if exit_price is not None:
-                finalize(
-                    trades, closed_gross, at, direction, exit_price, idx, current_time, exit_reason,
-                    round_trip_drag=round_trip_drag, leverage=leverage, trade_mode=trade_mode,
-                )
+                _finalize(at, direction, exit_price, idx, current_time, exit_reason)
                 active_trades[direction] = None
             elif at.get("trail_pct"):
                 at["extreme"] = max(fill_price, bar_high) if direction == "long" else min(fill_price, bar_low)
@@ -533,7 +635,7 @@ def simulate(
     open_positions = {direction: at for direction, at in active_trades.items() if at is not None}
     return KernelResult(
         closed_trades=trades, open_positions=open_positions, closed_gross=closed_gross,
-        pending_entries=pending_entries, pending_exits=pending_exits, ec=ec,
+        pending_entries=pending_entries, pending_exits=pending_exits, ec=ec, funding=funding,
     )
 
 
@@ -544,10 +646,15 @@ def force_close(
     leverage: float,
     round_trip_drag: float,
     trade_mode: str,
+    funding: "FundingContext | None" = None,
 ) -> list[dict]:
     """Append a synthetic close at the final bar's close for every still-open position
     (the backtest's end-of-data accounting). Mutates and returns ``res.closed_trades``.
-    The scanner does NOT call this — it leaves the position live."""
+    The scanner does NOT call this — it leaves the position live.
+
+    ``funding`` mirrors :func:`simulate`: when supplied, the end-of-data close accrues
+    its funding inside the kernel and is stamped so the post-walk pass skips it. Default
+    None keeps the price-only convention (the scanner never calls this)."""
     trades = res.closed_trades
     final_idx = len(df) - 1
     final_close = float(df["close"].iloc[final_idx]) if len(df) else 0.0
@@ -557,6 +664,7 @@ def force_close(
             continue
         finalize(
             trades, res.closed_gross, at, direction, final_close, final_idx, final_time, "signal",
-            round_trip_drag=round_trip_drag, leverage=leverage, trade_mode=trade_mode, open_at_end=True,
+            round_trip_drag=round_trip_drag, leverage=leverage, trade_mode=trade_mode,
+            open_at_end=True, funding=funding,
         )
     return trades

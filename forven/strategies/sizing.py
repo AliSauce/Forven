@@ -260,6 +260,7 @@ def size_fraction(
     leverage: float,
     initial_capital: float,
     closed_gross: list[float] | None = None,
+    current_equity: float | None = None,
 ) -> float:
     """Fraction of equity to deploy on a trade, per the sizing mode.
 
@@ -267,6 +268,14 @@ def size_fraction(
     full/fixed/kelly; for fraction/atr it returns ``risk_per_trade /
     (stop_dist_pct * leverage)`` clamped to [0, 1] (so a stop-out loses
     ~risk_per_trade of equity, leverage-invariant).
+
+    ``current_equity`` is the account value AT ENTRY. ``fixed`` mode divides the
+    target dollar notional by it (true fixed-dollar: the deployed notional stays
+    ~``fixed_size`` dollars regardless of account growth). It defaults to
+    ``initial_capital`` when the caller cannot supply a running equity (e.g. a
+    stateless mirror), which reproduces the pre-v5 fixed-FRACTION behaviour for
+    that one call — callers that track equity (the kernel walk) pass it so the
+    notional is genuinely fixed.
     """
     mode = ec["sizing_mode"]
     if mode == "full":
@@ -274,7 +283,12 @@ def size_fraction(
     if mode == "fixed":
         if not ec.get("fixed_size"):
             return 1.0
-        return clamp01(ec["fixed_size"] / max(float(initial_capital), 1e-9))
+        # True fixed-dollar notional: size the target dollar amount against the
+        # account value AT ENTRY, not the static initial capital, so a growing
+        # account keeps deploying ~fixed_size dollars (a SHRINKING fraction) rather
+        # than a fixed fraction whose dollar notional balloons with equity.
+        equity_base = current_equity if (current_equity is not None and current_equity > 0) else initial_capital
+        return clamp01(ec["fixed_size"] / max(float(equity_base), 1e-9))
     if mode == "kelly":
         return clamp01(ec["kelly_multiplier"] * kelly_fraction(closed_gross or [], ec["kelly_lookback"]))
     # fraction / atr → risk-based: lose ~risk_per_trade of equity at the stop.
