@@ -2343,6 +2343,49 @@ def transition_stage(
                     exc_info=True,
                 )
 
+        # Timeframe hygiene on a genuine RESTORE (terminal -> quick_screen): the
+        # re-evaluation must start on the AUTHOR'S declared timeframe. Prior runs
+        # can leave a hijacked timeframe column (sweep winner, fitness reassigner
+        # pre-#85), and the fresh quick-screen then RUNS on the wrong context —
+        # writing wrong-context metrics that the overfitting guardrails read and
+        # reject (S06895 run eight: restored with a residual 1h column, screened
+        # at 1h, Gate1 rejected on the fresh 1h Sharpe while the declared-4h
+        # evidence was positive). Stale METRICS need no handling here — the stage
+        # UPDATE below already NULLs them via reset_terminal_metrics. Same conn,
+        # atomic with the stage change; best-effort.
+        if normalized_target == "quick_screen" and str(current_stage or "").strip().lower() in (
+            "archived", "rejected", "backtest_failed", "failed",
+        ):
+            try:
+                hygiene_row = conn.execute(
+                    "SELECT params, timeframe FROM strategies WHERE id = ?",
+                    (strategy_id,),
+                ).fetchone()
+                declared_tf = ""
+                if hygiene_row:
+                    try:
+                        params_blob = json.loads(hygiene_row["params"]) if hygiene_row["params"] else {}
+                        if isinstance(params_blob, dict):
+                            declared_tf = str(params_blob.get("_timeframe") or "").strip().lower()
+                    except Exception:
+                        declared_tf = ""
+                current_tf = str(hygiene_row["timeframe"] or "").strip().lower() if hygiene_row else ""
+                if declared_tf and declared_tf != current_tf:
+                    conn.execute(
+                        "UPDATE strategies SET timeframe = ?, updated_at = ? WHERE id = ?",
+                        (declared_tf, now, strategy_id),
+                    )
+                    log.info(
+                        "Restore hygiene for %s: timeframe %s -> %s (author-declared)",
+                        strategy_id, current_tf, declared_tf,
+                    )
+            except Exception:
+                log.warning(
+                    "Restore timeframe hygiene failed for %s (continuing)",
+                    strategy_id,
+                    exc_info=True,
+                )
+
     if force_activity_message:
         log_activity("warning", "brain", force_activity_message)
 
