@@ -7021,7 +7021,7 @@ def auto_assign_best_symbol_timeframe(strategy_id: str) -> tuple[str, str] | Non
 
     with get_db() as conn:
         row = conn.execute(
-            "SELECT symbol, timeframe, name, type FROM strategies WHERE id = ?",
+            "SELECT symbol, timeframe, name, type, params FROM strategies WHERE id = ?",
             (strategy_id,),
         ).fetchone()
         if not row:
@@ -7031,6 +7031,33 @@ def auto_assign_best_symbol_timeframe(strategy_id: str) -> tuple[str, str] | Non
         old_timeframe = str(row["timeframe"] or "").strip().lower() or "1h"
         if old_symbol == best_symbol and old_timeframe == best_timeframe:
             return best_symbol, best_timeframe
+
+        # The author's declared timeframe (params._timeframe) is a contract. This
+        # reassigner scores rows from EVERY timeframe, so a dense off-declared
+        # history re-homes the strategy onto a context the sweep's prefer-declared
+        # bias just refused — S06895 run seven: gate passed at the declared 4h,
+        # this fired minutes later on old 1h rows, and the persisted walk-forward
+        # then ran (and merit-archived) at 1h. Timeframe changes for declared
+        # strategies belong to the sweep's quality-barred selection, not fitness
+        # shopping across contexts.
+        declared_tf = ""
+        try:
+            params_blob = json.loads(row["params"]) if row["params"] else {}
+            if isinstance(params_blob, dict):
+                declared_tf = str(params_blob.get("_timeframe") or "").strip().lower()
+        except Exception:
+            declared_tf = ""
+        if declared_tf and str(best_timeframe or "").strip().lower() != declared_tf:
+            log_activity(
+                "info",
+                "db.auto_assign_context",
+                (
+                    f"Auto-assign for {strategy_id} kept declared timeframe "
+                    f"{declared_tf} (fitness winner was {best_symbol} {best_timeframe})"
+                ),
+                {"strategy_id": strategy_id, "declared_timeframe": declared_tf},
+            )
+            return old_symbol, old_timeframe
 
         # Traded-asset freeze: never re-home a running paper/live strategy onto a
         # higher-scoring cross-asset sweep result — keep its promoted asset.

@@ -194,3 +194,49 @@ def test_scanner_allows_matching_asset_open(forven_db, monkeypatch):
         )
     except ValueError as e:
         assert "cross-asset open blocked" not in str(e)
+
+
+def test_auto_assign_never_moves_timeframe_off_declaration(forven_db):
+    """The fitness reassigner scores rows from every timeframe; with a dense
+    off-declared history it re-homed strategies onto contexts the sweep's
+    prefer-declared bias had just refused (S06895 run seven: gate passed at the
+    declared 4h, this flipped the column to 1h, the persisted walk-forward ran
+    at 1h and merit-archived the strategy). params._timeframe pins it."""
+    import json
+    from datetime import datetime, timezone
+
+    from forven.db import auto_assign_best_symbol_timeframe, get_db
+
+    now = datetime.now(timezone.utc).isoformat()
+    sid = "S-TFPIN1"
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO strategies (id, name, type, symbol, timeframe, params, metrics, "
+            "status, owner, stage, stage_changed_at, created_at, updated_at) "
+            "VALUES (?, ?, 'rsi_momentum', 'BTC', '4h', ?, '{}', 'gauntlet', 'brain', "
+            "'gauntlet', ?, ?, ?)",
+            (sid, sid, json.dumps({"_timeframe": "4h", "kc_period": 10}), now, now, now),
+        )
+        # A high-fitness 1h row that would win the cross-timeframe fitness contest.
+        conn.execute(
+            "INSERT INTO backtest_results (result_id, strategy_id, result_type, symbol, "
+            "timeframe, metrics_json, config_json, created_at) "
+            "VALUES ('bt-tfpin-1h', ?, 'backtest', 'BTC', '1h', ?, '{}', ?)",
+            (
+                sid,
+                json.dumps({
+                    "sharpe": 2.5, "sharpe_ratio": 2.5, "total_trades": 60,
+                    "total_return_pct": 20.0, "max_drawdown_pct": 0.05, "win_rate": 0.6,
+                }),
+                now,
+            ),
+        )
+        conn.commit()
+
+    auto_assign_best_symbol_timeframe(sid)
+
+    with get_db() as conn:
+        row = conn.execute("SELECT timeframe FROM strategies WHERE id = ?", (sid,)).fetchone()
+    assert str(row["timeframe"]).lower() == "4h", (
+        "auto-assign must never move the timeframe away from params._timeframe"
+    )
