@@ -71,6 +71,181 @@ def canonical_market_symbol(symbol: str) -> str:
     return f"{s}/USDT"
 
 
+# SYMBOL-VALID-1: strategies were minted with fabricated market symbols
+# (``MULTI/USDT``, ``BASKET/USDT``), inverted pairs (``BTC/ETH``), and dataset
+# context-names leaked into the symbol column (``ETH/USDT-8H``, ``BTC-USDT-1D``).
+# Each one wedged its gauntlet workflow in an eternal blocked_data backfill loop
+# and hammered the exchange with requests for markets that don't exist. Validate
+# at mint instead: repair the repairable (timeframe-suffix leak), reject the
+# fabricated, and let anything plausibly real through (the ensure_coverage
+# strike-out is the backstop for plausible-but-unlisted).
+_TIMEFRAME_SUFFIX_RE = None  # compiled lazily; module import must stay light
+_PLAUSIBLE_QUOTES = ("USDT", "USDC", "USD", "BUSD", "BTC", "ETH")
+
+
+def _strip_timeframe_suffix(symbol: str) -> str:
+    """``ETH/USDT-8H`` → ``ETH/USDT``; ``BTC-USDT-1D`` → ``BTC-USDT``.
+
+    Only strips a TRAILING ``-<timeframe>`` token — never touches the base."""
+    global _TIMEFRAME_SUFFIX_RE
+    if _TIMEFRAME_SUFFIX_RE is None:
+        import re
+
+        _TIMEFRAME_SUFFIX_RE = re.compile(
+            r"[-_/](?:1|3|5|15|30)M$|[-_/](?:1|2|4|6|8|12)H$|[-_/](?:1|3)D$|[-_/]1W$",
+            re.IGNORECASE,
+        )
+    return _TIMEFRAME_SUFFIX_RE.sub("", str(symbol or "").strip())
+
+
+def _series_is_known(canonical: str) -> bool:
+    """True when the lake already stores this series or the perp registry lists
+    it (active OR delisted — delisted history is real, tradable-at-T data)."""
+    from forven.data import DATA_DIR, symbol_to_fs
+
+    fs = symbol_to_fs(canonical)
+    if not fs:
+        return False
+    try:
+        sym_dir = DATA_DIR / fs
+        if sym_dir.is_dir() and any(sym_dir.glob("*.parquet")):
+            return True
+    except Exception:
+        pass
+    try:
+        from forven.dataeng.universe import get_symbol_registry
+
+        return any(str(row.get("symbol")) == fs for row in get_symbol_registry())
+    except Exception:
+        return False
+
+
+def _base_is_known(base: str) -> bool:
+    """A base asset counts as known when any lake dir or registry row trades it."""
+    from forven.data import DATA_DIR
+
+    b = str(base or "").strip().upper()
+    if not b:
+        return False
+    try:
+        if DATA_DIR.exists() and any(
+            d.name.upper().split("-")[0] == b for d in DATA_DIR.iterdir() if d.is_dir()
+        ):
+            return True
+    except Exception:
+        pass
+    try:
+        from forven.dataeng.universe import get_symbol_registry
+
+        return any(
+            str(row.get("symbol") or "").upper().split("-")[0] == b
+            for row in get_symbol_registry()
+        )
+    except Exception:
+        return False
+
+
+def known_base_asset(base: str) -> bool:
+    """Whether ``base`` is an asset the system has ANY evidence of (lake dir or
+    registry row). Fails open when there is no evidence base to judge against
+    (fresh install / isolated test home). Used by the funding collector to skip
+    fabricated assets (MULTI, BASKET) instead of hammering the venue for them."""
+    try:
+        if not _validation_evidence_available():
+            return True
+        return _base_is_known(base)
+    except Exception:
+        return True
+
+
+def _validation_evidence_available() -> bool:
+    """Whether the lake or the registry holds ANY markets to validate against."""
+    from forven.data import DATA_DIR
+
+    try:
+        if DATA_DIR.exists() and any(d.is_dir() and not d.name.startswith(".") for d in DATA_DIR.iterdir()):
+            return True
+    except Exception:
+        pass
+    try:
+        from forven.dataeng.universe import get_symbol_registry
+
+        return bool(get_symbol_registry())
+    except Exception:
+        return False
+
+
+def validate_strategy_symbol(symbol: str) -> dict[str, Any]:
+    """Mint-time market-symbol validation.
+
+    Returns ``{"ok": bool, "symbol": str, "repaired": bool, "reason": str | None}``
+    where ``symbol`` is the canonical (possibly repaired) form to store. Fail-open
+    on infrastructure errors — a registry/lake hiccup must never block a mint
+    (the ensure_coverage strike-out catches anything that slips through)."""
+    raw = str(symbol or "").strip()
+    if not raw:
+        return {"ok": False, "symbol": "", "repaired": False, "reason": "empty symbol"}
+    try:
+        canon = canonical_market_symbol(raw)
+
+        if _series_is_known(canon):
+            return {"ok": True, "symbol": canon, "repaired": False, "reason": None}
+
+        # Repairable: a dataset-context name leaked into the symbol column
+        # (``ETH/USDT-8H``). Strip the trailing timeframe token and re-check.
+        # This must run BEFORE the asset-class carve-out below: the classifier
+        # buckets unrecognized shapes like "ETH/USDT-8H" as "stock", which would
+        # otherwise wave the leak through unrepaired.
+        stripped = _strip_timeframe_suffix(raw)
+        if stripped and stripped != raw:
+            canon_stripped = canonical_market_symbol(stripped)
+            if _series_is_known(canon_stripped):
+                return {
+                    "ok": True,
+                    "symbol": canon_stripped,
+                    "repaired": True,
+                    "reason": f"stripped timeframe suffix from {raw!r}",
+                }
+
+        # Non-crypto tickers (stocks/ETFs/forex) are outside the crypto registry —
+        # never invent a rejection for them.
+        try:
+            from forven.data import classify_dataset_asset_class
+
+            if classify_dataset_asset_class(canon) in _NON_CRYPTO_ASSET_CLASSES:
+                return {"ok": True, "symbol": canon, "repaired": False, "reason": None}
+        except Exception:
+            pass
+
+        # Plausibly real but uncollected: a known base against a standard quote
+        # (new listing, spot cross). Let it through — the coverage strike-out
+        # terminates it cleanly if the venue doesn't actually list it.
+        base, _, quote = canon.partition("/")
+        if quote in _PLAUSIBLE_QUOTES and _base_is_known(base):
+            return {"ok": True, "symbol": canon, "repaired": False, "reason": None}
+
+        # No evidence base to judge against (fresh install / isolated test home:
+        # empty lake AND empty registry) → fail open. Rejection is only meaningful
+        # when the system actually knows what markets exist.
+        if not _validation_evidence_available():
+            return {"ok": True, "symbol": canon, "repaired": False, "reason": None}
+
+        return {
+            "ok": False,
+            "symbol": canon,
+            "repaired": False,
+            "reason": (
+                f"unknown market symbol {raw!r}: not in the data lake, not in the "
+                "symbol registry, and its base asset is not traded anywhere in "
+                "either. Placeholder names (MULTI, BASKET) are not real markets — "
+                "use a concrete listed pair like BTC/USDT."
+            ),
+        }
+    except Exception as exc:  # noqa: BLE001 — fail-open: never block a mint on infra
+        log.warning("validate_strategy_symbol: validation errored for %r: %s", raw, exc)
+        return {"ok": True, "symbol": canonical_market_symbol(raw) or raw, "repaired": False, "reason": None}
+
+
 def coverage_days(symbol: str, timeframe: str) -> float:
     """Days of stored OHLCV history for (symbol, timeframe), read from the parquet
     FOOTER only (no full column load). 0.0 when missing/empty/unreadable."""
@@ -125,6 +300,85 @@ def _latest_ingestion_run(symbol_canonical: str, timeframe: str) -> dict | None:
     return best
 
 
+# Strike-out for series whose downloads can never succeed (fabricated / unlisted
+# symbols like ``MULTI/USDT`` or context-name leaks like ``ETH/USDT-8H``). Without
+# it, ensure_coverage resubmits a fresh backfill on every tick forever — the
+# workflow stays blocked_data eternally and the exchange gets hammered with
+# requests for symbols it does not list (observed: 33 failed runs for MULTI/USDT,
+# all 429/BadSymbol). Two triggers:
+#   * the venue said the symbol does not exist (deterministic — 2 strikes), or
+#   * repeated failures with ZERO bars ever stored (5 strikes — loose enough that
+#     a transient network outage on a real series keeps its retry path).
+_UNFILLABLE_ERROR_TOKENS = (
+    "does not have market symbol",
+    "badsymbol",
+    "symbol not found",
+    "invalid symbol",
+)
+_UNFILLABLE_DETERMINISTIC_STREAK = 2
+_UNFILLABLE_ZERO_COVERAGE_STREAK = 5
+
+
+def _failed_ingestion_streak(symbol_canonical: str, timeframe: str) -> tuple[int, str]:
+    """Consecutive most-recent FAILED ingestion runs for this series.
+
+    Returns ``(streak, most_recent_error)``. A completed run breaks the streak
+    (the source can serve this series); in-flight runs are skipped — they have
+    not confirmed anything yet."""
+    from forven.data import get_active_ingestion_runs, symbol_to_fs
+
+    target_fs = symbol_to_fs(symbol_canonical)
+    series_runs: list[dict] = []
+    for run in get_active_ingestion_runs():
+        try:
+            if symbol_to_fs(run.get("symbol")) != target_fs:
+                continue
+            if str(run.get("timeframe")) != str(timeframe):
+                continue
+        except Exception:
+            continue
+        series_runs.append(run)
+    series_runs.sort(key=lambda run: str(run.get("started_at") or ""), reverse=True)
+
+    streak = 0
+    last_error = ""
+    for run in series_runs:
+        status = str(run.get("status") or "")
+        if status in {"pending", "running"}:
+            continue
+        if status != "failed":
+            break
+        streak += 1
+        if not last_error:
+            last_error = str(run.get("error") or "")
+    return streak, last_error
+
+
+def _unfillable_verdict(symbol_canonical: str, timeframe: str, cov: float) -> dict[str, Any] | None:
+    """The ``unfillable`` result when this series has struck out, else None."""
+    streak, last_error = _failed_ingestion_streak(symbol_canonical, timeframe)
+    if streak <= 0:
+        return None
+    lowered = last_error.lower()
+    deterministic = any(token in lowered for token in _UNFILLABLE_ERROR_TOKENS)
+    if (deterministic and streak >= _UNFILLABLE_DETERMINISTIC_STREAK) or (
+        cov <= 0 and streak >= _UNFILLABLE_ZERO_COVERAGE_STREAK
+    ):
+        log.warning(
+            "ensure_coverage: %s %s struck out as UNFILLABLE after %d consecutive "
+            "failed downloads (last error: %s) — no further backfills will be submitted",
+            symbol_canonical, timeframe, streak, last_error or "unknown",
+        )
+        return {
+            "status": "unfillable",
+            "symbol": symbol_canonical,
+            "coverage_days": cov,
+            "failed_attempts": streak,
+            "last_error": last_error,
+        }
+    return None
+
+
 def ensure_coverage(
     symbol: str,
     timeframe: str,
@@ -138,6 +392,9 @@ def ensure_coverage(
       * ``"ready"``       — enough history exists (or the source has no more); proceed.
       * ``"backfilling"`` — an async backfill is in flight; the caller should defer
         (``blocked_data`` / ``awaiting_data_backfill``) and retry on a later tick.
+      * ``"unfillable"``  — downloads for this series deterministically fail (bad /
+        unlisted symbol) or keep failing with zero bars ever stored; the caller
+        should treat this as TERMINAL for the strategy, not retry.
 
     Never blocks on the network — the download runs asynchronously via
     ``data.submit_ingestion``. ``symbol`` in the result is the canonical form the
@@ -177,7 +434,10 @@ def ensure_coverage(
                 "symbol": canon,
                 "max_available": True,
             }
-        # status == "failed" → fall through and (re)submit a fresh backfill.
+        # status == "failed" → strike-out check, then (re)submit a fresh backfill.
+        struck_out = _unfillable_verdict(canon, timeframe, cov)
+        if struck_out is not None:
+            return struck_out
 
     since_ms = int(time.time() * 1000) - need * _DAY_MS
     try:

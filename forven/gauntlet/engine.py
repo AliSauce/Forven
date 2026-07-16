@@ -1057,6 +1057,55 @@ def cancel_param_locked_workflows(*, limit: int = 50) -> int:
     return cancelled
 
 
+def cancel_orphaned_terminal_workflows(*, limit: int = 50) -> int:
+    """Cancel any non-terminal gauntlet workflow whose strategy is already at a
+    TERMINAL stage (archived/rejected/trash).
+
+    Archiving a strategy (evolution sweeps, operator action, brain transitions)
+    never touched its workflow, so 'pending' workflows for long-dead strategies
+    accumulated as permanent Forge clutter (8 such zombies dated back to June)
+    and could even be re-armed by stale-step recovery. Mirror of
+    :func:`cancel_param_locked_workflows` for the terminal stages. Idempotent.
+    """
+    from forven.db import get_db
+
+    with get_db() as conn:
+        init_gauntlet_schema(conn)
+        placeholders = ",".join("?" for _ in _TERMINAL_WORKFLOW_STATUSES)
+        rows = conn.execute(
+            f"""
+            SELECT w.id
+            FROM gauntlet_workflows w
+            JOIN strategies s ON s.id = w.strategy_id
+            WHERE w.status NOT IN ({placeholders})
+              AND LOWER(TRIM(COALESCE(s.stage, s.status, ''))) IN
+                  ('archived', 'rejected', 'trash', 'backtest_failed')
+            ORDER BY w.id
+            LIMIT ?
+            """,
+            (*_TERMINAL_WORKFLOW_STATUSES, int(max(int(limit), 1))),
+        ).fetchall()
+    workflow_ids = [str(row["id"]) for row in rows]
+
+    cancelled = 0
+    for workflow_id in workflow_ids:
+        try:
+            cancel_workflow(
+                workflow_id,
+                actor="gauntlet_sweep",
+                reason="strategy already at a terminal stage; zombie workflow cancelled",
+            )
+            cancelled += 1
+        except Exception:
+            log.exception("Gauntlet: failed to cancel orphaned terminal workflow %s", workflow_id)
+    if cancelled:
+        log.info(
+            "Gauntlet: cancelled %d zombie workflow(s) for terminal-stage strategies",
+            cancelled,
+        )
+    return cancelled
+
+
 # --- Engine-version re-baselining ---------------------------------------------------
 # Validation verdict result_types whose LATEST row decides whether a strategy's
 # evidence is current. Mirrors the IN-list of gauntlet/status._latest_robustness_results.
@@ -1636,6 +1685,10 @@ def tick_active_gauntlet_workflows(
     # (paper/live) so they are not re-armed by stale-step recovery and churn the
     # frozen strategy.
     cancelled_param_locked = cancel_param_locked_workflows(limit=max_workflows)
+    # And workflows whose strategy is already dead (archived/rejected) — zombie
+    # rows that otherwise clutter the Forge forever and can be re-armed by
+    # stale-step recovery.
+    cancelled_orphaned = cancel_orphaned_terminal_workflows(limit=max_workflows)
     workflow_ids = list_active_workflow_ids(max_workflows=max_workflows)
     summary: dict[str, Any] = {
         "ok": True,
@@ -1646,6 +1699,7 @@ def tick_active_gauntlet_workflows(
         "drained_exhausted": drained,
         "demoted_failed_gate": demoted,
         "cancelled_param_locked": cancelled_param_locked,
+        "cancelled_orphaned_terminal": cancelled_orphaned,
         "advanced": 0,
         "no_progress": 0,
         "errors": [],

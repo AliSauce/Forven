@@ -40,7 +40,14 @@ class CatchUpPlanner:
 
     def plan(self, *, now: datetime | None = None) -> list[CatchUpTask]:
         now_ts = _as_utc(now or datetime.now(timezone.utc))
-        tasks: list[CatchUpTask] = []
+        # (hours_behind, task) — sorted most-stale-first before returning. The plan
+        # used to ride the catalog's alphabetical order, which head-of-line blocked
+        # the bounded drain batch: the first few symbols' sub-hour series re-stale
+        # every couple of minutes and refilled the whole batch on every run, so a
+        # series past the alphabetical horizon could stay frozen for weeks while
+        # every run reported green. Staleness-descending is an aging queue: any
+        # series left unserved only rises in priority, so nothing starves.
+        prioritized: list[tuple[float, CatchUpTask]] = []
         covered: set[tuple[str, str]] = set()
         for row in self.catalog.list_coverage():
             stream = str(row.get("stream") or "")
@@ -60,11 +67,23 @@ class CatchUpPlanner:
             # Only closed bars are catch-up candidates.
             latest_closed_start = _floor_to_timeframe(now_ts, tf_delta) - tf_delta
             if start_ts <= latest_closed_start:
-                tasks.append(_task_from_row(row, start_ts, latest_closed_start, reason="stale"))
+                hours_behind = max(0.0, (now_ts - start_ts).total_seconds() / 3600.0)
+                prioritized.append(
+                    (hours_behind, _task_from_row(row, start_ts, latest_closed_start, reason="stale"))
+                )
                 continue
             # Current at the tail — but is it gap-complete inside its span?
+            # Interior-gap repair re-downloads the whole span (expensive) and no
+            # quality gate is waiting on it the way end-staleness gates scoring,
+            # so it queues behind end-staleness work at priority 0 and drains
+            # whenever the tail is healthy.
             if _completeness(row, tf_delta) < COMPLETENESS_THRESHOLD:
-                tasks.append(_task_from_row(row, _as_utc(row.get("start_ts") or end_ts), end_ts, reason="gaps"))
+                prioritized.append(
+                    (0.0, _task_from_row(row, _as_utc(row.get("start_ts") or end_ts), end_ts, reason="gaps"))
+                )
+
+        prioritized.sort(key=lambda pair: pair[0], reverse=True)
+        tasks: list[CatchUpTask] = [task for _, task in prioritized]
 
         # Symbol-inventory pre-stage: an active symbol that is in the trading
         # universe but has NO catalog row produces zero rows above and is never

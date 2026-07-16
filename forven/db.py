@@ -4962,6 +4962,32 @@ def create_strategy_container(
         params = lift_unambiguous_risk_params(params)
     except Exception:
         pass
+    # SYMBOL-VALID-1: fabricated symbols (MULTI/USDT, BASKET/USDT), inverted
+    # pairs, and dataset-context leaks (ETH/USDT-8H) wedge the gauntlet in an
+    # eternal blocked_data backfill loop and hammer the exchange with requests
+    # for markets that don't exist. Repair the repairable, reject the fabricated
+    # — loudly, at the mint chokepoint, so the author sees WHY instead of the
+    # strategy silently rotting in the Forge. Unlike the class-introspection
+    # guards above, this runs for sandbox_only registrations too (the dropzone
+    # import path is where several fake-symbol strategies came from) — symbol
+    # validity is independent of the strategy class. The validator fails OPEN on
+    # infra errors, so a registry/lake hiccup can never block a legitimate mint.
+    # An OMITTED symbol keeps the legacy default-fill behavior — only a symbol the
+    # caller actually provided is validated.
+    if str(symbol or "").strip():
+        from forven.dataeng.coverage import validate_strategy_symbol
+
+        _symbol_verdict = validate_strategy_symbol(symbol)
+        if not _symbol_verdict.get("ok"):
+            raise ValueError(
+                f"cannot create strategy on symbol {symbol!r}: {_symbol_verdict.get('reason')}"
+            )
+        if _symbol_verdict.get("repaired"):
+            log.warning(
+                "create_strategy_container: repaired market symbol %r -> %r (%s)",
+                symbol, _symbol_verdict.get("symbol"), _symbol_verdict.get("reason"),
+            )
+        symbol = str(_symbol_verdict.get("symbol") or symbol)
     normalized_parent = str(parent_strategy_id or "").strip() or None
     if normalized_parent:
         parent_row = conn.execute(

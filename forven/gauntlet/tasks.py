@@ -381,6 +381,21 @@ def run_quick_screen(workflow: dict[str, Any], step: dict[str, Any]) -> dict[str
                 "retryable": True,
                 "reason_code": "awaiting_data_backfill",
             }
+        if coverage.get("status") == "unfillable":
+            # Downloads for this series deterministically fail (fabricated / unlisted
+            # symbol, e.g. MULTI/USDT or a context-name leak like ETH/USDT-8H). This
+            # can never self-heal, so it is a terminal config failure — NOT a
+            # retryable data wait (which previously looped the workflow forever).
+            return {
+                "status": "failed_gate",
+                "message": (
+                    f"market data for {coverage.get('symbol')} {timeframe} is unobtainable "
+                    f"({int(coverage.get('failed_attempts') or 0)} consecutive failed downloads; "
+                    f"last error: {coverage.get('last_error') or 'unknown'}). The symbol is "
+                    "likely invalid or unlisted — fix the strategy's symbol and re-register."
+                ),
+                "retryable": False,
+            }
         symbol = str(coverage.get("symbol") or raw_symbol)
         if symbol != raw_symbol:
             _persist_strategy_symbol(str(row["id"]), symbol)
@@ -1824,6 +1839,56 @@ def _select_and_persist_execution_profile(workflow: dict[str, Any], strategy_id:
     return {"skipped": False, "selection": marker}
 
 
+def _requeue_walk_forward_for_window_rerun(workflow: dict[str, Any]) -> bool:
+    """Re-arm this workflow's completed walk_forward step so the WFA actually
+    re-runs on the trade-frequency-aware window.
+
+    The gate's ``wfa_window_insufficient`` block promises "re-run WFA on the
+    trade-frequency-aware window" and is exempt from the drain (correct — it is
+    absence of evidence, not merit), but nothing re-queued the already-passed
+    walk_forward step, so the gate retried forever against the same insufficient
+    artifact. Bounded: the step's own attempt budget is NOT reset, so the claim
+    increment caps re-runs at max_attempts; an in-flight step is left alone.
+    Best-effort — a store hiccup leaves the block to retry on its normal cadence.
+    """
+    workflow_id = str(workflow.get("id") or "").strip()
+    if not workflow_id:
+        return False
+    try:
+        from datetime import datetime, timezone
+
+        from forven.db import get_db
+
+        now = datetime.now(timezone.utc).isoformat()
+        with get_db() as conn:
+            row = conn.execute(
+                """SELECT id, status, attempt_count, max_attempts FROM gauntlet_steps
+                   WHERE workflow_id = ? AND step_key = 'walk_forward'""",
+                (workflow_id,),
+            ).fetchone()
+            if not row:
+                return False
+            if str(row["status"] or "") in {"queued", "pending", "running"}:
+                return True  # a re-run is already on its way
+            if int(row["attempt_count"] or 0) >= int(row["max_attempts"] or 3):
+                return False  # re-run budget spent; leave the block to the hygiene backstop
+            conn.execute(
+                """UPDATE gauntlet_steps
+                   SET status = 'queued', error_json = NULL, completed_at = NULL, updated_at = ?
+                   WHERE id = ?""",
+                (now, row["id"]),
+            )
+        log.info(
+            "paper gate: re-queued walk_forward for %s (workflow %s) — window "
+            "insufficient, re-running WFA on the trade-frequency-aware window",
+            workflow.get("strategy_id"), workflow_id,
+        )
+        return True
+    except Exception:
+        log.exception("paper gate: failed to re-queue walk_forward for workflow %s", workflow_id)
+        return False
+
+
 def run_paper_promotion_gate(workflow: dict[str, Any], step: dict[str, Any]) -> dict[str, Any]:
     from forven.gauntlet.status import get_strategy_gauntlet_status
 
@@ -1953,6 +2018,15 @@ def run_paper_promotion_gate(workflow: dict[str, Any], step: dict[str, Any]) -> 
         # archived genuinely-unjudged strategies via the workflow path.
         or "window insufficient" in _blocked_text
     ):
+        if "window insufficient" in _blocked_text:
+            # This block's whole premise is "the re-run produces judgeable folds"
+            # — but nothing ever re-armed the (already-passed) walk_forward step,
+            # so the gate retried forever against the SAME insufficient artifact
+            # (5 candidates with composite 94-100 sat here for days). Actually
+            # trigger the re-run, bounded by the step's own attempt budget so a
+            # strategy that can't produce judgeable folds even on the sized
+            # window doesn't ping-pong indefinitely.
+            _requeue_walk_forward_for_window_rerun(workflow)
         # PENDING RE-VALIDATION, not a merit failure. The gauntlet gate's artifact-
         # ordering / freshness check fails when a validation (walk_forward) is older
         # than the latest optimization — i.e. it ran in the transient window after

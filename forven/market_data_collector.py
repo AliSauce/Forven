@@ -396,10 +396,31 @@ def ensure_funding_history(
     - ``"exhausted"``  — the exchange has no data older than what is stored
     - ``"cooldown"``   — a recent attempt already failed to extend coverage
     - ``"error"``      — the backfill attempt itself failed
+    - ``"skipped_unknown_asset"`` — the asset exists nowhere in the lake or the
+      symbol registry (a fabricated symbol like MULTI/BASKET leaked in from a
+      strategy row); the venue is not asked at all
     """
     normalized_asset = str(asset or "").strip().upper()
     if not normalized_asset:
         return {"action": "error", "error": "empty asset"}
+
+    # SYMBOL-VALID-1 companion: assets are enumerated from strategy symbols, so a
+    # fabricated symbol (MULTI/USDT, BASKET/USDT) used to reach this backfill and
+    # hammer the venue every cooldown lapse (observed: repeated 429/500 pages,
+    # every 6h, forever). An asset with no lake dir and no registry row cannot
+    # have funding history — skip without a network call. Fails open when the
+    # system has no lake/registry evidence at all (fresh install).
+    try:
+        from forven.dataeng.coverage import known_base_asset
+
+        if not known_base_asset(normalized_asset):
+            log.info(
+                "Funding backfill skipped for %s: unknown asset (no lake data, "
+                "no registry row)", normalized_asset,
+            )
+            return {"action": "skipped_unknown_asset", "asset": normalized_asset}
+    except Exception:
+        pass
     start_ms = int(start_ms)
     now = datetime.now(timezone.utc)
 
